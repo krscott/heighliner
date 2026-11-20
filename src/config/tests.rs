@@ -180,7 +180,7 @@ fn concurrent_edits_last_write_wins() {
 }
 
 #[test]
-fn concurrent_rename_does_not_undo_untrack() {
+fn concurrent_rename_and_untrack_is_flagged() {
     let (mut a, mut b) = (db("a"), db("b"));
     a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
         .unwrap();
@@ -189,7 +189,94 @@ fn concurrent_rename_does_not_undo_untrack() {
     b.update_item(t(20), ITEM, |item| item.name = "renamed".into())
         .unwrap();
     sync(&mut a, &mut b, t(21));
+
+    // The rename wins the settings, but the untrack removed the Replicas.
+    let config = a.config();
+    assert_eq!(config.items[&ITEM].item.name, "renamed");
+    assert!(config.items[&ITEM].replicas.is_empty());
+    assert_eq!(
+        config.problems,
+        [
+            Problem::Resurrected { item: ITEM },
+            Problem::NoSender { item: ITEM }
+        ]
+    );
+    a.untrack(t(22), ITEM).unwrap();
     assert_eq!(a.config(), Config::default());
+}
+
+#[test]
+fn unseen_settings_edit_keeps_resurrection_flagged() {
+    let (mut a, mut b) = (db("a"), db("b"));
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(2));
+    b.add_replica(t(5), ITEM, &node("b"), replica("/x"))
+        .unwrap();
+    b.update_item(t(20), ITEM, |item| item.name = "renamed".into())
+        .unwrap();
+    a.untrack(t(10), ITEM).unwrap();
+    sync(&mut a, &mut b, t(21));
+    assert_eq!(b.config().problems, [Problem::Resurrected { item: ITEM }]);
+
+    // An edit that has seen the untrack restores the Item.
+    b.update_item(t(22), ITEM, |_| {}).unwrap();
+    sync(&mut a, &mut b, t(23));
+    assert_eq!(a.config().problems, []);
+    assert_eq!(a.config().items[&ITEM].item.name, "renamed");
+}
+
+#[test]
+fn concurrent_removals_leave_an_item_to_fix() {
+    let (mut a, mut b) = (db("a"), db("b"));
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    a.add_replica(t(2), ITEM, &node("b"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(3));
+    a.remove_replica(t(4), ITEM, &node("a")).unwrap();
+    b.remove_replica(t(4), ITEM, &node("b")).unwrap();
+    sync(&mut a, &mut b, t(5));
+    assert_eq!(a.config().problems, [Problem::NoSender { item: ITEM }]);
+    a.add_replica(t(6), ITEM, &node("a"), replica("/x"))
+        .unwrap();
+    assert_eq!(a.config().problems, []);
+}
+
+#[test]
+fn edits_keep_fixed_and_unknown_fields() {
+    let future = foreign_store(vec![
+        (
+            item_key(ITEM),
+            live(1, json!({"name": "x", "direction": "two-way", "future": 1})),
+        ),
+        (
+            replica_key(ITEM, &node("a")),
+            live(1, json!({"path": "/x", "future": 2})),
+        ),
+    ]);
+    let mut a = db("a");
+    a.merge(&future, t(2));
+    a.update_item(t(3), ITEM, |item| *item = two_way("y"))
+        .unwrap();
+    a.update_replica(t(3), ITEM, &node("a"), |r| *r = mirror("/elsewhere"))
+        .unwrap_err();
+    a.update_replica(t(3), ITEM, &node("a"), |r| {
+        *r = replica("/elsewhere");
+        r.paused = true;
+    })
+    .unwrap();
+
+    let fields = |key| match a.store().get(&key).unwrap().latest().1 {
+        Content::Live { fields, .. } => Value::Object(fields.clone()),
+        Content::Deleted => panic!("deleted"),
+    };
+    assert_eq!(fields(item_key(ITEM))["name"], "y");
+    assert_eq!(fields(item_key(ITEM))["future"], 1);
+    let replica_fields = fields(replica_key(ITEM, &node("a")));
+    assert_eq!(replica_fields["path"], "/x");
+    assert_eq!(replica_fields["paused"], true);
+    assert_eq!(replica_fields["future"], 2);
 }
 
 #[test]
@@ -612,6 +699,26 @@ fn apply(dbs: &mut [ConfigDb], on: usize, now: impl Fn(usize) -> Timestamp, op: 
     };
 }
 
+/// Checks that pruning left no version superseded more than `window` before
+/// `now`, other than a record's latest live version.
+fn check_pruned(store: &Store, now: Timestamp, window: Duration) -> Result<(), TestCaseError> {
+    for (key, record) in store.records() {
+        let versions: Vec<_> = record.versions().collect();
+        let latest_live = versions
+            .iter()
+            .rev()
+            .find(|(_, content)| matches!(content, Content::Live { .. }))
+            .map(|(hlc, _)| *hlc);
+        for pair in versions.windows(2) {
+            let ((old, _), (successor, _)) = (pair[0], pair[1]);
+            if Some(old) != latest_live {
+                prop_assert!(successor.wall.saturating_add(window) >= now, "{key:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Runs `steps`, checking every Node's configuration after each one. Each
 /// Node's wall clock is offset by its index times `skew` milliseconds.
 fn run(nodes: usize, skew: u64, steps: &[Step]) -> Result<Vec<ConfigDb>, TestCaseError> {
@@ -621,6 +728,9 @@ fn run(nodes: usize, skew: u64, steps: &[Step]) -> Result<Vec<ConfigDb>, TestCas
         now += advance;
         let wall = |node: usize| t(now + u64::try_from(node).unwrap() * skew);
         apply(&mut dbs, *on, wall, op);
+        if let Op::Prune { window } = op {
+            check_pruned(dbs[*on].store(), wall(*on), Duration::from_millis(*window))?;
+        }
         for db in &dbs {
             check_valid(db.store())?;
         }
@@ -652,7 +762,6 @@ fn check_valid(store: &Store) -> Result<Config, TestCaseError> {
     }
 
     for (id, entry) in &config.items {
-        prop_assert!(!entry.replicas.is_empty());
         let roles: Vec<Role> = entry
             .replicas
             .iter()
@@ -711,7 +820,7 @@ proptest! {
 
         let mut all = Store::default();
         for db in &dbs {
-            all.merge(db.store());
+            all.merge(db.store(), |_| true);
         }
         let config = check_valid(&all)?;
         for db in &mut dbs {

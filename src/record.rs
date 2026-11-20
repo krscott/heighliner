@@ -92,10 +92,11 @@ impl Record {
     /// Node learned of it; a version that arrives late can expire what it
     /// supersedes at once. A winning tombstone expires on its own, taking the
     /// record with it. The latest live version is kept as long as the record,
-    /// so a deleted record's last content stays known.
-    fn prune(&mut self, expired: impl Fn(&Hlc) -> bool) -> bool {
+    /// so a deleted record's last content stays known. With `keep`, the
+    /// record stays even if its winning tombstone has expired.
+    fn prune(&mut self, expired: impl Fn(&Hlc) -> bool, keep: bool) -> bool {
         let (latest_hlc, latest) = self.latest();
-        if matches!(latest, Content::Deleted) && expired(latest_hlc) {
+        if !keep && matches!(latest, Content::Deleted) && expired(latest_hlc) {
             return false;
         }
         let latest_live = self
@@ -140,13 +141,20 @@ impl Store {
         }
     }
 
-    /// Adds every version from `other`.
-    pub fn merge(&mut self, other: &Store) {
+    /// Adds every version from `other` that `accept` accepts, and returns how
+    /// many it didn't.
+    pub fn merge(&mut self, other: &Store, accept: impl Fn(&Hlc) -> bool) -> usize {
+        let mut rejected = 0;
         for (key, record) in &other.records {
             for (hlc, content) in &record.versions {
-                self.insert(key.clone(), hlc.clone(), content.clone());
+                if accept(hlc) {
+                    self.insert(key.clone(), hlc.clone(), content.clone());
+                } else {
+                    rejected += 1;
+                }
             }
         }
+        rejected
     }
 
     /// The latest [`Hlc`] of any retained version.
@@ -157,12 +165,13 @@ impl Store {
             .max()
     }
 
-    /// Drops versions and tombstones that expired more than `window` ago,
-    /// except in records for which `keep` returns true.
+    /// Drops versions and tombstones that expired more than `window` ago.
+    /// Records for which `keep` returns true stay, with their latest version
+    /// and latest live version, even if their winning tombstone expired.
     pub fn prune(&mut self, now: Timestamp, window: Duration, keep: impl Fn(&RecordKey) -> bool) {
         let expired = |hlc: &Hlc| hlc.wall.saturating_add(window) < now;
         self.records
-            .retain(|key, record| keep(key) || record.prune(expired));
+            .retain(|key, record| record.prune(expired, keep(key)));
     }
 }
 
@@ -307,12 +316,17 @@ mod tests {
     }
 
     #[test]
-    fn prune_skips_kept_records() {
+    fn prune_keeps_kept_records_but_prunes_their_history() {
         let mut store = Store::default();
-        store.insert(key("k", "1"), hlc(0, 0, "a"), Content::Deleted);
-        store.insert(key("k", "2"), hlc(0, 0, "a"), Content::Deleted);
+        for id in ["1", "2"] {
+            store.insert(key("k", id), hlc(0, 0, "a"), live(0));
+            store.insert(key("k", id), hlc(1, 0, "a"), live(1));
+            store.insert(key("k", id), hlc(2, 0, "a"), Content::Deleted);
+        }
         store.prune(Timestamp::from_millis(days(100)), DAY * 30, |k| k.id == "1");
-        assert!(store.get(&key("k", "1")).is_some());
+        let kept: Vec<_> = store.get(&key("k", "1")).unwrap().versions().collect();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].1, &live(1));
         assert!(store.get(&key("k", "2")).is_none());
     }
 
@@ -322,7 +336,7 @@ mod tests {
         store.insert(key("future-kind", "x"), hlc(1, 0, "a"), live(7));
         let json = serde_json::to_string(&store).unwrap();
         let mut copy = Store::default();
-        copy.merge(&serde_json::from_str(&json).unwrap());
+        copy.merge(&serde_json::from_str(&json).unwrap(), |_| true);
         assert_eq!(copy, store);
     }
 
@@ -362,7 +376,7 @@ mod tests {
 
     fn merged(a: &Store, b: &Store) -> Store {
         let mut out = a.clone();
-        out.merge(b);
+        out.merge(b, |_| true);
         out
     }
 

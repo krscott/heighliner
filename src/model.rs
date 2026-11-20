@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::hlc::Timestamp;
+use crate::hlc::{Hlc, Timestamp};
 
 /// Fields of a record that this version of heighliner does not know. They are
 /// kept and written back unchanged.
@@ -187,8 +187,8 @@ impl ExcludePattern {
         let pattern = pattern.into();
         let reason = if pattern.trim().is_empty() || pattern.contains(['\n', '\r']) {
             "must be one non-blank line"
-        } else if pattern.starts_with('#') {
-            "must not be a directive"
+        } else if pattern.trim_start().starts_with('#') {
+            "must not start with # (write [#] for a literal #)"
         } else if pattern.contains("(?d)") {
             "must not use the (?d) flag"
         } else {
@@ -255,6 +255,10 @@ pub struct Item {
     pub excludes: Vec<ExcludePattern>,
     pub direction: Direction,
     pub paused: bool,
+    /// The latest untrack of this Item that the Node writing these settings
+    /// had seen. A newer untrack means the settings were edited without
+    /// seeing it.
+    seen_untrack: Option<Hlc>,
     unknown_fields: UnknownFields,
 }
 
@@ -265,8 +269,20 @@ impl Item {
             excludes: Vec::new(),
             direction,
             paused: false,
+            seen_untrack: None,
             unknown_fields: UnknownFields::new(),
         }
+    }
+
+    pub(crate) fn seen_untrack(&self) -> Option<&Hlc> {
+        self.seen_untrack.as_ref()
+    }
+
+    /// Carries over the fields of `original` that only heighliner sets, and
+    /// records `seen_untrack` as the latest untrack seen.
+    pub(crate) fn keep_hidden_fields(&mut self, original: Self, seen_untrack: Option<Hlc>) {
+        self.seen_untrack = seen_untrack;
+        self.unknown_fields = original.unknown_fields;
     }
 }
 
@@ -281,6 +297,8 @@ struct ItemRecord {
     source: Option<NodeId>,
     #[serde(default)]
     paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seen_untrack: Option<Hlc>,
     #[serde(flatten)]
     unknown_fields: UnknownFields,
 }
@@ -307,6 +325,7 @@ impl TryFrom<ItemRecord> for Item {
             excludes: record.excludes,
             direction,
             paused: record.paused,
+            seen_untrack: record.seen_untrack,
             unknown_fields: record.unknown_fields,
         })
     }
@@ -324,6 +343,7 @@ impl From<Item> for ItemRecord {
             direction,
             source,
             paused: item.paused,
+            seen_untrack: item.seen_untrack,
             unknown_fields: item.unknown_fields,
         }
     }
@@ -355,6 +375,13 @@ impl Replica {
 
     pub fn path(&self) -> &AbsPath {
         &self.path
+    }
+
+    /// Carries over the path of `original` and the fields this version
+    /// doesn't know.
+    pub(crate) fn keep_fixed_fields(&mut self, original: Self) {
+        self.path = original.path;
+        self.unknown_fields = original.unknown_fields;
     }
 }
 
@@ -410,6 +437,7 @@ mod tests {
             " ",
             "a\nb",
             "#include x",
+            "  #include x",
             "#escape=\\",
             "(?d)*",
             "!(?i)(?d)x",

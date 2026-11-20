@@ -1,10 +1,9 @@
 //! The Fleet's configuration: Items and Replicas stored as records.
 //!
 //! [`Config`] is derived from a [`Store`], so every merge result has a valid
-//! configuration. An Item is tracked while it has a live Replica; its own
-//! record only holds its settings. Merges can produce situations local edits
-//! never would, such as overlapping Replicas or a resurrected Item, and the
-//! configuration reports those as [`Problem`]s instead of rejecting them.
+//! configuration. Merges can produce situations local edits never would, such
+//! as overlapping Replicas or a resurrected Item, and the configuration
+//! reports those as [`Problem`]s instead of rejecting them.
 //!
 //! [`ConfigDb`] is one Node's copy of the store. It refuses local edits that
 //! would add a Problem, and versions edits with the Node's clock.
@@ -17,7 +16,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::hlc::{Clock, Timestamp};
+use crate::hlc::{Clock, Hlc, Timestamp};
 use crate::model::{AbsPath, Item, ItemId, NodeId, Replica, Role};
 use crate::record::{Content, Record, RecordKey, Store};
 
@@ -86,7 +85,17 @@ fn is_live(record: Option<&Record>) -> bool {
     record.is_some_and(|record| matches!(record.latest().1, Content::Live { .. }))
 }
 
-/// A tracked Item with its Replicas, keyed by Node. There is at least one.
+/// The latest untrack in an Item record.
+fn latest_untrack(record: &Record) -> Option<&Hlc> {
+    record
+        .versions()
+        .rev()
+        .find(|(_, content)| matches!(content, Content::Deleted))
+        .map(|(hlc, _)| hlc)
+}
+
+/// A tracked Item with its Replicas, keyed by Node. Concurrent removals can
+/// leave it with none, which is reported as [`Problem::NoSender`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemEntry {
     pub item: Item,
@@ -119,8 +128,8 @@ pub enum Problem {
     /// A record of a known kind that this version can't read, for example
     /// one with a newer schema. It is kept but not used.
     Unreadable { key: RecordKey, error: String },
-    /// An untracked Item that is back because one of its Replicas was added
-    /// or changed without seeing the untrack.
+    /// An untracked Item that is back because one of its Replicas or its
+    /// settings changed without seeing the untrack.
     Resurrected { item: ItemId },
     /// A Replica whose Item is unknown or unreadable. It is not synced.
     Orphaned { item: ItemId, node: NodeId },
@@ -141,11 +150,12 @@ impl fmt::Display for Problem {
             }
             Self::Resurrected { item } => write!(
                 f,
-                "item {item} was untracked, but a replica changed without seeing that brought it back"
+                "item {item} was untracked, but an edit made without seeing the untrack brought it back"
             ),
-            Self::Orphaned { item, node } => {
-                write!(f, "the replica on {node} belongs to unknown item {item}")
-            }
+            Self::Orphaned { item, node } => write!(
+                f,
+                "the replica on {node} belongs to item {item}, which is unknown or unreadable"
+            ),
             Self::DuplicateName { name, items } => {
                 write!(f, "{} items are named {name:?}", items.len())
             }
@@ -167,7 +177,8 @@ pub struct Config {
 
 /// The readable settings in an Item record.
 enum ItemSettings {
-    Live(Item),
+    /// `resurrected` if the record holds an untrack these settings didn't see.
+    Live { item: Item, resurrected: bool },
     /// The record is a tombstone; this is its last live content.
     Untracked(Item),
 }
@@ -194,7 +205,9 @@ impl Config {
                     };
                     match parse_fields::<Item>(record.latest().1) {
                         Some(Ok(item)) => {
-                            settings.insert(id, ItemSettings::Live(item));
+                            let resurrected = latest_untrack(record)
+                                .is_some_and(|untrack| item.seen_untrack() < Some(untrack));
+                            settings.insert(id, ItemSettings::Live { item, resurrected });
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
                         None => {
@@ -229,20 +242,16 @@ impl Config {
             }
         }
 
-        for (id, item_replicas) in replicas {
-            let item = match settings.remove(&id) {
-                Some(ItemSettings::Live(item)) => item,
-                Some(ItemSettings::Untracked(item)) => {
-                    config.problems.push(Problem::Resurrected { item: id });
-                    item
-                }
-                None => {
-                    for node in item_replicas.into_keys() {
-                        config.problems.push(Problem::Orphaned { item: id, node });
-                    }
-                    continue;
-                }
+        for (id, item_settings) in settings {
+            let item_replicas = replicas.remove(&id).unwrap_or_default();
+            let (item, resurrected) = match item_settings {
+                ItemSettings::Live { item, resurrected } => (item, resurrected),
+                ItemSettings::Untracked(_) if item_replicas.is_empty() => continue,
+                ItemSettings::Untracked(item) => (item, true),
             };
+            if resurrected {
+                config.problems.push(Problem::Resurrected { item: id });
+            }
             config.items.insert(
                 id,
                 ItemEntry {
@@ -250,6 +259,11 @@ impl Config {
                     replicas: item_replicas,
                 },
             );
+        }
+        for (id, item_replicas) in replicas {
+            for node in item_replicas.into_keys() {
+                config.problems.push(Problem::Orphaned { item: id, node });
+            }
         }
 
         config.find_duplicate_names();
@@ -385,23 +399,16 @@ impl ConfigDb {
     /// Later local edits supersede everything merged.
     pub fn merge(&mut self, other: &Store, now: Timestamp) -> usize {
         let limit = now.saturating_add(MAX_CLOCK_DRIFT);
-        let mut rejected = 0;
-        for (key, record) in other.records() {
-            for (hlc, content) in record.versions() {
-                if hlc.wall > limit {
-                    rejected += 1;
-                    continue;
-                }
-                self.clock.observe(hlc);
-                self.store.insert(key.clone(), hlc.clone(), content.clone());
-            }
+        let rejected = self.store.merge(other, |hlc| hlc.wall <= limit);
+        if let Some(hlc) = self.store.max_hlc() {
+            self.clock.observe(hlc);
         }
         rejected
     }
 
     /// Drops versions and tombstones that expired more than `window` ago. An
-    /// untracked Item's record is kept while a live Replica refers to it, so
-    /// a resurrected Item keeps its settings.
+    /// untracked Item's tombstone and last settings are kept while a live
+    /// Replica refers to it, so a resurrected Item keeps its settings.
     pub fn prune(&mut self, now: Timestamp, window: Duration) {
         let referenced: BTreeSet<RecordKey> = self
             .store
@@ -432,15 +439,23 @@ impl ConfigDb {
         })
     }
 
-    /// Edits an Item's settings. Editing a resurrected Item restores it.
+    /// Edits an Item's settings, keeping fields this version doesn't know.
+    /// Editing a resurrected Item restores it.
     pub fn update_item(
         &mut self,
         now: Timestamp,
         id: ItemId,
         edit: impl FnOnce(&mut Item),
     ) -> Result<(), EditError> {
-        let mut item = self.item(id)?.item.clone();
+        let original = self.item(id)?.item;
+        let mut item = original.clone();
         edit(&mut item);
+        let seen_untrack = self
+            .store
+            .get(&item_key(id))
+            .and_then(latest_untrack)
+            .cloned();
+        item.keep_hidden_fields(original, seen_untrack);
         self.edit(|db| db.write(now, item_key(id), &item))
     }
 
@@ -491,8 +506,8 @@ impl ConfigDb {
         self.edit(|db| db.write(now, key, &replica))
     }
 
-    /// Edits a Replica's settings. Its path can't change; remove the Replica
-    /// and add a new one instead.
+    /// Edits a Replica's settings, keeping its path and fields this version
+    /// doesn't know. To move a Replica, remove it and add a new one.
     pub fn update_replica(
         &mut self,
         now: Timestamp,
@@ -500,16 +515,17 @@ impl ConfigDb {
         node: &NodeId,
         edit: impl FnOnce(&mut Replica),
     ) -> Result<(), EditError> {
-        let mut replica = self
-            .item(id)?
-            .replicas
-            .get(node)
-            .ok_or_else(|| EditError::UnknownReplica {
-                item: id,
-                node: node.clone(),
-            })?
-            .clone();
+        let original =
+            self.item(id)?
+                .replicas
+                .remove(node)
+                .ok_or_else(|| EditError::UnknownReplica {
+                    item: id,
+                    node: node.clone(),
+                })?;
+        let mut replica = original.clone();
         edit(&mut replica);
+        replica.keep_fixed_fields(original);
         self.edit(|db| db.write(now, replica_key(id, node), &replica))
     }
 

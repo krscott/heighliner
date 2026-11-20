@@ -129,9 +129,8 @@ pub enum Problem {
     /// one with a newer schema. It is kept but not used.
     Unreadable { key: RecordKey, error: String },
     /// An untracked Item that is back because one of its Replicas or its
-    /// settings changed without seeing the untrack. When the settings change
-    /// won, the flag lasts until the untrack expires, one Retention Window
-    /// after that change.
+    /// settings changed without seeing the untrack. Editing the Item's
+    /// settings or untracking it again clears the flag.
     Resurrected { item: ItemId },
     /// A Replica whose Item is unknown or unreadable. It is not synced.
     Orphaned { item: ItemId, node: NodeId },
@@ -452,11 +451,9 @@ impl ConfigDb {
         let original = self.item(id)?.item;
         let mut item = original.clone();
         edit(&mut item);
-        let seen_untrack = self
-            .store
-            .get(&item_key(id))
-            .and_then(latest_untrack)
-            .cloned();
+        // Pruning may have dropped untracks the settings already saw.
+        let stored_untrack = self.store.get(&item_key(id)).and_then(latest_untrack);
+        let seen_untrack = original.seen_untrack().max(stored_untrack).cloned();
         item.keep_hidden_fields(original, seen_untrack);
         self.edit(|db| db.write(now, item_key(id), &item))
     }

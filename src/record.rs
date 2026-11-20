@@ -91,27 +91,35 @@ impl Record {
     /// superseded it was written, by that version's [`Hlc`], not when this
     /// Node learned of it; a version that arrives late can expire what it
     /// supersedes at once. A winning tombstone expires on its own, taking the
-    /// record with it. The latest live version is kept as long as the record,
-    /// so a deleted record's last content stays known. With `keep`, the
-    /// record stays even if its winning tombstone has expired.
+    /// record with it. The latest live version and the latest tombstone are
+    /// kept as long as the record, so a deleted record's last content, and
+    /// the last deletion of a record that came back, stay known. With
+    /// `keep`, the record stays even if its winning tombstone has expired.
     fn prune(&mut self, expired: impl Fn(&Hlc) -> bool, keep: bool) -> bool {
         let (latest_hlc, latest) = self.latest();
         if !keep && matches!(latest, Content::Deleted) && expired(latest_hlc) {
             return false;
         }
-        let latest_live = self
-            .versions
-            .iter()
-            .rev()
-            .find(|(_, content)| matches!(content, Content::Live { .. }))
-            .map(|(hlc, _)| hlc.clone());
+        let kept: Vec<Hlc> = self.latest_of_each_state().into_iter().cloned().collect();
         let hlcs: Vec<Hlc> = self.versions.keys().cloned().collect();
         for pair in hlcs.windows(2) {
-            if expired(&pair[1]) && latest_live.as_ref() != Some(&pair[0]) {
+            if expired(&pair[1]) && !kept.contains(&pair[0]) {
                 self.versions.remove(&pair[0]);
             }
         }
         true
+    }
+
+    /// The latest live version and the latest tombstone, where they exist.
+    fn latest_of_each_state(&self) -> Vec<&Hlc> {
+        let latest = |deleted: bool| {
+            self.versions
+                .iter()
+                .rev()
+                .find(|(_, content)| matches!(content, Content::Deleted) == deleted)
+                .map(|(hlc, _)| hlc)
+        };
+        latest(false).into_iter().chain(latest(true)).collect()
     }
 }
 

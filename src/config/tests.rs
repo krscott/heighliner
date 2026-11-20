@@ -219,11 +219,38 @@ fn unseen_settings_edit_keeps_resurrection_flagged() {
     sync(&mut a, &mut b, t(21));
     assert_eq!(b.config().problems, [Problem::Resurrected { item: ITEM }]);
 
+    // The flag stays until someone acts on it.
+    let later = t(21).saturating_add(DAY * 100);
+    b.prune(later, DAY * 30);
+    assert_eq!(b.config().problems, [Problem::Resurrected { item: ITEM }]);
+
     // An edit that has seen the untrack restores the Item.
-    b.update_item(t(22), ITEM, |_| {}).unwrap();
-    sync(&mut a, &mut b, t(23));
+    b.update_item(later, ITEM, |_| {}).unwrap();
+    sync(&mut a, &mut b, later);
     assert_eq!(a.config().problems, []);
     assert_eq!(a.config().items[&ITEM].item.name, "renamed");
+}
+
+#[test]
+fn edits_after_pruning_keep_a_restore_acknowledged() {
+    let (mut a, mut b) = (db("a"), db("b"));
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(2));
+    b.add_replica(t(5), ITEM, &node("b"), replica("/x"))
+        .unwrap();
+    a.untrack(t(10), ITEM).unwrap();
+    sync(&mut a, &mut b, t(11));
+    a.update_item(t(12), ITEM, |_| {}).unwrap();
+    sync(&mut a, &mut b, t(13));
+
+    // a forgets the untrack, but b still has it.
+    let later = t(13).saturating_add(DAY * 31);
+    a.prune(later, DAY * 30);
+    a.update_item(later, ITEM, |item| item.name = "renamed".into())
+        .unwrap();
+    sync(&mut a, &mut b, later);
+    assert_eq!(a.config().problems, []);
 }
 
 #[test]
@@ -700,18 +727,21 @@ fn apply(dbs: &mut [ConfigDb], on: usize, now: impl Fn(usize) -> Timestamp, op: 
 }
 
 /// Checks that pruning left no version superseded more than `window` before
-/// `now`, other than a record's latest live version.
+/// `now`, other than a record's latest live version and latest tombstone.
 fn check_pruned(store: &Store, now: Timestamp, window: Duration) -> Result<(), TestCaseError> {
     for (key, record) in store.records() {
         let versions: Vec<_> = record.versions().collect();
-        let latest_live = versions
-            .iter()
-            .rev()
-            .find(|(_, content)| matches!(content, Content::Live { .. }))
-            .map(|(hlc, _)| *hlc);
+        let latest = |deleted: bool| {
+            versions
+                .iter()
+                .rev()
+                .find(|(_, content)| matches!(content, Content::Deleted) == deleted)
+                .map(|(hlc, _)| *hlc)
+        };
+        let kept = [latest(false), latest(true)];
         for pair in versions.windows(2) {
             let ((old, _), (successor, _)) = (pair[0], pair[1]);
-            if Some(old) != latest_live {
+            if !kept.contains(&Some(old)) {
                 prop_assert!(successor.wall.saturating_add(window) >= now, "{key:?}");
             }
         }

@@ -87,10 +87,12 @@ impl Record {
 
     /// Drops expired versions, and returns whether anything is left.
     ///
-    /// A superseded version expires with the version that superseded it, and
-    /// a winning tombstone expires on its own, taking the record with it. The
-    /// latest live version is kept as long as the record, so a deleted
-    /// record's last content stays known.
+    /// A superseded version expires one window after the version that
+    /// superseded it was written, by that version's [`Hlc`], not when this
+    /// Node learned of it; a version that arrives late can expire what it
+    /// supersedes at once. A winning tombstone expires on its own, taking the
+    /// record with it. The latest live version is kept as long as the record,
+    /// so a deleted record's last content stays known.
     fn prune(&mut self, expired: impl Fn(&Hlc) -> bool) -> bool {
         let (latest_hlc, latest) = self.latest();
         if matches!(latest, Content::Deleted) && expired(latest_hlc) {

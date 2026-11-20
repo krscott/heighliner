@@ -358,6 +358,8 @@ pub struct ConfigDb {
 impl ConfigDb {
     /// Opens `store` on `node`. The clock starts after every stored version,
     /// so local edits supersede them even if the wall clock went back.
+    /// Pruning can remove the latest versions the clock has seen, so this
+    /// only bounds the clock by what is still stored.
     pub fn new(node: NodeId, store: Store) -> Self {
         let mut clock = Clock::new(node);
         if let Some(hlc) = store.max_hlc() {

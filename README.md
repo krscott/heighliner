@@ -1,7 +1,8 @@
 # heighliner
 
 A control plane that tracks directories across a Tailscale fleet and keeps them
-replicated with Syncthing.
+replicated with Syncthing. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
+and [docs/adr](docs/adr) for the foundational decisions.
 
 Heighliner is under development and not usable yet.
 

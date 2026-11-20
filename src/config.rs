@@ -129,7 +129,9 @@ pub enum Problem {
     /// one with a newer schema. It is kept but not used.
     Unreadable { key: RecordKey, error: String },
     /// An untracked Item that is back because one of its Replicas or its
-    /// settings changed without seeing the untrack.
+    /// settings changed without seeing the untrack. When the settings change
+    /// won, the flag lasts until the untrack expires, one Retention Window
+    /// after that change.
     Resurrected { item: ItemId },
     /// A Replica whose Item is unknown or unreadable. It is not synced.
     Orphaned { item: ItemId, node: NodeId },

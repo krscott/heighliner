@@ -15,7 +15,7 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ./Cargo.toml
       ./Cargo.lock
-      ./src
+      (lib.fileset.fileFilter (file: file.hasExt "rs") ./.)
     ];
   };
 

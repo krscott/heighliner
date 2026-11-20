@@ -3,12 +3,15 @@ set positional-arguments
 default:
     just --list
 
+# Build with Cargo.
 build:
     cargo build --locked
 
+# Run with Cargo, passing arguments to heighliner.
 run *args:
     cargo run --locked -- "$@"
 
+# Run tests with Cargo.
 test:
     cargo test --locked
 
@@ -56,10 +59,11 @@ _format mode *files:
                 fi
             ;;
             *.rs)
+                # skip_children: format only this file, not the modules it declares.
                 if [[ "$mode" == check ]]; then
-                    rustfmt --check "$file"
+                    rustfmt --check --config skip_children=true "$file"
                 else
-                    rustfmt "$file"
+                    rustfmt --config skip_children=true "$file"
                 fi
             ;;
             *.sh|.githooks/*|*/.githooks/*)

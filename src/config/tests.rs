@@ -232,7 +232,7 @@ fn unseen_settings_edit_keeps_resurrection_flagged() {
 }
 
 #[test]
-fn edits_after_pruning_keep_a_restore_acknowledged() {
+fn pruning_keeps_the_untrack_a_restore_acknowledged() {
     let (mut a, mut b) = (db("a"), db("b"));
     a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
         .unwrap();
@@ -244,7 +244,8 @@ fn edits_after_pruning_keep_a_restore_acknowledged() {
     a.update_item(t(12), ITEM, |_| {}).unwrap();
     sync(&mut a, &mut b, t(13));
 
-    // a forgets the untrack, but b still has it.
+    // Pruning on a must keep the untrack, or the rename would not have
+    // seen it once b sends it back.
     let later = t(13).saturating_add(DAY * 31);
     a.prune(later, DAY * 30);
     a.update_item(later, ITEM, |item| item.name = "renamed".into())

@@ -451,9 +451,11 @@ impl ConfigDb {
         let original = self.item(id)?.item;
         let mut item = original.clone();
         edit(&mut item);
-        // Pruning may have dropped untracks the settings already saw.
-        let stored_untrack = self.store.get(&item_key(id)).and_then(latest_untrack);
-        let seen_untrack = original.seen_untrack().max(stored_untrack).cloned();
+        let seen_untrack = self
+            .store
+            .get(&item_key(id))
+            .and_then(latest_untrack)
+            .cloned();
         item.keep_hidden_fields(original, seen_untrack);
         self.edit(|db| db.write(now, item_key(id), &item))
     }

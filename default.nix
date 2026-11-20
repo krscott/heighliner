@@ -1,29 +1,25 @@
 {
   lib,
-  stdenv,
+  rustPlatform,
 }:
 
-stdenv.mkDerivation {
-  name = "heighliner";
+let
+  cargoToml = lib.importTOML ./Cargo.toml;
+in
+rustPlatform.buildRustPackage {
+  pname = cargoToml.package.name;
+  inherit (cargoToml.package) version;
 
-  src = lib.cleanSource ./.;
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./Cargo.toml
+      ./Cargo.lock
+      ./src
+    ];
+  };
 
-  nativeBuildInputs = [ ];
-  buildInputs = [ ];
-
-  installPhase = ''
-    runHook preInstall
-
-    mkdir -p "$out/bin"
-    printf '%s\n' \
-      '#!/usr/bin/env bash' \
-      'set -euo pipefail' \
-      'echo "Hello from heighliner"' \
-      >"$out/bin/heighliner"
-    chmod +x "$out/bin/heighliner"
-
-    runHook postInstall
-  '';
+  cargoLock.lockFile = ./Cargo.lock;
 
   meta.mainProgram = "heighliner";
 }

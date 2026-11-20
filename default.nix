@@ -16,11 +16,15 @@ rustPlatform.buildRustPackage {
     # included by default.
     fileset = lib.fileset.difference ./. (
       lib.fileset.unions [
-        (lib.fileset.fileFilter (file: file.hasExt "md" || file.hasExt "nix") ./.)
-        ./flake.lock
-        ./justfile
         ./.githooks
         ./.github
+        ./GLOSSARY.md
+        ./README.md
+        ./default.nix
+        ./docs
+        ./flake.lock
+        ./flake.nix
+        ./justfile
       ]
     );
   };

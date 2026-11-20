@@ -12,11 +12,17 @@ rustPlatform.buildRustPackage {
 
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [
-      ./Cargo.toml
-      ./Cargo.lock
-      (lib.fileset.fileFilter (file: file.hasExt "rs") ./.)
-    ];
+    # Exclude only files the build can't use, so new build inputs are
+    # included by default.
+    fileset = lib.fileset.difference ./. (
+      lib.fileset.unions [
+        (lib.fileset.fileFilter (file: file.hasExt "md" || file.hasExt "nix") ./.)
+        ./flake.lock
+        ./justfile
+        ./.githooks
+        ./.github
+      ]
+    );
   };
 
   cargoLock.lockFile = ./Cargo.lock;

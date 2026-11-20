@@ -1,0 +1,80 @@
+# Heighliner
+
+Heighliner tracks data across a Tailscale fleet and keeps it replicated between
+nodes, continuing to work while LANs are cut off from each other.
+
+## Fleet
+
+**Fleet**:
+The set of tailnet devices owned by the user that run heighliner.
+_Avoid_: Cluster, network, tailnet (the tailnet may contain non-members)
+
+**Node**:
+One member of the Fleet, identified by its Tailscale identity.
+_Avoid_: Host, peer, device, machine
+
+**Departed Node**:
+A former Node that has left the tailnet or was explicitly removed from the
+Fleet. Unlike an offline Node, it is not expected to come back.
+_Avoid_: Removed node, dead node
+
+## Data
+
+**Item**:
+A directory tree that the Fleet tracks, with a permanent identity and an
+editable name; names are not guaranteed unique. It may exclude some of its
+contents, which is also how a single file is tracked.
+_Avoid_: Tracked Item, share, folder, resource, sync
+
+**Replica**:
+One copy of an Item, at a specific path on a specific Node.
+_Avoid_: Location, copy, mirror (mirror is a Role)
+
+**Role**:
+How a Replica takes part in its Item: a **source** only sends changes, a
+**mirror** only receives them, and a **peer** does both.
+_Avoid_: Mode, direction
+
+**Direction**:
+Whether an Item is **one-way** (exactly one source and one or more mirrors) or
+**two-way** (one or more peers and any number of mirrors).
+_Avoid_: Sync mode, sync type
+
+## Replication state
+
+**Replica State**:
+What a Replica knows about its own freshness: **current** (has everything its
+reachable senders have), **syncing**, **behind** (its senders are unreachable;
+last confirmed current at a known time), **error**, or **paused**.
+_Avoid_: Sync status, health
+
+**Fully Replicated**:
+An Item whose every Replica was confirmed current within one connected window.
+_Avoid_: In sync, synced (ambiguous when part of the Fleet is unreachable)
+
+## Conflicts and history
+
+**Data Conflict**:
+A file changed on two Replicas without either change having seen the other, for
+example concurrent edits, or an edit on one Replica and a delete on another.
+_Avoid_: Merge conflict, collision
+
+**Displaced Version**:
+A file's previous content that sync replaced or deleted, kept on the Node where
+it was displaced.
+_Avoid_: Backup, snapshot, old file
+
+**Retention Window**:
+How long Displaced Versions and the losing side of a Data Conflict are kept and
+can be restored.
+_Avoid_: TTL, grace period
+
+## Relationships
+
+- An **Item** has one or more **Replicas**; each **Replica** is on exactly one **Node** and has exactly one **Role**.
+- Tracking a path creates an **Item** with its first **Replica**; syncing it somewhere adds another **Replica**.
+- An **Item**'s **Direction** limits which **Roles** its **Replicas** may have: a source exists only in a one-way **Item**, and a peer only in a two-way one.
+- The **Replicas** of a **Departed Node** stay until they are removed explicitly.
+- Removing a **Replica** or untracking an **Item** never deletes files.
+- Every data movement is ongoing replication between **Replicas**; there is no one-shot copy or move.
+- A **Data Conflict** is resolved by keeping one side and making the other a **Displaced Version**, which can be reversed within the **Retention Window**.

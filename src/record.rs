@@ -1,0 +1,352 @@
+//! The replicated record store.
+//!
+//! A record is the set of all its retained versions, keyed by [`Hlc`]. The
+//! latest version wins (last-write-wins); a tombstone is a version that
+//! deletes the record. Merging two stores is the union of their versions,
+//! which makes merge commutative, associative and idempotent by construction.
+//!
+//! Versions are opaque JSON fields plus a schema version, so record kinds and
+//! fields this version of heighliner doesn't know are kept and passed on
+//! unchanged.
+
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::hlc::{Hlc, Timestamp};
+
+/// Identifies a record: its kind (such as `item`) and its ID within the kind.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RecordKey {
+    pub kind: String,
+    pub id: String,
+}
+
+/// The content of one version of a record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum Content {
+    Live {
+        schema: u32,
+        fields: Map<String, Value>,
+    },
+    Deleted,
+}
+
+impl Content {
+    /// Orders two contents written with the same [`Hlc`], which only a bug or
+    /// a corrupt peer can produce, so that every Node keeps the same one.
+    fn tie_break_key(&self) -> String {
+        // serde_json's Map is sorted by key, so this serialization is canonical.
+        serde_json::to_string(self).expect("JSON values always serialize")
+    }
+}
+
+/// All retained versions of one record. Never empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    versions: BTreeMap<Hlc, Content>,
+}
+
+impl Record {
+    fn new(hlc: Hlc, content: Content) -> Self {
+        Self {
+            versions: BTreeMap::from([(hlc, content)]),
+        }
+    }
+
+    /// The winning version.
+    pub fn latest(&self) -> (&Hlc, &Content) {
+        self.versions
+            .last_key_value()
+            .expect("records are never empty")
+    }
+
+    /// Every retained version, oldest first.
+    pub fn versions(&self) -> impl DoubleEndedIterator<Item = (&Hlc, &Content)> {
+        self.versions.iter()
+    }
+
+    fn insert(&mut self, hlc: Hlc, content: Content) {
+        match self.versions.entry(hlc) {
+            Entry::Vacant(entry) => {
+                entry.insert(content);
+            }
+            Entry::Occupied(mut entry) => {
+                if content.tie_break_key() > entry.get().tie_break_key() {
+                    entry.insert(content);
+                }
+            }
+        }
+    }
+
+    /// Drops expired versions, and returns whether anything is left.
+    ///
+    /// A superseded version expires with the version that superseded it, and
+    /// a winning tombstone expires on its own, taking the record with it.
+    fn prune(&mut self, expired: impl Fn(&Hlc) -> bool) -> bool {
+        let (latest_hlc, latest) = self.latest();
+        if matches!(latest, Content::Deleted) && expired(latest_hlc) {
+            return false;
+        }
+        let hlcs: Vec<Hlc> = self.versions.keys().cloned().collect();
+        for pair in hlcs.windows(2) {
+            if expired(&pair[1]) {
+                self.versions.remove(&pair[0]);
+            }
+        }
+        true
+    }
+}
+
+/// A set of records.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
+pub struct Store {
+    records: BTreeMap<RecordKey, Record>,
+}
+
+impl Store {
+    pub fn get(&self, key: &RecordKey) -> Option<&Record> {
+        self.records.get(key)
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = (&RecordKey, &Record)> {
+        self.records.iter()
+    }
+
+    /// Adds one version. If it is the latest, it becomes the record's value.
+    pub fn insert(&mut self, key: RecordKey, hlc: Hlc, content: Content) {
+        match self.records.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(Record::new(hlc, content));
+            }
+            Entry::Occupied(mut entry) => entry.get_mut().insert(hlc, content),
+        }
+    }
+
+    /// Adds every version from `other`.
+    pub fn merge(&mut self, other: &Store) {
+        for (key, record) in &other.records {
+            for (hlc, content) in &record.versions {
+                self.insert(key.clone(), hlc.clone(), content.clone());
+            }
+        }
+    }
+
+    /// The latest [`Hlc`] of any retained version.
+    pub fn max_hlc(&self) -> Option<&Hlc> {
+        self.records
+            .values()
+            .flat_map(|record| record.versions.keys())
+            .max()
+    }
+
+    /// Drops versions and tombstones that expired more than `window` ago.
+    pub fn prune(&mut self, now: Timestamp, window: Duration) {
+        let expired = |hlc: &Hlc| hlc.wall.saturating_add(window) < now;
+        self.records.retain(|_, record| record.prune(expired));
+    }
+}
+
+/// How a record is serialized, since JSON map keys must be strings.
+#[derive(Clone, Serialize, Deserialize)]
+struct WireRecord {
+    kind: String,
+    id: String,
+    versions: Vec<WireVersion>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WireVersion {
+    hlc: Hlc,
+    content: Content,
+}
+
+impl From<Vec<WireRecord>> for Store {
+    fn from(records: Vec<WireRecord>) -> Self {
+        let mut store = Self::default();
+        for record in records {
+            let key = RecordKey {
+                kind: record.kind,
+                id: record.id,
+            };
+            for version in record.versions {
+                store.insert(key.clone(), version.hlc, version.content);
+            }
+        }
+        store
+    }
+}
+
+impl From<Store> for Vec<WireRecord> {
+    fn from(store: Store) -> Self {
+        store
+            .records
+            .into_iter()
+            .map(|(key, record)| WireRecord {
+                kind: key.kind,
+                id: key.id,
+                versions: record
+                    .versions
+                    .into_iter()
+                    .map(|(hlc, content)| WireVersion { hlc, content })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    use super::*;
+    use crate::model::NodeId;
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn key(kind: &str, id: &str) -> RecordKey {
+        RecordKey {
+            kind: kind.to_owned(),
+            id: id.to_owned(),
+        }
+    }
+
+    fn hlc(wall: u64, counter: u32, node: &str) -> Hlc {
+        Hlc {
+            wall: Timestamp::from_millis(wall),
+            counter,
+            node: NodeId::new(node).unwrap(),
+        }
+    }
+
+    fn live(value: i64) -> Content {
+        Content::Live {
+            schema: 1,
+            fields: Map::from_iter([("value".to_owned(), json!(value))]),
+        }
+    }
+
+    fn days(n: u64) -> u64 {
+        u64::try_from((DAY * u32::try_from(n).unwrap()).as_millis()).unwrap()
+    }
+
+    #[test]
+    fn latest_version_wins() {
+        let mut store = Store::default();
+        store.insert(key("k", "1"), hlc(2, 0, "a"), live(2));
+        store.insert(key("k", "1"), hlc(1, 0, "b"), live(1));
+        assert_eq!(store.get(&key("k", "1")).unwrap().latest().1, &live(2));
+    }
+
+    #[test]
+    fn prune_keeps_superseded_versions_for_the_window() {
+        let mut store = Store::default();
+        store.insert(key("k", "1"), hlc(0, 0, "a"), live(0));
+        store.insert(key("k", "1"), hlc(days(10), 0, "a"), live(1));
+        store.insert(key("k", "1"), hlc(days(20), 0, "a"), live(2));
+
+        // The first version was superseded on day 10, so it expires on day 40.
+        store.prune(Timestamp::from_millis(days(40)), DAY * 30);
+        assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 3);
+        store.prune(Timestamp::from_millis(days(40) + 1), DAY * 30);
+        assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 2);
+
+        // The winner never expires.
+        store.prune(Timestamp::from_millis(days(1000)), DAY * 30);
+        let record = store.get(&key("k", "1")).unwrap();
+        assert_eq!(record.versions().count(), 1);
+        assert_eq!(record.latest().1, &live(2));
+    }
+
+    #[test]
+    fn prune_drops_expired_tombstones() {
+        let mut store = Store::default();
+        store.insert(key("k", "1"), hlc(0, 0, "a"), live(0));
+        store.insert(key("k", "1"), hlc(days(1), 0, "a"), Content::Deleted);
+        store.prune(Timestamp::from_millis(days(31)), DAY * 30);
+        assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 2);
+        store.prune(Timestamp::from_millis(days(31) + 1), DAY * 30);
+        assert!(store.get(&key("k", "1")).is_none());
+    }
+
+    #[test]
+    fn unknown_kinds_survive_serialization() {
+        let mut store = Store::default();
+        store.insert(key("future-kind", "x"), hlc(1, 0, "a"), live(7));
+        let json = serde_json::to_string(&store).unwrap();
+        let mut copy = Store::default();
+        copy.merge(&serde_json::from_str(&json).unwrap());
+        assert_eq!(copy, store);
+    }
+
+    fn arb_content() -> impl Strategy<Value = Content> {
+        prop_oneof![
+            Just(Content::Deleted),
+            (0..3u32, 0..3i64).prop_map(|(schema, value)| Content::Live {
+                schema,
+                fields: Map::from_iter([("value".to_owned(), json!(value))]),
+            }),
+        ]
+    }
+
+    fn arb_store() -> impl Strategy<Value = Store> {
+        // Small pools so that keys and HLCs collide, including the same HLC
+        // with different content.
+        let version = (
+            prop::sample::select(vec!["item", "replica", "unknown"]),
+            0..3u8,
+            0..4u64,
+            0..2u32,
+            prop::sample::select(vec!["a", "b"]),
+            arb_content(),
+        );
+        prop::collection::vec(version, 0..12).prop_map(|versions| {
+            let mut store = Store::default();
+            for (kind, id, wall, counter, node, content) in versions {
+                store.insert(
+                    key(kind, &id.to_string()),
+                    hlc(wall, counter, node),
+                    content,
+                );
+            }
+            store
+        })
+    }
+
+    fn merged(a: &Store, b: &Store) -> Store {
+        let mut out = a.clone();
+        out.merge(b);
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn merge_is_commutative(a in arb_store(), b in arb_store()) {
+            prop_assert_eq!(merged(&a, &b), merged(&b, &a));
+        }
+
+        #[test]
+        fn merge_is_associative(a in arb_store(), b in arb_store(), c in arb_store()) {
+            prop_assert_eq!(merged(&merged(&a, &b), &c), merged(&a, &merged(&b, &c)));
+        }
+
+        #[test]
+        fn merge_is_idempotent(a in arb_store(), b in arb_store()) {
+            prop_assert_eq!(merged(&a, &a), a.clone());
+            let ab = merged(&a, &b);
+            prop_assert_eq!(merged(&ab, &b), ab);
+        }
+
+        #[test]
+        fn serialization_round_trips(a in arb_store()) {
+            let json = serde_json::to_string(&a).unwrap();
+            prop_assert_eq!(serde_json::from_str::<Store>(&json).unwrap(), a);
+        }
+    }
+}

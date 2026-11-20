@@ -3,23 +3,17 @@ set positional-arguments
 default:
     just --list
 
+# Build with Cargo.
 build:
-    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''Hello from hello.sh\n'\''' > hello.sh
-    chmod +x hello.sh
+    cargo build --locked
 
-run: build
-    ./hello.sh
+# Run with Cargo, passing arguments to heighliner.
+run *args:
+    cargo run --locked -- "$@"
 
-# Test the locally built program.
-test: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    expected='Hello from hello.sh'
-    actual=$(./hello.sh)
-    if [[ "$actual" != "$expected" ]]; then
-        printf 'Expected: %s\nActual: %s\n' "$expected" "$actual" >&2
-        exit 1
-    fi
+# Run tests with Cargo.
+test:
+    cargo test --locked
 
 # Format files, or all tracked files when no files are provided.
 format *files:
@@ -64,6 +58,14 @@ _format mode *files:
                     nixfmt "$file"
                 fi
             ;;
+            *.rs)
+                # skip_children: format only this file, not the modules it declares.
+                if [[ "$mode" == check ]]; then
+                    rustfmt --check --config skip_children=true "$file"
+                else
+                    rustfmt --config skip_children=true "$file"
+                fi
+            ;;
             *.sh|.githooks/*|*/.githooks/*)
                 if [[ "$mode" == check ]]; then
                     shfmt -d -i 4 "$file"
@@ -74,7 +76,7 @@ _format mode *files:
         esac
     done
 
-# Check tracked shell scripts and Git hooks.
+# Lint Rust code, tracked shell scripts, and Git hooks.
 lint:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -84,8 +86,9 @@ lint:
             *.sh|.githooks/*) shellcheck "$file" ;;
         esac
     done < <(git ls-files -z)
+    cargo clippy --locked --all-targets -- -D warnings
 
-# Run non-mutating formatting, shell, and Nix checks.
+# Run non-mutating formatting, lint, and Nix checks.
 check: format-check lint
     nix flake check -L --no-update-lock-file
 

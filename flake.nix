@@ -14,8 +14,6 @@
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
       ];
     in
     flake-utils.lib.eachSystem supportedSystems (
@@ -31,12 +29,17 @@
           default = package;
         };
 
+        checks.package = package;
+
         devShells.default = pkgs.mkShell {
           inputsFrom = [ package ];
 
           packages = with pkgs; [
+            clippy
             just
             nixfmt
+            rust-analyzer
+            rustfmt
             shfmt
             shellcheck
             bash

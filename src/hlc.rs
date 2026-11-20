@@ -37,8 +37,9 @@ impl Timestamp {
 /// A hybrid logical clock reading.
 ///
 /// Readings are totally ordered: by wall time, then counter, then the Node
-/// that took them. A Node never takes the same reading twice, so two versions
-/// written by different edits never compare equal.
+/// that took them. A Node never takes the same reading twice (short of
+/// exhausting the clock at `u64::MAX` milliseconds), so two versions written
+/// by different edits never compare equal.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Hlc {
     pub wall: Timestamp,
@@ -50,12 +51,16 @@ pub struct Hlc {
 #[derive(Clone, Debug)]
 pub struct Clock {
     node: NodeId,
-    last: Option<(Timestamp, u32)>,
+    /// The latest reading taken or observed, as wall time and counter.
+    last: (Timestamp, u32),
 }
 
 impl Clock {
     pub fn new(node: NodeId) -> Self {
-        Self { node, last: None }
+        Self {
+            node,
+            last: (Timestamp(0), 0),
+        }
     }
 
     pub fn node(&self) -> &NodeId {
@@ -64,14 +69,16 @@ impl Clock {
 
     /// Takes a reading later than every earlier reading and every observed one.
     pub fn tick(&mut self, now: Timestamp) -> Hlc {
-        let (wall, counter) = match self.last {
-            Some((wall, counter)) if wall >= now => match counter.checked_add(1) {
-                Some(counter) => (wall, counter),
-                None => (wall.saturating_add(Duration::from_millis(1)), 0),
-            },
-            _ => (now, 0),
+        let (last_wall, last_counter) = self.last;
+        let (wall, counter) = if now > last_wall {
+            (now, 0)
+        } else {
+            match last_counter.checked_add(1) {
+                Some(counter) => (last_wall, counter),
+                None => (last_wall.saturating_add(Duration::from_millis(1)), 0),
+            }
         };
-        self.last = Some((wall, counter));
+        self.last = (wall, counter);
         Hlc {
             wall,
             counter,
@@ -81,10 +88,7 @@ impl Clock {
 
     /// Records a reading seen elsewhere, so the next tick is later than it.
     pub fn observe(&mut self, seen: &Hlc) {
-        let seen = (seen.wall, seen.counter);
-        if self.last.is_none_or(|last| seen > last) {
-            self.last = Some(seen);
-        }
+        self.last = self.last.max((seen.wall, seen.counter));
     }
 }
 

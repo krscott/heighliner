@@ -3,16 +3,24 @@ use serde_json::json;
 
 use super::*;
 use crate::hlc::Hlc;
+use crate::model::{Direction, ExcludePattern};
 
 const ITEM: ItemId = ItemId::from_u128(1);
 const OTHER: ItemId = ItemId::from_u128(2);
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn node(id: &str) -> NodeId {
     NodeId::new(id).unwrap()
 }
 
-fn path(p: &str) -> AbsPath {
-    AbsPath::new(p).unwrap()
+fn replica(p: &str) -> Replica {
+    Replica::new(AbsPath::new(p).unwrap())
+}
+
+fn mirror(p: &str) -> Replica {
+    let mut replica = replica(p);
+    replica.mirror = true;
+    replica
 }
 
 fn t(millis: u64) -> Timestamp {
@@ -23,30 +31,42 @@ fn db(id: &str) -> ConfigDb {
     ConfigDb::new(node(id), Store::default())
 }
 
-fn sync(a: &mut ConfigDb, b: &mut ConfigDb) {
+fn sync(a: &mut ConfigDb, b: &mut ConfigDb, now: Timestamp) {
     let a_store = a.store().clone();
-    b.merge(&a_store);
+    assert_eq!(b.merge(&a_store, now), 0);
     let b_store = b.store().clone();
-    a.merge(&b_store);
+    assert_eq!(a.merge(&b_store, now), 0);
 }
 
 fn two_way(name: &str) -> Item {
     Item::new(name, Direction::TwoWay)
 }
 
+fn one_way(name: &str, source: &str) -> Item {
+    Item::new(
+        name,
+        Direction::OneWay {
+            source: node(source),
+        },
+    )
+}
+
+fn would_cause(problem: Problem) -> Result<(), EditError> {
+    Err(EditError::WouldCause(problem))
+}
+
 #[test]
 fn track_and_derive_roles() {
     let mut a = db("a");
-    let one_way = Item::new("docs", Direction::OneWay { source: node("a") });
     a.track(
         t(1),
         ITEM,
-        &one_way,
+        one_way("docs", "a"),
         &node("a"),
-        &Replica::new(path("/srv/docs")),
+        replica("/srv"),
     )
     .unwrap();
-    a.add_replica(t(2), ITEM, &node("b"), &Replica::new(path("/srv/docs")))
+    a.add_replica(t(2), ITEM, &node("b"), replica("/srv"))
         .unwrap();
 
     let config = a.config();
@@ -55,101 +75,83 @@ fn track_and_derive_roles() {
     assert_eq!(entry.role(&node("b")), Some(Role::Mirror));
     assert_eq!(entry.role(&node("c")), None);
     assert_eq!(config.problems, []);
+
+    // The mirror stays a mirror when the Item becomes two-way.
+    a.update_item(t(3), ITEM, |item| item.direction = Direction::TwoWay)
+        .unwrap();
+    let entry = &a.config().items[&ITEM];
+    assert_eq!(entry.role(&node("a")), Some(Role::Peer));
+    assert_eq!(entry.role(&node("b")), Some(Role::Mirror));
 }
 
 #[test]
-fn one_way_source_needs_a_replica() {
+fn edits_that_leave_no_sender_are_refused() {
     let mut a = db("a");
-    let from_b = Item::new("docs", Direction::OneWay { source: node("b") });
-    assert!(matches!(
-        a.track(t(1), ITEM, &from_b, &node("a"), &Replica::new(path("/x"))),
-        Err(EditError::SourceWithoutReplica { .. })
-    ));
+    let no_sender = || would_cause(Problem::NoSender { item: ITEM });
+    assert_eq!(
+        a.track(t(1), ITEM, one_way("x", "b"), &node("a"), replica("/x")),
+        no_sender()
+    );
+    assert_eq!(
+        a.track(t(1), ITEM, two_way("x"), &node("a"), mirror("/x")),
+        no_sender()
+    );
 
-    a.track(
-        t(1),
-        ITEM,
-        &two_way("docs"),
-        &node("a"),
-        &Replica::new(path("/x")),
-    )
-    .unwrap();
-    let to_b = |item: &mut Item| item.direction = Direction::OneWay { source: node("b") };
-    assert!(matches!(
-        a.update_item(t(2), ITEM, to_b),
-        Err(EditError::SourceWithoutReplica { .. })
-    ));
-    a.add_replica(t(3), ITEM, &node("b"), &Replica::new(path("/x")))
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
         .unwrap();
-    a.update_item(t(4), ITEM, to_b).unwrap();
-    assert!(matches!(
-        a.remove_replica(t(5), ITEM, &node("b")),
-        Err(EditError::RemovesSource { .. })
-    ));
+    a.add_replica(t(2), ITEM, &node("b"), mirror("/x")).unwrap();
+    assert_eq!(
+        a.update_replica(t(3), ITEM, &node("a"), |r| r.mirror = true),
+        no_sender()
+    );
+    let to_one_way = |item: &mut Item| item.direction = Direction::OneWay { source: node("c") };
+    assert_eq!(a.update_item(t(3), ITEM, to_one_way), no_sender());
+
+    a.update_item(t(4), ITEM, |item| {
+        item.direction = Direction::OneWay { source: node("b") }
+    })
+    .unwrap();
+    assert_eq!(a.remove_replica(t(5), ITEM, &node("b")), no_sender());
     a.remove_replica(t(5), ITEM, &node("a")).unwrap();
+    assert_eq!(
+        a.remove_replica(t(6), ITEM, &node("b")),
+        Err(EditError::LastReplica { item: ITEM })
+    );
 }
 
 #[test]
-fn local_edits_refuse_overlaps() {
+fn edits_that_overlap_are_refused() {
     let mut a = db("a");
-    a.track(
-        t(1),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/srv")),
-    )
-    .unwrap();
-    assert!(matches!(
-        a.track(
-            t(2),
-            OTHER,
-            &two_way("y"),
-            &node("a"),
-            &Replica::new(path("/srv/sub"))
-        ),
-        Err(EditError::Overlap { .. })
-    ));
-    a.track(
-        t(2),
-        OTHER,
-        &two_way("y"),
-        &node("b"),
-        &Replica::new(path("/srv/sub")),
-    )
-    .unwrap();
-    assert!(matches!(
-        a.add_replica(t(3), OTHER, &node("a"), &Replica::new(path("/"))),
-        Err(EditError::Overlap { .. })
-    ));
-    a.add_replica(t(3), OTHER, &node("a"), &Replica::new(path("/other")))
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/srv"))
         .unwrap();
-    assert!(matches!(
-        a.update_replica(t(4), OTHER, &node("a"), |r| r.path = path("/srv")),
-        Err(EditError::Overlap { .. })
-    ));
+    let overlap = || {
+        would_cause(Problem::Overlap {
+            node: node("a"),
+            items: [ITEM, OTHER],
+        })
+    };
+    assert_eq!(
+        a.track(t(2), OTHER, two_way("y"), &node("a"), replica("/srv/sub")),
+        overlap()
+    );
+    a.track(t(2), OTHER, two_way("y"), &node("b"), replica("/srv/sub"))
+        .unwrap();
+    assert_eq!(
+        a.add_replica(t(3), OTHER, &node("a"), replica("/")),
+        overlap()
+    );
+    a.add_replica(t(3), OTHER, &node("a"), replica("/other"))
+        .unwrap();
 }
 
 #[test]
-fn merged_overlap_is_reported() {
+fn merged_overlap_is_reported_and_editable() {
     let (mut a, mut b) = (db("a"), db("b"));
-    a.track(
-        t(1),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/srv")),
-    )
-    .unwrap();
-    b.track(
-        t(1),
-        OTHER,
-        &two_way("y"),
-        &node("a"),
-        &Replica::new(path("/srv/sub")),
-    )
-    .unwrap();
-    sync(&mut a, &mut b);
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/srv"))
+        .unwrap();
+    b.track(t(1), OTHER, two_way("y"), &node("a"), replica("/srv/sub"))
+        .unwrap();
+    sync(&mut a, &mut b, t(2));
     assert_eq!(
         a.config().problems,
         [Problem::Overlap {
@@ -157,59 +159,71 @@ fn merged_overlap_is_reported() {
             items: [ITEM, OTHER],
         }]
     );
+    // Edits that don't add a Problem are still allowed.
+    a.update_replica(t(3), OTHER, &node("a"), |r| r.paused = true)
+        .unwrap();
 }
 
 #[test]
 fn concurrent_edits_last_write_wins() {
     let (mut a, mut b) = (db("a"), db("b"));
-    a.track(
-        t(1),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/x")),
-    )
-    .unwrap();
-    sync(&mut a, &mut b);
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(2));
     b.update_item(t(20), ITEM, |item| item.name = "from b".into())
         .unwrap();
     a.update_item(t(10), ITEM, |item| item.name = "from a".into())
         .unwrap();
-    sync(&mut a, &mut b);
+    sync(&mut a, &mut b, t(21));
     assert_eq!(a.config(), b.config());
     assert_eq!(a.config().items[&ITEM].item.name, "from b");
 }
 
 #[test]
+fn concurrent_rename_does_not_undo_untrack() {
+    let (mut a, mut b) = (db("a"), db("b"));
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(2));
+    a.untrack(t(10), ITEM).unwrap();
+    b.update_item(t(20), ITEM, |item| item.name = "renamed".into())
+        .unwrap();
+    sync(&mut a, &mut b, t(21));
+    assert_eq!(a.config(), Config::default());
+}
+
+#[test]
 fn edits_after_a_merge_supersede_what_was_merged() {
     let (mut a, mut b) = (db("a"), db("b"));
-    // a's wall clock is far ahead of b's.
-    a.track(
-        t(1_000),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/x")),
-    )
-    .unwrap();
-    sync(&mut a, &mut b);
+    // a's wall clock is a minute ahead of b's.
+    a.track(t(60_000), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(5));
     b.update_item(t(5), ITEM, |item| item.name = "renamed".into())
         .unwrap();
-    sync(&mut a, &mut b);
+    sync(&mut a, &mut b, t(6));
     assert_eq!(a.config().items[&ITEM].item.name, "renamed");
+}
+
+#[test]
+fn merge_leaves_out_versions_from_far_ahead() {
+    let mut ahead = db("ahead");
+    let far = MAX_CLOCK_DRIFT.as_millis() as u64 + 1;
+    ahead
+        .track(t(far), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    let mut a = db("a");
+    assert_eq!(a.merge(ahead.store(), t(0)), 2);
+    assert_eq!(a.config(), Config::default());
+    assert_eq!(a.merge(ahead.store(), t(1)), 0);
+    assert!(a.config().items.contains_key(&ITEM));
 }
 
 #[test]
 fn reopening_a_store_continues_its_clock() {
     let mut a = db("a");
-    a.track(
-        t(1_000),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/x")),
-    )
-    .unwrap();
+    a.track(t(1_000), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
     let mut reopened = ConfigDb::new(node("a"), a.store().clone());
     reopened
         .update_item(t(5), ITEM, |item| item.name = "renamed".into())
@@ -220,50 +234,48 @@ fn reopening_a_store_continues_its_clock() {
 #[test]
 fn replica_unseen_by_untrack_resurrects_the_item() {
     let (mut a, mut b) = (db("a"), db("b"));
-    a.track(
-        t(1),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/x")),
-    )
-    .unwrap();
-    sync(&mut a, &mut b);
-    b.add_replica(t(5), ITEM, &node("b"), &Replica::new(path("/x")))
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    sync(&mut a, &mut b, t(2));
+    b.add_replica(t(5), ITEM, &node("b"), replica("/x"))
         .unwrap();
     a.untrack(t(10), ITEM).unwrap();
-    sync(&mut a, &mut b);
+    sync(&mut a, &mut b, t(11));
 
-    let config = a.config();
-    assert_eq!(config.problems, [Problem::Resurrected { item: ITEM }]);
-    let entry = &config.items[&ITEM];
-    assert_eq!(entry.item.name, "x");
-    assert_eq!(entry.replicas.keys().collect::<Vec<_>>(), [&node("b")]);
+    let resurrected = |db: &ConfigDb| {
+        let config = db.config();
+        assert_eq!(config.problems, [Problem::Resurrected { item: ITEM }]);
+        let entry = &config.items[&ITEM];
+        assert_eq!(entry.item.name, "x");
+        assert_eq!(entry.replicas.keys().collect::<Vec<_>>(), [&node("b")]);
+    };
+    resurrected(&a);
+
+    // The Item's settings outlive the Retention Window while it has Replicas.
+    let later = t(11).saturating_add(DAY * 100);
+    a.prune(later, DAY * 30);
+    resurrected(&a);
 
     // Editing the Item restores it.
-    a.update_item(t(11), ITEM, |_| {}).unwrap();
+    a.update_item(later, ITEM, |_| {}).unwrap();
     assert_eq!(a.config().problems, []);
 }
 
 #[test]
 fn untrack_removes_every_replica() {
     let mut a = db("a");
-    a.track(
-        t(1),
-        ITEM,
-        &two_way("x"),
-        &node("a"),
-        &Replica::new(path("/x")),
-    )
-    .unwrap();
-    a.add_replica(t(2), ITEM, &node("b"), &Replica::new(path("/x")))
+    a.track(t(1), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    a.add_replica(t(2), ITEM, &node("b"), replica("/x"))
         .unwrap();
     a.untrack(t(3), ITEM).unwrap();
     assert_eq!(a.config(), Config::default());
     assert_eq!(a.untrack(t(4), ITEM), Err(EditError::UnknownItem(ITEM)));
+    a.prune(t(4).saturating_add(DAY * 31), DAY * 30);
+    assert_eq!(a.store(), &Store::default());
 }
 
-fn future_hlc() -> Hlc {
+fn foreign_hlc() -> Hlc {
     Hlc {
         wall: t(1),
         counter: 0,
@@ -278,25 +290,37 @@ fn live(schema: u32, fields: Value) -> Content {
     Content::Live { schema, fields }
 }
 
+fn foreign_store(records: Vec<(RecordKey, Content)>) -> Store {
+    let mut store = Store::default();
+    for (key, content) in records {
+        store.insert(key, foreign_hlc(), content);
+    }
+    store
+}
+
 #[test]
 fn unknown_fields_and_kinds_are_preserved() {
-    let mut future = Store::default();
-    future.insert(
-        item_key(ITEM),
-        future_hlc(),
-        live(
-            2,
-            json!({"name": "x", "direction": "two-way", "future": true}),
-        ),
-    );
     let gadget = RecordKey {
         kind: "gadget".into(),
         id: "g".into(),
     };
-    future.insert(gadget.clone(), future_hlc(), live(2, json!({"a": 1})));
+    let future = foreign_store(vec![
+        (
+            item_key(ITEM),
+            live(
+                1,
+                json!({"name": "x", "direction": "two-way", "future": true}),
+            ),
+        ),
+        (
+            replica_key(ITEM, &node("a")),
+            live(1, json!({"path": "/x"})),
+        ),
+        (gadget.clone(), live(7, json!({"a": 1}))),
+    ]);
 
     let mut a = db("a");
-    a.merge(&future);
+    a.merge(&future, t(2));
     a.update_item(t(2), ITEM, |item| item.name = "renamed".into())
         .unwrap();
 
@@ -304,7 +328,7 @@ fn unknown_fields_and_kinds_are_preserved() {
     assert_eq!(
         content,
         &live(
-            2,
+            1,
             json!({
                 "name": "renamed",
                 "direction": "two-way",
@@ -319,38 +343,83 @@ fn unknown_fields_and_kinds_are_preserved() {
 
 #[test]
 fn unreadable_records_are_kept_but_not_used() {
-    let mut future = Store::default();
-    future.insert(
-        item_key(ITEM),
-        future_hlc(),
-        live(2, json!({"name": "x", "direction": "n-way"})),
-    );
-    future.insert(
-        replica_key(ITEM, &node("a")),
-        future_hlc(),
-        live(2, json!({"path": "/x"})),
-    );
-
-    let mut a = db("a");
-    a.merge(&future);
-    let config = a.config();
-    assert!(config.items.is_empty());
-    assert!(matches!(
-        config.problems.as_slice(),
-        [
-            Problem::Unreadable { .. },
-            Problem::Orphaned { item: ITEM, .. }
-        ]
-    ));
-    assert_eq!(
-        a.update_item(t(2), ITEM, |_| {}),
-        Err(EditError::UnknownItem(ITEM))
-    );
-    a.untrack(t(2), ITEM).unwrap();
-    assert_eq!(a.config(), Config::default());
+    for item in [
+        live(SCHEMA + 1, json!({"name": "x", "direction": "two-way"})),
+        live(1, json!({"name": "x", "direction": "n-way"})),
+        live(
+            1,
+            json!({"name": "x", "direction": "two-way", "excludes": ["(?d)x"]}),
+        ),
+    ] {
+        let future = foreign_store(vec![
+            (item_key(ITEM), item),
+            (
+                replica_key(ITEM, &node("a")),
+                live(1, json!({"path": "/x"})),
+            ),
+        ]);
+        let mut a = db("a");
+        a.merge(&future, t(2));
+        let config = a.config();
+        assert!(config.items.is_empty());
+        assert!(matches!(
+            config.problems.as_slice(),
+            [
+                Problem::Unreadable { .. },
+                Problem::Orphaned { item: ITEM, .. }
+            ]
+        ));
+        assert_eq!(
+            a.update_item(t(2), ITEM, |_| {}),
+            Err(EditError::UnknownItem(ITEM))
+        );
+        a.untrack(t(2), ITEM).unwrap();
+        assert_eq!(a.config(), Config::default());
+    }
 }
 
-// Simulation: random edits on random Nodes, interleaved with partial syncs.
+#[test]
+fn non_canonical_keys_are_unreadable() {
+    let upper = ItemId::from_u128(0xabcdef).to_string().to_uppercase();
+    let future = foreign_store(vec![
+        (
+            RecordKey {
+                kind: ITEM_KIND.into(),
+                id: upper.clone(),
+            },
+            live(1, json!({"name": "x", "direction": "two-way"})),
+        ),
+        (
+            RecordKey {
+                kind: REPLICA_KIND.into(),
+                id: format!("{upper}/a"),
+            },
+            live(1, json!({"path": "/x"})),
+        ),
+    ]);
+    let config = Config::new(&future);
+    assert!(config.items.is_empty());
+    assert_eq!(config.problems.len(), 2);
+    assert!(
+        config
+            .problems
+            .iter()
+            .all(|p| matches!(p, Problem::Unreadable { .. }))
+    );
+}
+
+#[test]
+fn excludes_are_validated_when_set() {
+    assert!(ExcludePattern::new("(?d)*").is_err());
+    let mut item = two_way("x");
+    item.excludes = vec![ExcludePattern::new("*.tmp").unwrap()];
+    let mut a = db("a");
+    a.track(t(1), ITEM, item, &node("a"), replica("/x"))
+        .unwrap();
+}
+
+// Simulation: random edits on random Nodes with skewed clocks, interleaved
+// with partial syncs, pruning and restarts.
 
 const NODES: [&str; 3] = ["a", "b", "c"];
 const PATHS: [&str; 4] = ["/a", "/a/b", "/c", "/d"];
@@ -362,6 +431,7 @@ enum Op {
         node: usize,
         path: usize,
         one_way: bool,
+        mirror: bool,
     },
     Rename {
         item: u8,
@@ -387,7 +457,6 @@ enum Op {
     UpdateReplica {
         item: u8,
         node: usize,
-        path: usize,
         mirror: bool,
         paused: bool,
     },
@@ -398,6 +467,10 @@ enum Op {
     Sync {
         to: usize,
     },
+    Prune {
+        window: u64,
+    },
+    Restart,
 }
 
 /// An Op, the Node it runs on, and how far time advances before it.
@@ -408,43 +481,45 @@ fn arb_op() -> impl Strategy<Value = Op> {
     let node = 0..NODES.len();
     let path = 0..PATHS.len();
     prop_oneof![
-        (item.clone(), node.clone(), path.clone(), any::<bool>()).prop_map(
-            |(item, node, path, one_way)| Op::Track {
+        (
+            item.clone(),
+            node.clone(),
+            path.clone(),
+            any::<bool>(),
+            any::<bool>()
+        )
+            .prop_map(|(item, node, path, one_way, mirror)| Op::Track {
                 item,
                 node,
                 path,
-                one_way
-            }
-        ),
+                one_way,
+                mirror
+            }),
         (item.clone(), 0..2u8).prop_map(|(item, name)| Op::Rename { item, name }),
         (item.clone(), prop::option::of(node.clone()))
             .prop_map(|(item, source)| Op::SetDirection { item, source }),
         (item.clone(), any::<bool>()).prop_map(|(item, paused)| Op::PauseItem { item, paused }),
         item.clone().prop_map(|item| Op::Untrack { item }),
-        (item.clone(), node.clone(), path.clone(), any::<bool>()).prop_map(
-            |(item, node, path, mirror)| Op::AddReplica {
-                item,
-                node,
-                path,
-                mirror
-            }
-        ),
-        (
-            item.clone(),
-            node.clone(),
-            path,
-            any::<bool>(),
-            any::<bool>()
-        )
-            .prop_map(|(item, node, path, mirror, paused)| Op::UpdateReplica {
+        (item.clone(), node.clone(), path, any::<bool>()).prop_map(|(item, node, path, mirror)| {
+            Op::AddReplica {
                 item,
                 node,
                 path,
                 mirror,
+            }
+        }),
+        (item.clone(), node.clone(), any::<bool>(), any::<bool>()).prop_map(
+            |(item, node, mirror, paused)| Op::UpdateReplica {
+                item,
+                node,
+                mirror,
                 paused
-            }),
+            }
+        ),
         (item, node.clone()).prop_map(|(item, node)| Op::RemoveReplica { item, node }),
         node.prop_map(|to| Op::Sync { to }),
+        (0..20u64).prop_map(|window| Op::Prune { window }),
+        Just(Op::Restart),
     ]
 }
 
@@ -457,9 +532,9 @@ fn item_id(item: u8) -> ItemId {
 }
 
 /// Applies `op` on `dbs[on]`. Edits that validation refuses are skipped.
-fn apply(dbs: &mut [ConfigDb], on: usize, now: Timestamp, op: &Op) {
+fn apply(dbs: &mut [ConfigDb], on: usize, now: impl Fn(usize) -> Timestamp, op: &Op) {
     let nodes = NODES.map(node);
-    let paths = PATHS.map(path);
+    let at = now(on);
     let db = &mut dbs[on];
     let _ = match *op {
         Op::Track {
@@ -467,6 +542,7 @@ fn apply(dbs: &mut [ConfigDb], on: usize, now: Timestamp, op: &Op) {
             node,
             path,
             one_way,
+            mirror,
         } => {
             let direction = if one_way {
                 Direction::OneWay {
@@ -475,18 +551,20 @@ fn apply(dbs: &mut [ConfigDb], on: usize, now: Timestamp, op: &Op) {
             } else {
                 Direction::TwoWay
             };
+            let mut new = replica(PATHS[path]);
+            new.mirror = mirror;
             db.track(
-                now,
+                at,
                 item_id(item),
-                &Item::new(format!("item {item}"), direction),
+                Item::new(format!("item {item}"), direction),
                 &nodes[node],
-                &Replica::new(paths[path].clone()),
+                new,
             )
         }
         Op::Rename { item, name } => {
-            db.update_item(now, item_id(item), |i| i.name = format!("name {name}"))
+            db.update_item(at, item_id(item), |i| i.name = format!("name {name}"))
         }
-        Op::SetDirection { item, source } => db.update_item(now, item_id(item), |i| {
+        Op::SetDirection { item, source } => db.update_item(at, item_id(item), |i| {
             i.direction = match source {
                 Some(source) => Direction::OneWay {
                     source: nodes[source].clone(),
@@ -494,35 +572,41 @@ fn apply(dbs: &mut [ConfigDb], on: usize, now: Timestamp, op: &Op) {
                 None => Direction::TwoWay,
             }
         }),
-        Op::PauseItem { item, paused } => db.update_item(now, item_id(item), |i| i.paused = paused),
-        Op::Untrack { item } => db.untrack(now, item_id(item)),
+        Op::PauseItem { item, paused } => db.update_item(at, item_id(item), |i| i.paused = paused),
+        Op::Untrack { item } => db.untrack(at, item_id(item)),
         Op::AddReplica {
             item,
             node,
             path,
             mirror,
         } => {
-            let mut replica = Replica::new(paths[path].clone());
-            replica.mirror = mirror;
-            db.add_replica(now, item_id(item), &nodes[node], &replica)
+            let mut new = replica(PATHS[path]);
+            new.mirror = mirror;
+            db.add_replica(at, item_id(item), &nodes[node], new)
         }
         Op::UpdateReplica {
             item,
             node,
-            path,
             mirror,
             paused,
-        } => db.update_replica(now, item_id(item), &nodes[node], |r| {
-            r.path = paths[path].clone();
+        } => db.update_replica(at, item_id(item), &nodes[node], |r| {
             r.mirror = mirror;
             r.paused = paused;
         }),
-        Op::RemoveReplica { item, node } => db.remove_replica(now, item_id(item), &nodes[node]),
+        Op::RemoveReplica { item, node } => db.remove_replica(at, item_id(item), &nodes[node]),
         Op::Sync { to } => {
             if to < dbs.len() {
                 let store = dbs[on].store().clone();
-                dbs[to].merge(&store);
+                assert_eq!(dbs[to].merge(&store, now(to)), 0);
             }
+            Ok(())
+        }
+        Op::Prune { window } => {
+            db.prune(at, Duration::from_millis(window));
+            Ok(())
+        }
+        Op::Restart => {
+            *db = ConfigDb::new(nodes[on].clone(), db.store().clone());
             Ok(())
         }
     };
@@ -535,49 +619,70 @@ fn run(nodes: usize, skew: u64, steps: &[Step]) -> Result<Vec<ConfigDb>, TestCas
     let mut now = 0;
     for (on, advance, op) in steps {
         now += advance;
-        let offset = u64::try_from(*on).unwrap() * skew;
-        apply(&mut dbs, *on, t(now + offset), op);
+        let wall = |node: usize| t(now + u64::try_from(node).unwrap() * skew);
+        apply(&mut dbs, *on, wall, op);
         for db in &dbs {
-            check_valid(&db.config())?;
+            check_valid(db.store())?;
         }
     }
     Ok(dbs)
 }
 
-/// Checks the invariants every configuration must meet, however it was
-/// merged.
-fn check_valid(config: &Config) -> Result<(), TestCaseError> {
+/// Checks the invariants every configuration must meet, however its store
+/// was merged.
+fn check_valid(store: &Store) -> Result<Config, TestCaseError> {
+    let config = Config::new(store);
+
+    // Every live, readable Replica record is either in the configuration or
+    // reported as orphaned.
+    for (key, record) in store.records() {
+        if key.kind != REPLICA_KIND || !is_live(Some(record)) {
+            continue;
+        }
+        let (item, node) = parse_replica_id(&key.id).unwrap();
+        let listed = config
+            .items
+            .get(&item)
+            .is_some_and(|entry| entry.replicas.contains_key(&node));
+        let orphaned = config.problems.contains(&Problem::Orphaned {
+            item,
+            node: node.clone(),
+        });
+        prop_assert!(listed != orphaned, "{key:?}");
+    }
+
     for (id, entry) in &config.items {
+        prop_assert!(!entry.replicas.is_empty());
         let roles: Vec<Role> = entry
             .replicas
-            .keys()
-            .map(|node| entry.role(node).unwrap())
+            .iter()
+            .map(|(node, r)| entry.item.direction.role(node, r.mirror))
             .collect();
-        let sources = roles.iter().filter(|r| **r == Role::Source).count();
+        let count = |role| roles.iter().filter(|r| **r == role).count();
         match &entry.item.direction {
-            Direction::OneWay { source } => {
-                prop_assert!(!roles.contains(&Role::Peer));
-                if entry.replicas.contains_key(source) {
-                    prop_assert_eq!(sources, 1);
-                } else {
-                    prop_assert_eq!(sources, 0);
-                    let missing = Problem::MissingSource {
-                        item: *id,
-                        source: source.clone(),
-                    };
-                    prop_assert!(config.problems.contains(&missing));
-                }
+            Direction::OneWay { .. } => {
+                prop_assert!(count(Role::Source) <= 1);
+                prop_assert_eq!(count(Role::Peer), 0);
             }
-            Direction::TwoWay => prop_assert_eq!(sources, 0),
+            Direction::TwoWay => prop_assert_eq!(count(Role::Source), 0),
+        }
+        if count(Role::Source) + count(Role::Peer) == 0 {
+            let no_sender = Problem::NoSender { item: *id };
+            prop_assert!(config.problems.contains(&no_sender));
         }
     }
 
     for (a, a_entry) in &config.items {
         for (b, b_entry) in config.items.range(a..).skip(1) {
             for (node, a_replica) in &a_entry.replicas {
-                if let Some(b_replica) = b_entry.replicas.get(node)
-                    && a_replica.path.overlaps(&b_replica.path)
-                {
+                let Some(b_replica) = b_entry.replicas.get(node) else {
+                    continue;
+                };
+                let (a_path, b_path) = (a_replica.path().as_str(), b_replica.path().as_str());
+                let nested = |outer: &str, inner: &str| {
+                    outer == "/" || inner == outer || inner.starts_with(&format!("{outer}/"))
+                };
+                if nested(a_path, b_path) || nested(b_path, a_path) {
                     let overlap = Problem::Overlap {
                         node: node.clone(),
                         items: [*a, *b],
@@ -589,13 +694,11 @@ fn check_valid(config: &Config) -> Result<(), TestCaseError> {
     }
 
     for problem in &config.problems {
-        match problem {
-            Problem::Resurrected { item } => prop_assert!(config.items.contains_key(item)),
-            Problem::Orphaned { item, .. } => prop_assert!(!config.items.contains_key(item)),
-            _ => {}
+        if let Problem::Resurrected { item } = problem {
+            prop_assert!(config.items.contains_key(item));
         }
     }
-    Ok(())
+    Ok(config)
 }
 
 proptest! {
@@ -610,19 +713,15 @@ proptest! {
         for db in &dbs {
             all.merge(db.store());
         }
+        let config = check_valid(&all)?;
         for db in &mut dbs {
-            db.merge(&all);
-        }
-        let config = dbs[0].config();
-        check_valid(&config)?;
-        for db in &dbs[1..] {
-            prop_assert_eq!(db.store(), dbs[0].store());
+            db.merge(&all, t(u64::MAX / 2));
             prop_assert_eq!(&db.config(), &config);
         }
     }
 
     #[test]
-    fn a_single_node_edits_cause_no_problems(steps in arb_steps(1)) {
+    fn a_single_nodes_edits_cause_no_problems(steps in arb_steps(1)) {
         let dbs = run(1, 0, &steps)?;
         let problems = dbs[0].config().problems;
         prop_assert!(

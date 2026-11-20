@@ -1,14 +1,15 @@
 //! The Fleet's configuration: Items and Replicas stored as records.
 //!
 //! [`Config`] is derived from a [`Store`], so every merge result has a valid
-//! configuration. Merges can still produce situations a single Node's edits
-//! never would, such as overlapping Replicas or a resurrected Item; the
+//! configuration. An Item is tracked while it has a live Replica; its own
+//! record only holds its settings. Merges can produce situations local edits
+//! never would, such as overlapping Replicas or a resurrected Item, and the
 //! configuration reports those as [`Problem`]s instead of rejecting them.
 //!
-//! [`ConfigDb`] is one Node's copy of the store. It validates local edits and
-//! versions them with the Node's clock.
+//! [`ConfigDb`] is one Node's copy of the store. It refuses local edits that
+//! would add a Problem, and versions edits with the Node's clock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -17,14 +18,23 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::hlc::{Clock, Timestamp};
-use crate::model::{AbsPath, Direction, Item, ItemId, NodeId, Replica, Role};
+use crate::model::{AbsPath, Item, ItemId, NodeId, Replica, Role};
 use crate::record::{Content, Record, RecordKey, Store};
 
 pub const ITEM_KIND: &str = "item";
 pub const REPLICA_KIND: &str = "replica";
 
-/// The record schema version this version of heighliner writes.
+/// The record schema version this version of heighliner reads and writes.
+///
+/// Adding fields doesn't change it, since unknown fields are preserved. A
+/// change that older versions would misread increments it, and records with
+/// a newer schema are kept but not used.
 pub const SCHEMA: u32 = 1;
+
+/// How far ahead of the local clock a merged version may be. Later versions
+/// are left out until the local clock catches up, so one Node's wrong clock
+/// can't drag every Node's clock forward.
+pub const MAX_CLOCK_DRIFT: Duration = Duration::from_secs(5 * 60);
 
 fn item_key(item: ItemId) -> RecordKey {
     RecordKey {
@@ -40,18 +50,31 @@ fn replica_key(item: ItemId, node: &NodeId) -> RecordKey {
     }
 }
 
+/// Parses an Item record ID, which must be the ID's canonical form so that
+/// every Item has exactly one record.
+fn parse_item_id(id: &str) -> Result<ItemId, String> {
+    let item: ItemId = id.parse().map_err(|e| format!("{e}"))?;
+    if item.to_string() != id {
+        return Err(format!("item ID {id:?} is not in canonical form"));
+    }
+    Ok(item)
+}
+
 fn parse_replica_id(id: &str) -> Result<(ItemId, NodeId), String> {
     let (item, node) = id
         .split_once('/')
         .ok_or_else(|| format!("invalid replica ID {id:?}"))?;
     Ok((
-        item.parse().map_err(|e| format!("{e}"))?,
+        parse_item_id(item)?,
         NodeId::new(node).map_err(|e| format!("{e}"))?,
     ))
 }
 
 fn parse_fields<T: DeserializeOwned>(content: &Content) -> Option<Result<T, String>> {
     match content {
+        Content::Live { schema, .. } if *schema > SCHEMA => Some(Err(format!(
+            "schema {schema} is newer than this version's {SCHEMA}"
+        ))),
         Content::Live { fields, .. } => {
             Some(serde_json::from_value(Value::Object(fields.clone())).map_err(|e| e.to_string()))
         }
@@ -63,7 +86,7 @@ fn is_live(record: Option<&Record>) -> bool {
     record.is_some_and(|record| matches!(record.latest().1, Content::Live { .. }))
 }
 
-/// An Item with its Replicas, keyed by Node.
+/// A tracked Item with its Replicas, keyed by Node. There is at least one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemEntry {
     pub item: Item,
@@ -82,13 +105,19 @@ impl ItemEntry {
         let replica = self.replicas.get(node)?;
         Some(self.item.paused || replica.paused)
     }
+
+    fn has_sender(&self) -> bool {
+        self.replicas
+            .keys()
+            .any(|node| self.role(node) != Some(Role::Mirror))
+    }
 }
 
-/// Something in a merged configuration that needs the user's attention.
+/// Something in a configuration that needs the user's attention.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {
     /// A record of a known kind that this version can't read, for example
-    /// one written by a newer version. It is kept but not acted on.
+    /// one with a newer schema. It is kept but not used.
     Unreadable { key: RecordKey, error: String },
     /// An untracked Item that is back because one of its Replicas was added
     /// or changed without seeing the untrack.
@@ -97,10 +126,36 @@ pub enum Problem {
     Orphaned { item: ItemId, node: NodeId },
     /// Items that share a name.
     DuplicateName { name: String, items: Vec<ItemId> },
-    /// A one-way Item whose source has no Replica, so nothing sends.
-    MissingSource { item: ItemId, source: NodeId },
+    /// An Item none of whose Replicas sends: a one-way Item without a Replica
+    /// at its source, or a two-way Item whose Replicas are all mirrors.
+    NoSender { item: ItemId },
     /// Two Replicas on one Node whose paths overlap. Neither may be synced.
     Overlap { node: NodeId, items: [ItemId; 2] },
+}
+
+impl fmt::Display for Problem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable { key, error } => {
+                write!(f, "record {}/{} can't be read: {error}", key.kind, key.id)
+            }
+            Self::Resurrected { item } => write!(
+                f,
+                "item {item} was untracked, but a replica changed without seeing that brought it back"
+            ),
+            Self::Orphaned { item, node } => {
+                write!(f, "the replica on {node} belongs to unknown item {item}")
+            }
+            Self::DuplicateName { name, items } => {
+                write!(f, "{} items are named {name:?}", items.len())
+            }
+            Self::NoSender { item } => write!(f, "no replica of item {item} sends changes"),
+            Self::Overlap {
+                node,
+                items: [a, b],
+            } => write!(f, "the replicas of items {a} and {b} on {node} overlap"),
+        }
+    }
 }
 
 /// The configuration derived from a store.
@@ -110,11 +165,17 @@ pub struct Config {
     pub problems: Vec<Problem>,
 }
 
+/// The readable settings in an Item record.
+enum ItemSettings {
+    Live(Item),
+    /// The record is a tombstone; this is its last live content.
+    Untracked(Item),
+}
+
 impl Config {
     pub fn new(store: &Store) -> Self {
         let mut config = Self::default();
-        // Untracked Items, with their last live content if it is retained.
-        let mut untracked: BTreeMap<ItemId, Item> = BTreeMap::new();
+        let mut settings: BTreeMap<ItemId, ItemSettings> = BTreeMap::new();
         let mut replicas: BTreeMap<ItemId, BTreeMap<NodeId, Replica>> = BTreeMap::new();
 
         for (key, record) in store.records() {
@@ -124,22 +185,16 @@ impl Config {
             };
             match key.kind.as_str() {
                 ITEM_KIND => {
-                    let id = match key.id.parse::<ItemId>() {
+                    let id = match parse_item_id(&key.id) {
                         Ok(id) => id,
                         Err(e) => {
-                            config.problems.push(unreadable(e.to_string()));
+                            config.problems.push(unreadable(e));
                             continue;
                         }
                     };
                     match parse_fields::<Item>(record.latest().1) {
                         Some(Ok(item)) => {
-                            config.items.insert(
-                                id,
-                                ItemEntry {
-                                    item,
-                                    replicas: BTreeMap::new(),
-                                },
-                            );
+                            settings.insert(id, ItemSettings::Live(item));
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
                         None => {
@@ -148,7 +203,7 @@ impl Config {
                                 .rev()
                                 .find_map(|(_, content)| parse_fields::<Item>(content));
                             if let Some(Ok(item)) = last_live {
-                                untracked.insert(id, item);
+                                settings.insert(id, ItemSettings::Untracked(item));
                             }
                         }
                     }
@@ -175,26 +230,30 @@ impl Config {
         }
 
         for (id, item_replicas) in replicas {
-            if let Some(entry) = config.items.get_mut(&id) {
-                entry.replicas = item_replicas;
-            } else if let Some(item) = untracked.remove(&id) {
-                config.problems.push(Problem::Resurrected { item: id });
-                config.items.insert(
-                    id,
-                    ItemEntry {
-                        item,
-                        replicas: item_replicas,
-                    },
-                );
-            } else {
-                for node in item_replicas.into_keys() {
-                    config.problems.push(Problem::Orphaned { item: id, node });
+            let item = match settings.remove(&id) {
+                Some(ItemSettings::Live(item)) => item,
+                Some(ItemSettings::Untracked(item)) => {
+                    config.problems.push(Problem::Resurrected { item: id });
+                    item
                 }
-            }
+                None => {
+                    for node in item_replicas.into_keys() {
+                        config.problems.push(Problem::Orphaned { item: id, node });
+                    }
+                    continue;
+                }
+            };
+            config.items.insert(
+                id,
+                ItemEntry {
+                    item,
+                    replicas: item_replicas,
+                },
+            );
         }
 
         config.find_duplicate_names();
-        config.find_missing_sources();
+        config.find_items_without_senders();
         config.find_overlaps();
         config
     }
@@ -214,15 +273,10 @@ impl Config {
         }
     }
 
-    fn find_missing_sources(&mut self) {
+    fn find_items_without_senders(&mut self) {
         for (id, entry) in &self.items {
-            if let Direction::OneWay { source } = &entry.item.direction
-                && !entry.replicas.contains_key(source)
-            {
-                self.problems.push(Problem::MissingSource {
-                    item: *id,
-                    source: source.clone(),
-                });
+            if !entry.has_sender() {
+                self.problems.push(Problem::NoSender { item: *id });
             }
         }
     }
@@ -231,7 +285,7 @@ impl Config {
         let mut by_node: BTreeMap<&NodeId, Vec<(ItemId, &AbsPath)>> = BTreeMap::new();
         for (id, entry) in &self.items {
             for (node, replica) in &entry.replicas {
-                by_node.entry(node).or_default().push((*id, &replica.path));
+                by_node.entry(node).or_default().push((*id, replica.path()));
             }
         }
         let mut overlaps = Vec::new();
@@ -249,25 +303,6 @@ impl Config {
         }
         self.problems.extend(overlaps);
     }
-
-    /// Checks that a Replica of `item` at `path` on `node` would not overlap
-    /// another Item's Replica.
-    fn check_overlap(&self, item: ItemId, node: &NodeId, path: &AbsPath) -> Result<(), EditError> {
-        for (other, entry) in &self.items {
-            if *other == item {
-                continue;
-            }
-            if let Some(replica) = entry.replicas.get(node)
-                && replica.path.overlaps(path)
-            {
-                return Err(EditError::Overlap {
-                    node: node.clone(),
-                    item: *other,
-                });
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Why a local edit was refused.
@@ -283,22 +318,12 @@ pub enum EditError {
         item: ItemId,
         node: NodeId,
     },
-    /// The path overlaps a Replica of `item` on the same Node.
-    Overlap {
-        node: NodeId,
+    /// Removing an Item's last Replica; untrack the Item instead.
+    LastReplica {
         item: ItemId,
     },
-    /// A one-way Item's source must be a Node with a Replica.
-    SourceWithoutReplica {
-        item: ItemId,
-        source: NodeId,
-    },
-    /// A one-way Item's source Replica can't be removed; change the Direction
-    /// first.
-    RemovesSource {
-        item: ItemId,
-        node: NodeId,
-    },
+    /// The edit would cause a Problem that wasn't there before.
+    WouldCause(Problem),
 }
 
 impl fmt::Display for EditError {
@@ -312,16 +337,11 @@ impl fmt::Display for EditError {
             Self::UnknownReplica { item, node } => {
                 write!(f, "item {item} has no replica on {node}")
             }
-            Self::Overlap { node, item } => {
-                write!(f, "path overlaps the replica of item {item} on {node}")
-            }
-            Self::SourceWithoutReplica { item, source } => {
-                write!(f, "item {item} has no replica on its source {source}")
-            }
-            Self::RemovesSource { item, node } => write!(
+            Self::LastReplica { item } => write!(
                 f,
-                "the replica on {node} is the source of one-way item {item}; change its direction first"
+                "that is the last replica of item {item}; untrack the item instead"
             ),
+            Self::WouldCause(problem) => write!(f, "refused, because {problem}"),
         }
     }
 }
@@ -358,16 +378,38 @@ impl ConfigDb {
         Config::new(&self.store)
     }
 
-    /// Merges records from another Node. Later local edits supersede them.
-    pub fn merge(&mut self, other: &Store) {
-        if let Some(hlc) = other.max_hlc() {
-            self.clock.observe(hlc);
+    /// Merges records from another Node, and returns how many versions were
+    /// left out for being more than [`MAX_CLOCK_DRIFT`] ahead of `now`.
+    /// Later local edits supersede everything merged.
+    pub fn merge(&mut self, other: &Store, now: Timestamp) -> usize {
+        let limit = now.saturating_add(MAX_CLOCK_DRIFT);
+        let mut rejected = 0;
+        for (key, record) in other.records() {
+            for (hlc, content) in record.versions() {
+                if hlc.wall > limit {
+                    rejected += 1;
+                    continue;
+                }
+                self.clock.observe(hlc);
+                self.store.insert(key.clone(), hlc.clone(), content.clone());
+            }
         }
-        self.store.merge(other);
+        rejected
     }
 
+    /// Drops versions and tombstones that expired more than `window` ago. An
+    /// untracked Item's record is kept while a live Replica refers to it, so
+    /// a resurrected Item keeps its settings.
     pub fn prune(&mut self, now: Timestamp, window: Duration) {
-        self.store.prune(now, window);
+        let referenced: BTreeSet<RecordKey> = self
+            .store
+            .records()
+            .filter(|(key, record)| key.kind == REPLICA_KIND && is_live(Some(record)))
+            .filter_map(|(key, _)| parse_replica_id(&key.id).ok())
+            .map(|(item, _)| item_key(item))
+            .collect();
+        self.store
+            .prune(now, window, |key| referenced.contains(key));
     }
 
     /// Creates an Item with its first Replica.
@@ -375,48 +417,29 @@ impl ConfigDb {
         &mut self,
         now: Timestamp,
         id: ItemId,
-        item: &Item,
+        item: Item,
         node: &NodeId,
-        replica: &Replica,
+        replica: Replica,
     ) -> Result<(), EditError> {
         if self.store.get(&item_key(id)).is_some() {
             return Err(EditError::ItemExists(id));
         }
-        if let Direction::OneWay { source } = &item.direction
-            && source != node
-        {
-            return Err(EditError::SourceWithoutReplica {
-                item: id,
-                source: source.clone(),
-            });
-        }
-        self.config().check_overlap(id, node, &replica.path)?;
-        self.write(now, item_key(id), item);
-        self.write(now, replica_key(id, node), replica);
-        Ok(())
+        self.edit(|db| {
+            db.write(now, item_key(id), &item);
+            db.write(now, replica_key(id, node), &replica);
+        })
     }
 
-    /// Edits an Item. Editing a resurrected Item restores it.
+    /// Edits an Item's settings. Editing a resurrected Item restores it.
     pub fn update_item(
         &mut self,
         now: Timestamp,
         id: ItemId,
         edit: impl FnOnce(&mut Item),
     ) -> Result<(), EditError> {
-        let config = self.config();
-        let entry = config.items.get(&id).ok_or(EditError::UnknownItem(id))?;
-        let mut item = entry.item.clone();
+        let mut item = self.item(id)?.item.clone();
         edit(&mut item);
-        if let Direction::OneWay { source } = &item.direction
-            && !entry.replicas.contains_key(source)
-        {
-            return Err(EditError::SourceWithoutReplica {
-                item: id,
-                source: source.clone(),
-            });
-        }
-        self.write(now, item_key(id), &item);
-        Ok(())
+        self.edit(|db| db.write(now, item_key(id), &item))
     }
 
     /// Stops tracking an Item and removes all its Replicas, including ones
@@ -442,17 +465,17 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Adds a Replica. On a one-way Item, a Replica away from the source is
+    /// stored as a mirror, so it stays receive-only if the Item becomes
+    /// two-way.
     pub fn add_replica(
         &mut self,
         now: Timestamp,
         id: ItemId,
         node: &NodeId,
-        replica: &Replica,
+        mut replica: Replica,
     ) -> Result<(), EditError> {
-        let config = self.config();
-        if !config.items.contains_key(&id) {
-            return Err(EditError::UnknownItem(id));
-        }
+        let direction = self.item(id)?.item.direction.clone();
         let key = replica_key(id, node);
         if is_live(self.store.get(&key)) {
             return Err(EditError::ReplicaExists {
@@ -460,11 +483,14 @@ impl ConfigDb {
                 node: node.clone(),
             });
         }
-        config.check_overlap(id, node, &replica.path)?;
-        self.write(now, key, replica);
-        Ok(())
+        if direction.role(node, replica.mirror) == Role::Mirror {
+            replica.mirror = true;
+        }
+        self.edit(|db| db.write(now, key, &replica))
     }
 
+    /// Edits a Replica's settings. Its path can't change; remove the Replica
+    /// and add a new one instead.
     pub fn update_replica(
         &mut self,
         now: Timestamp,
@@ -472,9 +498,8 @@ impl ConfigDb {
         node: &NodeId,
         edit: impl FnOnce(&mut Replica),
     ) -> Result<(), EditError> {
-        let config = self.config();
-        let entry = config.items.get(&id).ok_or(EditError::UnknownItem(id))?;
-        let mut replica = entry
+        let mut replica = self
+            .item(id)?
             .replicas
             .get(node)
             .ok_or_else(|| EditError::UnknownReplica {
@@ -483,9 +508,7 @@ impl ConfigDb {
             })?
             .clone();
         edit(&mut replica);
-        config.check_overlap(id, node, &replica.path)?;
-        self.write(now, replica_key(id, node), &replica);
-        Ok(())
+        self.edit(|db| db.write(now, replica_key(id, node), &replica))
     }
 
     /// Removes a Replica, including one this version can't read. Its files
@@ -503,40 +526,51 @@ impl ConfigDb {
                 node: node.clone(),
             });
         }
-        if let Some(entry) = self.config().items.get(&id)
-            && entry.item.direction
-                == (Direction::OneWay {
-                    source: node.clone(),
-                })
+        if let Ok(entry) = self.item(id)
+            && entry.replicas.len() == 1
+            && entry.replicas.contains_key(node)
         {
-            return Err(EditError::RemovesSource {
-                item: id,
-                node: node.clone(),
-            });
+            return Err(EditError::LastReplica { item: id });
         }
-        self.delete(now, key);
+        self.edit(|db| db.delete(now, key))
+    }
+
+    fn item(&self, id: ItemId) -> Result<ItemEntry, EditError> {
+        self.config()
+            .items
+            .remove(&id)
+            .ok_or(EditError::UnknownItem(id))
+    }
+
+    /// Applies `write` unless it would add a Problem. Duplicate names are
+    /// allowed, since names need not be unique.
+    fn edit(&mut self, write: impl FnOnce(&mut Self)) -> Result<(), EditError> {
+        let before = self.config().problems;
+        let mut after = self.clone();
+        write(&mut after);
+        let added = after.config().problems.into_iter().find(|problem| {
+            !matches!(problem, Problem::DuplicateName { .. }) && !before.contains(problem)
+        });
+        if let Some(problem) = added {
+            return Err(EditError::WouldCause(problem));
+        }
+        *self = after;
         Ok(())
     }
 
-    /// Writes a new version of a record. It keeps the record's schema version
-    /// if that is newer, since the value carries forward unknown fields.
     fn write(&mut self, now: Timestamp, key: RecordKey, value: &impl Serialize) {
         let Value::Object(fields) = serde_json::to_value(value).expect("records serialize") else {
             unreachable!("records serialize to JSON objects");
         };
-        let stored_schema = self.store.get(&key).and_then(|record| {
-            record
-                .versions()
-                .rev()
-                .find_map(|(_, content)| match content {
-                    Content::Live { schema, .. } => Some(*schema),
-                    Content::Deleted => None,
-                })
-        });
-        let schema = stored_schema.map_or(SCHEMA, |stored| stored.max(SCHEMA));
         let hlc = self.clock.tick(now);
-        self.store
-            .insert(key, hlc, Content::Live { schema, fields });
+        self.store.insert(
+            key,
+            hlc,
+            Content::Live {
+                schema: SCHEMA,
+                fields,
+            },
+        );
     }
 
     fn delete(&mut self, now: Timestamp, key: RecordKey) {

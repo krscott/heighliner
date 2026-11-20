@@ -7,7 +7,9 @@
 //!
 //! Versions are opaque JSON fields plus a schema version, so record kinds and
 //! fields this version of heighliner doesn't know are kept and passed on
-//! unchanged.
+//! unchanged. The envelope around them (the [`Hlc`] and the [`Content`]
+//! states) is part of the protocol between Nodes, so changing it needs a new
+//! major protocol version.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -26,7 +28,7 @@ pub struct RecordKey {
 }
 
 /// The content of one version of a record.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum Content {
     Live {
@@ -38,7 +40,7 @@ pub enum Content {
 
 impl Content {
     /// Orders two contents written with the same [`Hlc`], which only a bug or
-    /// a corrupt peer can produce, so that every Node keeps the same one.
+    /// a corrupt Node can produce, so that every Node keeps the same one.
     fn tie_break_key(&self) -> String {
         // serde_json's Map is sorted by key, so this serialization is canonical.
         serde_json::to_string(self).expect("JSON values always serialize")
@@ -46,7 +48,7 @@ impl Content {
 }
 
 /// All retained versions of one record. Never empty.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     versions: BTreeMap<Hlc, Content>,
 }
@@ -86,15 +88,23 @@ impl Record {
     /// Drops expired versions, and returns whether anything is left.
     ///
     /// A superseded version expires with the version that superseded it, and
-    /// a winning tombstone expires on its own, taking the record with it.
+    /// a winning tombstone expires on its own, taking the record with it. The
+    /// latest live version is kept as long as the record, so a deleted
+    /// record's last content stays known.
     fn prune(&mut self, expired: impl Fn(&Hlc) -> bool) -> bool {
         let (latest_hlc, latest) = self.latest();
         if matches!(latest, Content::Deleted) && expired(latest_hlc) {
             return false;
         }
+        let latest_live = self
+            .versions
+            .iter()
+            .rev()
+            .find(|(_, content)| matches!(content, Content::Live { .. }))
+            .map(|(hlc, _)| hlc.clone());
         let hlcs: Vec<Hlc> = self.versions.keys().cloned().collect();
         for pair in hlcs.windows(2) {
-            if expired(&pair[1]) {
+            if expired(&pair[1]) && latest_live.as_ref() != Some(&pair[0]) {
                 self.versions.remove(&pair[0]);
             }
         }
@@ -103,7 +113,7 @@ impl Record {
 }
 
 /// A set of records.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
 pub struct Store {
     records: BTreeMap<RecordKey, Record>,
@@ -145,10 +155,12 @@ impl Store {
             .max()
     }
 
-    /// Drops versions and tombstones that expired more than `window` ago.
-    pub fn prune(&mut self, now: Timestamp, window: Duration) {
+    /// Drops versions and tombstones that expired more than `window` ago,
+    /// except in records for which `keep` returns true.
+    pub fn prune(&mut self, now: Timestamp, window: Duration, keep: impl Fn(&RecordKey) -> bool) {
         let expired = |hlc: &Hlc| hlc.wall.saturating_add(window) < now;
-        self.records.retain(|_, record| record.prune(expired));
+        self.records
+            .retain(|key, record| keep(key) || record.prune(expired));
     }
 }
 
@@ -233,7 +245,11 @@ mod tests {
     }
 
     fn days(n: u64) -> u64 {
-        u64::try_from((DAY * u32::try_from(n).unwrap()).as_millis()).unwrap()
+        n * 24 * 60 * 60 * 1000
+    }
+
+    fn prune(store: &mut Store, now: u64) {
+        store.prune(Timestamp::from_millis(now), DAY * 30, |_| false);
     }
 
     #[test]
@@ -252,13 +268,13 @@ mod tests {
         store.insert(key("k", "1"), hlc(days(20), 0, "a"), live(2));
 
         // The first version was superseded on day 10, so it expires on day 40.
-        store.prune(Timestamp::from_millis(days(40)), DAY * 30);
+        prune(&mut store, days(40));
         assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 3);
-        store.prune(Timestamp::from_millis(days(40) + 1), DAY * 30);
+        prune(&mut store, days(40) + 1);
         assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 2);
 
         // The winner never expires.
-        store.prune(Timestamp::from_millis(days(1000)), DAY * 30);
+        prune(&mut store, days(1000));
         let record = store.get(&key("k", "1")).unwrap();
         assert_eq!(record.versions().count(), 1);
         assert_eq!(record.latest().1, &live(2));
@@ -269,10 +285,33 @@ mod tests {
         let mut store = Store::default();
         store.insert(key("k", "1"), hlc(0, 0, "a"), live(0));
         store.insert(key("k", "1"), hlc(days(1), 0, "a"), Content::Deleted);
-        store.prune(Timestamp::from_millis(days(31)), DAY * 30);
+        prune(&mut store, days(31));
         assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 2);
-        store.prune(Timestamp::from_millis(days(31) + 1), DAY * 30);
+        prune(&mut store, days(31) + 1);
         assert!(store.get(&key("k", "1")).is_none());
+    }
+
+    #[test]
+    fn prune_keeps_a_tombstones_last_live_version() {
+        let mut store = Store::default();
+        store.insert(key("k", "1"), hlc(0, 0, "a"), live(0));
+        store.insert(key("k", "1"), hlc(days(1), 0, "a"), Content::Deleted);
+        store.insert(key("k", "1"), hlc(days(50), 0, "a"), Content::Deleted);
+        prune(&mut store, days(51));
+        let versions: Vec<_> = store.get(&key("k", "1")).unwrap().versions().collect();
+        assert_eq!(versions.len(), 3);
+        prune(&mut store, days(81) + 1);
+        assert!(store.get(&key("k", "1")).is_none());
+    }
+
+    #[test]
+    fn prune_skips_kept_records() {
+        let mut store = Store::default();
+        store.insert(key("k", "1"), hlc(0, 0, "a"), Content::Deleted);
+        store.insert(key("k", "2"), hlc(0, 0, "a"), Content::Deleted);
+        store.prune(Timestamp::from_millis(days(100)), DAY * 30, |k| k.id == "1");
+        assert!(store.get(&key("k", "1")).is_some());
+        assert!(store.get(&key("k", "2")).is_none());
     }
 
     #[test]

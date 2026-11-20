@@ -4,7 +4,6 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -12,13 +11,9 @@ use uuid::Uuid;
 
 use crate::hlc::Timestamp;
 
-/// How long Displaced Versions, superseded record versions and tombstones are
-/// kept unless configured otherwise.
-pub const DEFAULT_RETENTION_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
 /// Fields of a record that this version of heighliner does not know. They are
 /// kept and written back unchanged.
-pub type UnknownFields = Map<String, Value>;
+type UnknownFields = Map<String, Value>;
 
 /// A value that failed validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,7 +84,8 @@ impl ItemId {
         Self(Uuid::new_v4())
     }
 
-    pub const fn from_u128(id: u128) -> Self {
+    #[cfg(test)]
+    pub(crate) const fn from_u128(id: u128) -> Self {
         Self(Uuid::from_u128(id))
     }
 }
@@ -179,6 +175,9 @@ impl fmt::Display for AbsPath {
 }
 
 /// One line of an Item's exclude patterns, in Syncthing's `.stignore` syntax.
+///
+/// Directives (`#include`, `#escape`) and the `(?d)` flag are refused: the
+/// flag lets Syncthing delete excluded files.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ExcludePattern(String);
@@ -186,14 +185,20 @@ pub struct ExcludePattern(String);
 impl ExcludePattern {
     pub fn new(pattern: impl Into<String>) -> Result<Self, InvalidValue> {
         let pattern = pattern.into();
-        if pattern.trim().is_empty() || pattern.contains(['\n', '\r']) {
-            return Err(InvalidValue {
-                what: "exclude pattern",
-                value: pattern,
-                reason: "must be one non-blank line",
-            });
-        }
-        Ok(Self(pattern))
+        let reason = if pattern.trim().is_empty() || pattern.contains(['\n', '\r']) {
+            "must be one non-blank line"
+        } else if pattern.starts_with('#') {
+            "must not be a directive"
+        } else if pattern.contains("(?d)") {
+            "must not use the (?d) flag"
+        } else {
+            return Ok(Self(pattern));
+        };
+        Err(InvalidValue {
+            what: "exclude pattern",
+            value: pattern,
+            reason,
+        })
     }
 
     pub fn as_str(&self) -> &str {
@@ -250,7 +255,7 @@ pub struct Item {
     pub excludes: Vec<ExcludePattern>,
     pub direction: Direction,
     pub paused: bool,
-    pub unknown_fields: UnknownFields,
+    unknown_fields: UnknownFields,
 }
 
 impl Item {
@@ -325,17 +330,17 @@ impl From<Item> for ItemRecord {
 }
 
 /// One copy of an Item on one Node. An Item has at most one Replica per Node,
-/// so the Replica is identified by its Item and Node.
+/// so the Replica is identified by its Item and Node. Its path is fixed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Replica {
-    pub path: AbsPath,
+    path: AbsPath,
     /// Whether this Replica only receives changes in a two-way Item.
     #[serde(default)]
     pub mirror: bool,
     #[serde(default)]
     pub paused: bool,
     #[serde(flatten)]
-    pub unknown_fields: UnknownFields,
+    unknown_fields: UnknownFields,
 }
 
 impl Replica {
@@ -346,6 +351,10 @@ impl Replica {
             paused: false,
             unknown_fields: UnknownFields::new(),
         }
+    }
+
+    pub fn path(&self) -> &AbsPath {
+        &self.path
     }
 }
 
@@ -388,6 +397,24 @@ mod tests {
             "", "a", "a/b", "//", "/a/", "/a//b", "/a/./b", "/a/..", "/a\0b",
         ] {
             assert!(AbsPath::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn exclude_pattern_validation() {
+        for ok in ["*.tmp", "!keep", "(?i)cache", "// comment", "a#b"] {
+            assert!(ExcludePattern::new(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            " ",
+            "a\nb",
+            "#include x",
+            "#escape=\\",
+            "(?d)*",
+            "!(?i)(?d)x",
+        ] {
+            assert!(ExcludePattern::new(bad).is_err(), "{bad:?}");
         }
     }
 

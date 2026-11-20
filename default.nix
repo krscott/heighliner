@@ -4,7 +4,7 @@
 }:
 
 stdenv.mkDerivation {
-  name = "flake-start";
+  name = "heighliner";
 
   src = lib.cleanSource ./.;
 
@@ -18,12 +18,12 @@ stdenv.mkDerivation {
     printf '%s\n' \
       '#!/usr/bin/env bash' \
       'set -euo pipefail' \
-      'echo "Hello from flake-start"' \
-      >"$out/bin/flake-start"
-    chmod +x "$out/bin/flake-start"
+      'echo "Hello from heighliner"' \
+      >"$out/bin/heighliner"
+    chmod +x "$out/bin/heighliner"
 
     runHook postInstall
   '';
 
-  meta.mainProgram = "flake-start";
+  meta.mainProgram = "heighliner";
 }

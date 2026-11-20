@@ -27,7 +27,7 @@
       in
       {
         packages = {
-          "flake-start" = package;
+          "heighliner" = package;
           default = package;
         };
 

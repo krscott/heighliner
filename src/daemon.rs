@@ -1,7 +1,9 @@
 //! The daemon: serves the Node protocol on this Node's Tailscale addresses,
 //! pulls the other Nodes' records on a timer, and keeps its copy of all
-//! records in a state file.
+//! records in a state file. When it drives Syncthing, it configures it each
+//! round and follows its Replicas' states.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fmt;
@@ -16,13 +18,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
-use crate::config::ConfigDb;
+use crate::config::{Config, ConfigDb};
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
-use crate::model::{ItemId, NodeId};
+use crate::model::{AbsPath, ItemId, NodeId, ReplicaState};
 use crate::protocol::{self, Hello};
 use crate::record::Store;
 use crate::syncthing::{self, Driver, Outcome};
@@ -61,6 +64,18 @@ struct SavedState {
     /// node is the Node the state belongs to.
     clock: Hlc,
     records: Store,
+    /// When each of this Node's Replicas was last confirmed current, as of
+    /// when it last stopped being current or the daemon last stopped.
+    #[serde(default)]
+    last_current: BTreeMap<ItemId, Confirmed>,
+}
+
+/// When a Replica was confirmed current, and at which path, since one moved
+/// elsewhere starts afresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Confirmed {
+    path: AbsPath,
+    at: Timestamp,
 }
 
 #[derive(Deserialize)]
@@ -238,8 +253,33 @@ pub struct Daemon<T> {
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
     driver: Option<Driver>,
-    /// The last reconcile's outcome for each Replica, to log changes only.
-    outcomes: Mutex<BTreeMap<ItemId, Outcome>>,
+    replicas: Mutex<Replicas>,
+}
+
+/// A reconcile: the configuration it applied, and its outcome for each
+/// Replica or why it couldn't run. States are read against it, so that they
+/// describe what Syncthing was told.
+struct Reconciled {
+    config: Config,
+    outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
+}
+
+/// This Node's Replicas, as last seen in Syncthing.
+struct Replicas {
+    /// The last reconcile, if one has run.
+    reconciled: Option<Arc<Reconciled>>,
+    states: BTreeMap<ItemId, ReplicaState>,
+    /// How many refreshes have started, and which of them `states` are
+    /// from, so that one overtaken by a later one is dropped.
+    started: u64,
+    applied: u64,
+    /// When each Replica that is current was last read so.
+    current: BTreeMap<ItemId, Confirmed>,
+    /// When each Replica was last confirmed current, as of when it last
+    /// stopped being current; see [`SavedState::last_current`].
+    last_current: BTreeMap<ItemId, Confirmed>,
+    /// The state last logged for each Replica, to log changes only.
+    logged: BTreeMap<ItemId, ReplicaState>,
 }
 
 impl<T: LocalApi + Clone> Daemon<T> {
@@ -264,10 +304,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
             Err(fs::TryLockError::Error(source)) => return Err(state_error(&lock_file)(source)),
         }
         let state_file = state_dir.join(STATE_FILE);
-        let db = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
+        let (db, last_current) = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
         // Count the state as it was opened as saved, so nothing is written
         // until it changes; a daemon that changed nothing writes no file.
-        let saved = Mutex::new(snapshot(&db, tailnet.owner()));
+        let saved = Mutex::new(snapshot(&db, tailnet.owner(), &last_current));
         Ok(Self {
             api,
             port,
@@ -277,7 +317,15 @@ impl<T: LocalApi + Clone> Daemon<T> {
             db: Arc::new(Mutex::new(db)),
             saved,
             driver: None,
-            outcomes: Mutex::default(),
+            replicas: Mutex::new(Replicas {
+                reconciled: None,
+                states: BTreeMap::new(),
+                started: 0,
+                applied: 0,
+                current: BTreeMap::new(),
+                last_current,
+                logged: BTreeMap::new(),
+            }),
         })
     }
 
@@ -428,6 +476,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         // slow, is interrupted.
         self.save()?;
         round.syncthing = self.drive(&tailnet).await;
+        self.refresh().await;
         self.db
             .lock()
             .unwrap()
@@ -446,10 +495,16 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// configuration, as this device's status `tailnet` describes it.
     async fn drive(&self, tailnet: &Tailnet) -> Option<syncthing::Report> {
         let driver = self.driver.as_ref()?;
+        let record = |config: Config, outcomes| {
+            let reconciled = Reconciled { config, outcomes };
+            self.replicas.lock().unwrap().reconciled = Some(Arc::new(reconciled));
+        };
         let device_id = match driver.client().device_id().await {
             Ok(device_id) => device_id,
             Err(error) => {
-                tracing::warn!(%error, "can't reach Syncthing");
+                let config = self.db.lock().unwrap().config();
+                let reason = format!("can't be synced: Syncthing can't be reached: {error}");
+                record(config, Err(reason));
                 return None;
             }
         };
@@ -464,38 +519,152 @@ impl<T: LocalApi + Clone> Daemon<T> {
         let config = self.db.lock().unwrap().config();
         match driver.reconcile(&config, tailnet, &device_id).await {
             Ok(report) => {
-                let me = &tailnet.me().id;
-                let mut outcomes = self.outcomes.lock().unwrap();
-                for (item, outcome) in &report.replicas {
-                    // An unreadable Replica's Item and path aren't known.
-                    let entry = config.items.get(item);
-                    let name = entry.map_or("", |entry| entry.item.name.as_str());
-                    let path = entry
-                        .and_then(|entry| entry.replicas.get(me))
-                        .map_or("", |replica| replica.path().as_str());
-                    match outcomes.get(item) {
-                        Some(before) if before == outcome => {}
-                        Some(_) if *outcome == Outcome::Configured => {
-                            tracing::info!(%item, %name, %path, "this Node's replica {outcome} again");
-                        }
-                        None if *outcome == Outcome::Configured => {}
-                        _ => tracing::warn!(%item, %name, %path, "this Node's replica {outcome}"),
-                    }
-                }
-                *outcomes = report.replicas.clone();
+                record(config, Ok(report.replicas.clone()));
                 Some(report)
             }
             Err(error) => {
-                tracing::warn!(%error, "configuring Syncthing failed");
+                let reason = format!("can't be synced: configuring Syncthing failed: {error}");
+                record(config, Err(reason));
                 None
             }
         }
     }
 
+    /// Reads this Node's Replicas' states from Syncthing again, and logs
+    /// the ones that changed. Refreshes may overlap; one that finishes after
+    /// a later one is dropped.
+    pub async fn refresh(&self) {
+        let Some(driver) = &self.driver else {
+            return;
+        };
+        let me = self.db.lock().unwrap().node().clone();
+        let (reconciled, number) = {
+            let mut replicas = self.replicas.lock().unwrap();
+            let Some(reconciled) = replicas.reconciled.clone() else {
+                return;
+            };
+            replicas.started += 1;
+            (reconciled, replicas.started)
+        };
+        let config = &reconciled.config;
+        // Taken before reading, so that a confirmation is never dated later
+        // than it happened.
+        let read_at = Timestamp::now();
+        let mut states = match &reconciled.outcomes {
+            Ok(outcomes) => driver.states(config, &me, outcomes).await,
+            Err(reason) => config
+                .replicas_on(&me)
+                .into_iter()
+                .map(|local| {
+                    let message = reason.clone();
+                    (local.item_id, ReplicaState::Error { message })
+                })
+                .collect(),
+        };
+        let mut replicas = self.replicas.lock().unwrap();
+        if number < replicas.applied {
+            return;
+        }
+        replicas.applied = number;
+        let Replicas {
+            states: before,
+            current,
+            last_current,
+            logged,
+            ..
+        } = &mut *replicas;
+        // An unreadable Replica's Item and path aren't known.
+        let path_of = |item: &ItemId| {
+            config
+                .items
+                .get(item)
+                .and_then(|entry| entry.replicas.get(&me))
+                .map(|replica| replica.path())
+        };
+        for (item, state) in &mut states {
+            let path = path_of(item);
+            match (&*state, path) {
+                (ReplicaState::Current, Some(path)) => {
+                    let path = path.clone();
+                    current.insert(*item, Confirmed { path, at: read_at });
+                }
+                _ => {
+                    if let Some(confirmed) = current.remove(item) {
+                        last_current.insert(*item, confirmed);
+                    }
+                }
+            }
+            if let ReplicaState::Behind { last_current: at } = state {
+                *at = last_current
+                    .get(item)
+                    .filter(|confirmed| Some(&confirmed.path) == path)
+                    .map(|confirmed| confirmed.at);
+            }
+            // Syncing comes and goes with each change, so it isn't logged.
+            if matches!(state, ReplicaState::Syncing { .. })
+                || logged
+                    .get(item)
+                    .is_some_and(|logged| same_kind(logged, state))
+            {
+                continue;
+            }
+            let name = config
+                .items
+                .get(item)
+                .map_or("", |entry| entry.item.name.as_str());
+            let path = path.map_or("", AbsPath::as_str);
+            if matches!(state, ReplicaState::Error { .. }) {
+                tracing::warn!(%item, %name, %path, "this Node's replica {state}");
+            } else {
+                tracing::info!(%item, %name, %path, "this Node's replica {state}");
+            }
+            logged.insert(*item, state.clone());
+        }
+        for (item, confirmed) in std::mem::take(current) {
+            if states.contains_key(&item) {
+                current.insert(item, confirmed);
+            } else {
+                last_current.insert(item, confirmed);
+            }
+        }
+        // Forget the Replicas that are gone, or moved elsewhere; keep the
+        // ones that can't be read.
+        let unusable = config.unusable_on(&me);
+        last_current.retain(|item, confirmed| {
+            unusable.contains(item)
+                || match path_of(item) {
+                    Some(path) => *path == confirmed.path,
+                    None => !config.was_removed(*item, &me) && !config.items.contains_key(item),
+                }
+        });
+        logged.retain(|item, _| states.contains_key(item));
+        *before = states;
+    }
+
+    /// This Node's Replicas' states, as last read.
+    pub fn states(&self) -> BTreeMap<ItemId, ReplicaState> {
+        self.replicas.lock().unwrap().states.clone()
+    }
+
+    /// Saves, also keeping when the Replicas that are current now were last
+    /// confirmed so, for once the daemon runs again.
+    pub fn save_on_stop(&self) -> Result<(), Error> {
+        {
+            let mut replicas = self.replicas.lock().unwrap();
+            let current = replicas.current.clone();
+            replicas.last_current.extend(current);
+        }
+        self.save()
+    }
+
     /// Writes the records and clock to the state file, if they changed.
     pub fn save(&self) -> Result<(), Error> {
         let mut saved = self.saved.lock().unwrap();
-        let bytes = snapshot(&self.db.lock().unwrap(), self.tailnet.owner());
+        let bytes = snapshot(
+            &self.db.lock().unwrap(),
+            self.tailnet.owner(),
+            &self.replicas.lock().unwrap().last_current,
+        );
         if *saved == bytes {
             return Ok(());
         }
@@ -509,23 +678,28 @@ impl<T: LocalApi + Clone> Daemon<T> {
 }
 
 /// The state file's contents for `db`, a copy of `owner`'s Fleet.
-fn snapshot(db: &ConfigDb, owner: Owner) -> Vec<u8> {
+fn snapshot(db: &ConfigDb, owner: Owner, last_current: &BTreeMap<ItemId, Confirmed>) -> Vec<u8> {
     let state = SavedState {
         format: STATE_FORMAT,
         owner,
         clock: db.last_reading(),
         records: db.store().clone(),
+        last_current: last_current.clone(),
     };
     serde_json::to_vec(&state).expect("the state serializes")
 }
 
-/// Reads the state file for `node` of `owner`'s Fleet, or starts empty if
-/// there is none.
-fn load(path: &Path, node: NodeId, owner: Owner) -> Result<ConfigDb, Error> {
+/// Reads the state file for `node` of `owner`'s Fleet, and when its
+/// Replicas were last confirmed current, or starts empty if there is none.
+fn load(
+    path: &Path,
+    node: NodeId,
+    owner: Owner,
+) -> Result<(ConfigDb, BTreeMap<ItemId, Confirmed>), Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ConfigDb::new(node, Store::default()));
+            return Ok((ConfigDb::new(node, Store::default()), BTreeMap::new()));
         }
         Err(source) => {
             return Err(Error::State {
@@ -558,7 +732,16 @@ fn load(path: &Path, node: NodeId, owner: Owner) -> Result<ConfigDb, Error> {
             current: node,
         });
     }
-    Ok(ConfigDb::resume(node, saved.records, &saved.clock))
+    let db = ConfigDb::resume(node, saved.records, &saved.clock);
+    Ok((db, saved.last_current))
+}
+
+/// Whether two states are the same kind, and for errors the same error.
+fn same_kind(a: &ReplicaState, b: &ReplicaState) -> bool {
+    match (a, b) {
+        (ReplicaState::Error { message: a }, ReplicaState::Error { message: b }) => a == b,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
 }
 
 /// Replaces `path` with `bytes`, readable only by this user, so that a
@@ -626,7 +809,7 @@ pub async fn run(options: Options) -> Result<(), Error> {
     }
     let stopped = serve(&mut daemon, options.pull_every).await;
     // Whatever stopped the daemon, keep what it merged since the last save.
-    if let Err(error) = daemon.save() {
+    if let Err(error) = daemon.save_on_stop() {
         tracing::error!(%error, "saving before stopping failed");
     }
     stopped
@@ -641,15 +824,50 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     let mut servers = daemon.relisten().await?;
     let mut pulls = tokio::time::interval(pull_every);
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Dropped, and so stopped, with the daemon's other tasks.
+    let mut watcher = JoinSet::new();
+    let changed = Arc::new(Notify::new());
+    if let Some(driver) = daemon.driver.clone() {
+        let changed = changed.clone();
+        watcher.spawn(async move { driver.watch(&changed).await });
+    }
     loop {
         tokio::select! {
-            _ = pulls.tick() => {
-                // A round can take a while, for example scanning a mirror
-                // before it starts to send, so stop signals interrupt it.
-                let round = tokio::select! {
-                    round = daemon.pull_round() => round,
+            _ = changed.notified() => {
+                tokio::select! {
+                    () = daemon.refresh() => {}
                     _ = terminate.recv() => return Ok(()),
                     _ = interrupt.recv() => return Ok(()),
+                }
+            }
+            _ = pulls.tick() => {
+                // A round can take a while, for example scanning a mirror
+                // before it starts to send, so stop signals interrupt it,
+                // and Syncthing's events still refresh the states meanwhile.
+                let round = {
+                    let daemon = &*daemon;
+                    let round = daemon.pull_round();
+                    tokio::pin!(round);
+                    let refreshing = Cell::new(false);
+                    let round = loop {
+                        tokio::select! {
+                            round = &mut round => break round,
+                            () = async {
+                                changed.notified().await;
+                                refreshing.set(true);
+                                daemon.refresh().await;
+                                refreshing.set(false);
+                            } => {}
+                            _ = terminate.recv() => return Ok(()),
+                            _ = interrupt.recv() => return Ok(()),
+                        }
+                    };
+                    // The round's own refresh may have read a Replica before
+                    // the change that started the one it cut short.
+                    if refreshing.get() {
+                        changed.notify_one();
+                    }
+                    round
                 };
                 match round {
                 Err(Error::AddressesChanged) => {

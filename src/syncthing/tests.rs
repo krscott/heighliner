@@ -4,7 +4,7 @@ use super::test_instance::{Syncthing, free_port};
 use super::*;
 use crate::config::ConfigDb;
 use crate::hlc::Timestamp;
-use crate::model::{Direction, ExcludePattern, Item, Replica};
+use crate::model::{Direction, ExcludePattern, Item, Replica, ReplicaState};
 use crate::record::Store;
 use crate::tailscale::UserId;
 use crate::tailscale::fake::device;
@@ -397,6 +397,38 @@ impl Pair {
             self.b.reconcile(&config, &b_tailnet).await,
         )
     }
+
+    /// Reconciles, then waits up to 60s for B's state to satisfy `done`,
+    /// and returns it.
+    async fn b_state(&self, done: impl Fn(&ReplicaState) -> bool) -> ReplicaState {
+        let (_, report) = self.reconcile().await;
+        state_of(&self.b, &self.db.config(), "b", &report, done).await
+    }
+}
+
+/// Waits up to 60s for `syncthing`'s state for `ITEM` on `node` to satisfy
+/// `done`, and returns the last one read.
+async fn state_of(
+    syncthing: &Syncthing,
+    config: &Config,
+    node_name: &str,
+    report: &Report,
+    done: impl Fn(&ReplicaState) -> bool,
+) -> ReplicaState {
+    let mut state = None;
+    for _ in 0..600 {
+        let states = syncthing
+            .driver
+            .states(config, &node(node_name), &report.replicas)
+            .await;
+        let read = states[&ITEM].clone();
+        if done(&read) {
+            return read;
+        }
+        state = Some(read);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    state.unwrap()
 }
 
 #[tokio::test]
@@ -741,4 +773,162 @@ async fn an_alias_of_overlapping_replicas_overlaps_too() {
     store.merge(tracked_as(third, "a", &alias).store(), |_| true);
     let report = syncthing.reconcile(&Config::new(&store), &alone()).await;
     assert_eq!(report.replicas[&third], Outcome::Overlaps);
+}
+
+#[tokio::test]
+async fn replica_states_follow_syncthing() {
+    let mut pair = Pair::start(Direction::TwoWay, false).await;
+    fs::write(file(&pair.a_path, "one"), "1").unwrap();
+    scan(&pair.a).await;
+    assert!(eventually(|| file(&pair.b_path, "one").exists()).await);
+    let current = |state: &ReplicaState| *state == ReplicaState::Current;
+    assert_eq!(pair.b_state(current).await, ReplicaState::Current);
+
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("b"), |replica| {
+            replica.paused = true
+        })
+        .unwrap();
+    assert_eq!(
+        pair.b_state(|state| *state == ReplicaState::Paused).await,
+        ReplicaState::Paused
+    );
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("b"), |replica| {
+            replica.paused = false
+        })
+        .unwrap();
+    assert_eq!(pair.b_state(current).await, ReplicaState::Current);
+
+    // Its only sender goes away.
+    let Pair { a, b, db, .. } = pair;
+    drop(a);
+    let config = db.config();
+    let tailnet = Tailnet::new(
+        device("b", OWNER, "127.0.0.2"),
+        vec![device("a", OWNER, "127.0.0.1")],
+    )
+    .unwrap();
+    let report = b.reconcile(&config, &tailnet).await;
+    let behind = ReplicaState::Behind { last_current: None };
+    assert_eq!(
+        state_of(&b, &config, "b", &report, |state| *state == behind).await,
+        behind
+    );
+}
+
+#[tokio::test]
+async fn a_mirror_with_local_changes_is_an_error() {
+    let pair = Pair::start(Direction::TwoWay, true).await;
+    fs::write(file(&pair.b_path, "mine"), "local").unwrap();
+    scan(&pair.b).await;
+    let state = pair
+        .b_state(|state| matches!(state, ReplicaState::Error { .. }))
+        .await;
+    assert!(
+        matches!(&state, ReplicaState::Error { message } if message.contains("changed locally")),
+        "{state:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_replica_that_cant_be_configured_is_an_error() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    let db = tracked("a", &at);
+    syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(eventually(|| file(&at, MARKER).exists()).await);
+    fs::remove_dir_all(at.as_str()).unwrap();
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    let states = syncthing
+        .driver
+        .states(&db.config(), &node("a"), &report.replicas)
+        .await;
+    assert_eq!(
+        states[&ITEM],
+        ReplicaState::Error {
+            message: Outcome::Missing.to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn syncthing_events_wake_the_watcher() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let watcher = {
+        let (driver, changed) = (syncthing.driver.clone(), changed.clone());
+        tokio::spawn(async move { driver.watch(&changed).await })
+    };
+    // Let it catch up with the events so far.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let woken = changed.notified();
+    syncthing
+        .reconcile(&tracked("a", &syncthing.dir("docs")).config(), &alone())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), woken)
+        .await
+        .expect("a new folder's events wake the watcher");
+    watcher.abort();
+}
+
+#[tokio::test]
+async fn syncthing_takes_the_event_filter() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let client = syncthing.driver.client();
+    assert_eq!(client.latest_event().await.unwrap(), 0);
+    syncthing
+        .reconcile(&tracked("a", &syncthing.dir("docs")).config(), &alone())
+        .await;
+    let ids = client.events(0, Duration::from_secs(1)).await.unwrap();
+    assert!(!ids.is_empty());
+    assert_eq!(
+        ids.iter().max().copied(),
+        Some(client.latest_event().await.unwrap())
+    );
+}
+
+#[tokio::test]
+async fn a_sender_syncthing_doesnt_know_is_unreachable() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    // Its device ID is known, but it isn't on the tailnet, so it isn't
+    // configured.
+    let mut db = added(&syncthing.dir("docs"), false);
+    let mut x = ConfigDb::new(node("x"), Store::default());
+    x.set_device_id(Timestamp::now(), DeviceId::new(SOME_ID).unwrap())
+        .unwrap();
+    db.merge(x.store(), Timestamp::now());
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    let states = syncthing
+        .driver
+        .states(&db.config(), &node("a"), &report.replicas)
+        .await;
+    assert_eq!(states[&ITEM], ReplicaState::Behind { last_current: None });
+}
+
+#[tokio::test]
+async fn a_mirror_with_no_sender_is_an_error() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    // Made a mirror on one Node while its sender is removed on another.
+    let base = added(&syncthing.dir("docs"), false);
+    let mut db = ConfigDb::new(node("a"), base.store().clone());
+    db.update_replica(Timestamp::now(), ITEM, &node("a"), |replica| {
+        replica.mirror = true
+    })
+    .unwrap();
+    let mut other = ConfigDb::new(node("x"), base.store().clone());
+    other
+        .remove_replica(Timestamp::now(), ITEM, &node("x"))
+        .unwrap();
+    db.merge(other.store(), Timestamp::now());
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    let states = syncthing
+        .driver
+        .states(&db.config(), &node("a"), &report.replicas)
+        .await;
+    assert!(
+        matches!(&states[&ITEM], ReplicaState::Error { message } if message.contains("mirror")),
+        "{:?}",
+        states[&ITEM]
+    );
 }

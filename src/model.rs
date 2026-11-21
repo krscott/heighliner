@@ -524,6 +524,30 @@ pub enum ReplicaState {
     Paused,
 }
 
+/// As a predicate of the Replica, such as "is current".
+impl fmt::Display for ReplicaState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Current => f.write_str("is current"),
+            Self::Syncing {
+                files_left,
+                bytes_left,
+            } => write!(f, "is syncing: {files_left} items ({bytes_left} bytes) left"),
+            Self::Behind {
+                last_current: Some(at),
+            } => write!(
+                f,
+                "is behind: none of its senders can be reached; last confirmed current at {at}"
+            ),
+            Self::Behind { last_current: None } => f.write_str(
+                "is behind: none of its senders can be reached, and it hasn't been confirmed current",
+            ),
+            Self::Error { message } => f.write_str(message),
+            Self::Paused => f.write_str("is paused"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

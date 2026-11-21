@@ -357,7 +357,7 @@ fn reopening_resumes_after_the_saved_clock_reading() {
 fn nodes_publish_their_device_ids() {
     let id = |s: &str| DeviceId::new(s).unwrap();
     let first = id("MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD");
-    let second = id("AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-2222222");
+    let second = id("AAAAAAA-BBBBBBX-BCCCCCC-CDDDDDU-DDEEEEE-EEFFFFR-FFFGGGG-2222223");
     let (mut a, mut b) = (db("a"), db("b"));
     a.set_device_id(t(1), first.clone()).unwrap();
     b.set_device_id(t(1), second).unwrap();

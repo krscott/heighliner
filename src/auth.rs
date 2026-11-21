@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Extension, Request, State};
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -143,8 +143,8 @@ impl<T: LocalApi> Authorizer<T> {
 ///
 /// Each connection is authorized as it is accepted, before anything is
 /// read from it; a refused caller gets a single error response and the
-/// connection is closed. Each request on an accepted connection checks
-/// again that this device still has its owner. A caller that doesn't send
+/// connection is closed. Each request on an accepted connection is
+/// authorized again, since either device can change while it is open. A caller that doesn't send
 /// a request's headers within [`HEADER_TIMEOUT`] is disconnected.
 pub async fn serve<T: LocalApi>(
     listener: TcpListener,
@@ -172,10 +172,6 @@ async fn serve_with<T: LocalApi>(
     authorizer: Arc<Authorizer<T>>,
     header_timeout: Duration,
 ) -> Infallible {
-    let router = router.layer(middleware::from_fn_with_state(
-        authorizer.clone(),
-        still_owned,
-    ));
     let unauthorized = Arc::new(Semaphore::new(MAX_UNAUTHORIZED));
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -195,9 +191,13 @@ async fn serve_with<T: LocalApi>(
         let router = router.clone();
         tokio::spawn(async move {
             match authorizer.authorize(addr).await {
-                Ok(identity) => {
+                Ok(_) => {
                     drop(permit);
-                    let service = TowerToHyperService::new(router.layer(Extension(identity)));
+                    let router = router.layer(middleware::from_fn_with_state(
+                        (authorizer, addr),
+                        reauthorize,
+                    ));
+                    let service = TowerToHyperService::new(router);
                     let connection = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(header_timeout)
@@ -231,13 +231,18 @@ async fn refuse(mut stream: TcpStream, denied: &Denied) {
     let _ = tokio::time::timeout(REFUSE_LINGER, send).await;
 }
 
-async fn still_owned<T: LocalApi>(
-    State(authorizer): State<Arc<Authorizer<T>>>,
-    request: Request,
+/// Authorizes each request on a connection from `addr` again, since the
+/// caller's device or this one can change while a connection is open.
+async fn reauthorize<T: LocalApi>(
+    State((authorizer, addr)): State<(Arc<Authorizer<T>>, SocketAddr)>,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    match authorizer.check_owner().await {
-        Ok(()) => next.run(request).await,
+    match authorizer.authorize(addr).await {
+        Ok(identity) => {
+            request.extensions_mut().insert(identity);
+            next.run(request).await
+        }
         Err(denied) => denied.into_response(),
     }
 }
@@ -259,7 +264,7 @@ mod tests {
     const OTHER: UserId = UserId::new(2);
 
     fn fake() -> Fake {
-        let mut fake = Fake::new(device("me", OWNER, "127.0.0.1"));
+        let fake = Fake::new(device("me", OWNER, "127.0.0.1"));
         fake.add_device(device("laptop", OWNER, "127.0.0.2"));
         fake.add_device(device("friend", OTHER, "127.0.0.3"));
         let mut tagged = device("server", OWNER, "127.0.0.4");
@@ -400,6 +405,33 @@ mod tests {
             .await
             .expect("the server closes an idle connection")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_request_on_a_connection_is_authorized() {
+        let fake = fake();
+        let server = start(fake.clone()).await;
+        let stream = connect_from("127.0.0.2", server).await;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let get = || {
+            hyper::Request::get("/")
+                .header(hyper::header::HOST, "heighliner")
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let first = sender.send_request(get()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        first.into_body().collect().await.unwrap();
+
+        // The laptop is tagged while its connection stays open.
+        let mut tagged = device("laptop", OWNER, "127.0.0.2");
+        tagged.tagged = true;
+        fake.add_device(tagged);
+        let second = sender.send_request(get()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

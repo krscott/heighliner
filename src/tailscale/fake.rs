@@ -29,26 +29,26 @@ pub(crate) fn device(name: &str, user: UserId, ip: &str) -> Device {
 #[derive(Clone)]
 pub(crate) struct Fake {
     devices: Arc<Mutex<Devices>>,
-    identities: BTreeMap<IpAddr, Identity>,
-    failing_whois: BTreeSet<IpAddr>,
+    identities: Arc<Mutex<BTreeMap<IpAddr, Identity>>>,
+    failing_whois: Arc<Mutex<BTreeSet<IpAddr>>>,
 }
 
 impl Fake {
     pub(crate) fn new(me: Device) -> Self {
-        let mut fake = Self {
+        let fake = Self {
             devices: Arc::new(Mutex::new(Devices {
                 me: me.clone(),
                 others: Vec::new(),
             })),
-            identities: BTreeMap::new(),
-            failing_whois: BTreeSet::new(),
+            identities: Arc::default(),
+            failing_whois: Arc::default(),
         };
         fake.add_identities(&me);
         fake
     }
 
-    /// Adds another device, which WhoIs then identifies.
-    pub(crate) fn add_device(&mut self, device: Device) {
+    /// Adds another device, or changes one at the same addresses.
+    pub(crate) fn add_device(&self, device: Device) {
         self.add_identities(&device);
         self.devices.lock().unwrap().others.push(device);
     }
@@ -58,13 +58,14 @@ impl Fake {
         self.devices.lock().unwrap().me = me;
     }
 
-    pub(crate) fn fail_whois_for(&mut self, ip: IpAddr) {
-        self.failing_whois.insert(ip);
+    pub(crate) fn fail_whois_for(&self, ip: IpAddr) {
+        self.failing_whois.lock().unwrap().insert(ip);
     }
 
-    fn add_identities(&mut self, device: &Device) {
+    fn add_identities(&self, device: &Device) {
+        let mut identities = self.identities.lock().unwrap();
         for ip in &device.ips {
-            self.identities.insert(
+            identities.insert(
                 *ip,
                 Identity {
                     node: device.id.clone(),
@@ -88,11 +89,11 @@ impl LocalApi for Fake {
     }
 
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {
-        if self.failing_whois.contains(&addr.ip()) {
+        if self.failing_whois.lock().unwrap().contains(&addr.ip()) {
             return Err(Error::Timeout {
                 path: "/localapi/v0/whois".to_owned(),
             });
         }
-        Ok(self.identities.get(&addr.ip()).cloned())
+        Ok(self.identities.lock().unwrap().get(&addr.ip()).cloned())
     }
 }

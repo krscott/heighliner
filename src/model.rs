@@ -386,7 +386,8 @@ impl Replica {
 }
 
 /// A Syncthing device ID, in Syncthing's canonical form: eight groups of
-/// seven base32 characters, separated by `-`.
+/// seven base32 characters, separated by `-`, with Syncthing's check
+/// characters.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct DeviceId(String);
@@ -409,12 +410,45 @@ impl DeviceId {
                 reason: "must be eight dash-separated groups of seven base32 characters",
             });
         }
+        // The 56 characters are four groups of 13, each followed by its
+        // check character.
+        let chars: Vec<u8> = id.bytes().filter(|&b| b != b'-').collect();
+        if !chars
+            .chunks(14)
+            .all(|group| luhn32(&group[..13]) == group[13])
+        {
+            return Err(InvalidValue {
+                what: "Syncthing device ID",
+                value: id,
+                reason: "has a wrong check character; check for typos",
+            });
+        }
         Ok(Self(id))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// The check character Syncthing computes for a group of base32 characters
+/// (its variant of the Luhn mod N algorithm).
+fn luhn32(group: &[u8]) -> u8 {
+    const N: usize = 32;
+    let mut factor = 1;
+    let mut sum = 0;
+    for byte in group {
+        let codepoint = BASE32
+            .iter()
+            .position(|c| c == byte)
+            .expect("validated as base32");
+        let addend = factor * codepoint;
+        factor = if factor == 2 { 1 } else { 2 };
+        sum += addend / N + addend % N;
+    }
+    BASE32[(N - sum % N) % N]
 }
 
 impl TryFrom<String> for DeviceId {
@@ -532,6 +566,8 @@ mod tests {
             &id[..id.len() - 1],
             &id.replace('-', ""),
             &id.replace('M', "1"),
+            // A wrong check character.
+            &format!("{}E", &id[..id.len() - 1]),
         ] {
             assert!(DeviceId::new(bad).is_err(), "{bad:?}");
         }

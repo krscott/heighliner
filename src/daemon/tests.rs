@@ -17,7 +17,7 @@ async fn free_port() -> u16 {
 
 /// A Fake for the device at `me` that sees the devices at `others`.
 fn tailnet(me: &str, others: &[&str]) -> Fake {
-    let mut fake = Fake::new(device(me, OWNER, me));
+    let fake = Fake::new(device(me, OWNER, me));
     for other in others {
         fake.add_device(device(other, OWNER, other));
     }

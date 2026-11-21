@@ -56,6 +56,9 @@ const CONFLICTS: &str = "conflicts";
 /// heighliner's.
 const SET_UP: &str = "set-up";
 
+/// Where `set-up` is written before it is renamed into place.
+const SET_UP_STAGED: &str = "set-up.new";
+
 const SET_UP_CONTENT: &str = "heighliner keeps this replica's data conflicts here\n";
 
 const CONFLICT: &str = ".sync-conflict-";
@@ -320,6 +323,17 @@ pub fn has_store(root: &Path) -> Result<bool, Error> {
     match fs::symlink_metadata(&set_up) {
         Ok(metadata) if metadata.is_file() && metadata.len() == SET_UP_CONTENT.len() as u64 => {}
         Ok(_) => return Err(Error::Foreign),
+        // As left if heighliner stopped while making it.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && fs::read_dir(&store).is_ok_and(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .all(|entry| entry.file_name() == SET_UP_STAGED)
+                }) =>
+        {
+            return Ok(false);
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Error::Foreign),
         Err(source) => return Err(io_error(&set_up)(source)),
     }
@@ -337,17 +351,24 @@ pub fn mark_set_up(root: &Path) -> Result<(), Error> {
 }
 
 fn mark(root: &Path) -> Result<(), Error> {
-    has_store(root)?;
+    let path = root.join(STORE).join(SET_UP);
+    if has_store(root)? {
+        // Only its time changes, so it is never missing.
+        return fs::File::open(&path)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .map_err(io_error(&path));
+    }
     let store = directory(root, &[STORE], true)?.expect("created");
-    let path = store.join(SET_UP);
-    match fs::remove_file(&path) {
+    let staged = store.join(SET_UP_STAGED);
+    match fs::remove_file(&staged) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => return Err(io_error(&path)(source)),
+        Err(source) => return Err(io_error(&staged)(source)),
     }
-    fs::File::create_new(&path)
+    fs::File::create_new(&staged)
         .and_then(|mut file| io::Write::write_all(&mut file, SET_UP_CONTENT.as_bytes()))
-        .map_err(io_error(&path))
+        .map_err(io_error(&staged))?;
+    move_new(&staged, &path)
 }
 
 /// When heighliner set up the Replica at `root`. A Replica set up before
@@ -1050,6 +1071,27 @@ mod tests {
         assert!(
             root.join(".heighliner/conflicts/x.sync-conflict-20240101-120000-ABCDEFG/kept-1")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn a_store_cut_short_while_being_made_is_heighliners() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(MARKER)).unwrap();
+        fs::create_dir(root.join(STORE)).unwrap();
+        mark_set_up(root).unwrap();
+        assert!(has_store(root).unwrap());
+        fs::remove_file(root.join(STORE).join(SET_UP)).unwrap();
+        write(root, &format!("{STORE}/{SET_UP_STAGED}"), "half");
+        mark_set_up(root).unwrap();
+        assert!(has_store(root).unwrap());
+        // Setting up again only moves its time.
+        let before = fs::metadata(root.join(STORE).join(SET_UP)).unwrap().ino();
+        mark_set_up(root).unwrap();
+        assert_eq!(
+            fs::metadata(root.join(STORE).join(SET_UP)).unwrap().ino(),
+            before
         );
     }
 

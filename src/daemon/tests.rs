@@ -349,3 +349,52 @@ async fn the_daemon_drives_syncthing() {
     let db = daemon.db().lock().unwrap();
     assert_eq!(db.config().nodes[db.node()].device_id, device_id);
 }
+
+#[tokio::test]
+async fn a_replica_added_again_is_checked_afresh() {
+    let port = crate::syncthing::test_instance::free_port();
+    let syncthing = crate::syncthing::test_instance::Syncthing::start("127.0.0.1", port).await;
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap()
+        .with_driver(syncthing.driver.clone());
+    let at = syncthing.dir("docs");
+    let me = daemon.db().lock().unwrap().node().clone();
+    let elsewhere = NodeId::new("n-elsewhere").unwrap();
+    {
+        let mut db = daemon.db().lock().unwrap();
+        db.track(
+            Timestamp::now(),
+            ITEM,
+            Item::new("docs", Direction::TwoWay),
+            &elsewhere,
+            Replica::new(AbsPath::new("/srv/docs").unwrap()),
+        )
+        .unwrap();
+        db.add_replica(Timestamp::now(), ITEM, &me, Replica::new(at.clone()))
+            .unwrap();
+    }
+    daemon.pull_round().await.unwrap();
+
+    // Removed, then unrelated files arrive, then added again.
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .remove_replica(Timestamp::now(), ITEM, &me)
+        .unwrap();
+    daemon.pull_round().await.unwrap();
+    fs::write(std::path::Path::new(at.as_str()).join("unrelated"), "x").unwrap();
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .add_replica(Timestamp::now(), ITEM, &me, Replica::new(at.clone()))
+        .unwrap();
+    let round = daemon.pull_round().await.unwrap();
+    assert_eq!(
+        round.syncthing.unwrap().replicas[&ITEM],
+        crate::syncthing::Outcome::NotEmpty
+    );
+}

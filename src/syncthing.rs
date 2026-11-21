@@ -19,15 +19,19 @@
 //! - A Replica is first set up at an empty path, or at a missing one whose
 //!   parent exists (so an unmounted disk isn't filled in its place), or
 //!   with its `adopt` flag. A path that already holds files is otherwise
-//!   refused, and so is one with its own `.stignore`. Once set up at a path,
-//!   a Replica isn't refused there again.
+//!   refused, and so is one with its own `.stignore`.
+//! - A configured folder is removed only when its Replica is removed or
+//!   its Item untracked. While it can't be synced for a while (its path is
+//!   missing, it overlaps another, or its records can't be read), it is
+//!   paused instead, keeping its marker and index.
+//! - Replicas whose paths overlap once symlinks are resolved aren't synced.
 //! - Removing a Replica only removes its folder from Syncthing; the files
 //!   stay (Syncthing removes only its `.stfolder` marker). Heighliner never
 //!   removes the marker of a configured folder and never recreates a
 //!   configured folder's missing path, so a missing or unmounted path is an
 //!   error rather than everything having been deleted.
-//! - A mirror with local changes isn't made to send: it stays receive-only
-//!   until the changes are dealt with.
+//! - A mirror is made to send only while it runs and right after a scan
+//!   finds no local changes; otherwise it stays receive-only.
 //! - Overlapping Replicas aren't synced.
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
 //!   used.
@@ -38,6 +42,7 @@ use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -72,11 +77,6 @@ const MARKER: &str = ".stfolder";
 /// How many Displaced Versions of one file to keep. The Retention Window
 /// is what clears them out; this only bounds a file replaced very often.
 const KEEP_VERSIONS: u32 = 10_000;
-
-/// The Replicas that have been set up on this Node, with their paths. A
-/// Replica in it isn't refused as not empty at that path again, for
-/// example when its folder comes back after being left out for a while.
-pub type Established = BTreeSet<(ItemId, AbsPath)>;
 
 /// Why a call to Syncthing failed.
 #[derive(Debug)]
@@ -247,16 +247,22 @@ impl Client {
         DeviceId::new(id).map_err(Error::DeviceId)
     }
 
-    pub(crate) async fn ignores(&self, folder: ItemId) -> Result<Vec<String>, Error> {
+    /// A folder's ignore patterns, and Syncthing's error if it can't parse
+    /// them.
+    pub(crate) async fn ignores(
+        &self,
+        folder: ItemId,
+    ) -> Result<(Vec<String>, Option<String>), Error> {
         let path = format!("/rest/db/ignores?folder={folder}");
         let answer: Value = self.get(&path).await?;
-        Ok(match &answer["ignore"] {
+        let lines = match &answer["ignore"] {
             Value::Array(lines) => lines
                 .iter()
                 .filter_map(|line| line.as_str().map(str::to_owned))
                 .collect(),
             _ => Vec::new(),
-        })
+        };
+        Ok((lines, answer["error"].as_str().map(str::to_owned)))
     }
 
     async fn set_ignores(&self, folder: ItemId, lines: &[String]) -> Result<(), Error> {
@@ -266,8 +272,20 @@ impl Client {
         Ok(())
     }
 
-    /// How many files a receive-only folder has changed locally.
-    async fn local_changes(&self, folder: &str) -> Result<u64, Error> {
+    /// Scans a folder and waits for the scan to finish.
+    async fn scan(&self, folder: &str) -> Result<(), Error> {
+        self.call(
+            Method::POST,
+            &format!("/rest/db/scan?folder={folder}"),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// How many files a receive-only folder has changed locally, as of its
+    /// last scan.
+    pub(crate) async fn local_changes(&self, folder: &str) -> Result<u64, Error> {
         let path = format!("/rest/db/status?folder={folder}");
         let status: Value = self.get(&path).await?;
         status["receiveOnlyTotalItems"]
@@ -299,6 +317,8 @@ pub enum Outcome {
     Missing,
     /// Its path can't be used.
     PathError(String),
+    /// It or its Item was written by a newer heighliner and can't be read.
+    Unreadable,
     /// Syncthing failed to apply part of it.
     Failed(String),
 }
@@ -315,7 +335,7 @@ impl fmt::Display for Outcome {
         match self {
             Self::Configured => f.write_str("is configured"),
             Self::LocalChanges => f.write_str(
-                "has changes made locally while it was a mirror, so it stays receive-only until they are dealt with",
+                "has changes made locally while it was a mirror, so it stays receive-only; make it a mirror again, or undo the changes (Syncthing lists them as locally changed items)",
             ),
             Self::Overlaps => f.write_str("overlaps another replica on this Node, so it isn't synced"),
             Self::NotEmpty => f.write_str(
@@ -324,8 +344,13 @@ impl fmt::Display for Outcome {
             Self::OwnIgnoreFile => f.write_str(
                 "can't start: its path has its own .stignore; move it aside, or copy its patterns into the item's excludes",
             ),
-            Self::Missing => f.write_str("can't be synced: its path is missing; is its disk mounted?"),
+            Self::Missing => f.write_str(
+                "can't be synced: its path or Syncthing's marker in it is missing; is its disk mounted?",
+            ),
             Self::PathError(error) => write!(f, "can't be synced: {error}"),
+            Self::Unreadable => f.write_str(
+                "can't be synced: its records were written by a newer heighliner; upgrade this Node",
+            ),
             Self::Failed(error) => write!(f, "couldn't be configured: {error}"),
         }
     }
@@ -346,6 +371,9 @@ pub struct Driver {
     port: u16,
     /// Clean-out age for Displaced Versions, in days.
     retention_days: u64,
+    /// Paths with a check still running, so that a hung filesystem holds
+    /// one thread, not one more each reconcile.
+    checking: Arc<Mutex<BTreeSet<AbsPath>>>,
 }
 
 impl Driver {
@@ -359,6 +387,7 @@ impl Driver {
             client,
             port,
             retention_days: retention.as_secs().div_ceil(24 * 60 * 60).max(1),
+            checking: Arc::default(),
         }
     }
 
@@ -367,14 +396,12 @@ impl Driver {
     }
 
     /// Makes Syncthing's configuration match `config` for this device, as
-    /// `tailnet` describes it. `device_id` is Syncthing's, and
-    /// `established` the Replicas already set up here.
+    /// `tailnet` describes it. `device_id` is Syncthing's.
     pub async fn reconcile(
         &self,
         config: &Config,
         tailnet: &Tailnet,
         device_id: &DeviceId,
-        established: &Established,
     ) -> Result<Report, Error> {
         let me = &tailnet.me().id;
         let current: Value = self.client.get("/rest/config").await?;
@@ -398,48 +425,65 @@ impl Driver {
             .collect();
 
         let mut report = Report::default();
+        let locals = config.replicas_on(me);
+        let aliased = self.aliases(&locals).await;
         let mut folders = Vec::new();
         let mut shared_with: BTreeSet<&NodeId> = BTreeSet::new();
         let mut moved = BTreeSet::new();
-        for local in config.replicas_on(me) {
+        for local in &locals {
             let id = local.item_id.to_string();
             let path = local.replica.path();
-            if local.overlaps {
+            if local.overlaps || aliased.contains(&local.item_id) {
+                folders.extend(existing.get(id.as_str()).map(|folder| paused(folder)));
                 report.replicas.insert(local.item_id, Outcome::Overlaps);
                 continue;
             }
-            let was = existing.get(id.as_str());
-            let in_place = was.is_some_and(|folder| folder["path"] == path.as_str());
-            if !in_place {
-                let ready = if established.contains(&(local.item_id, path.clone())) {
-                    in_blocking(check_exists, path.clone()).await
-                } else {
-                    let (adopt, excludes) = (local.replica.adopt, excludes(&local));
-                    in_blocking(move |path| prepare(&path, adopt, &excludes), path.clone()).await
-                };
-                if let Err(outcome) = ready {
-                    report.replicas.insert(local.item_id, outcome);
-                    continue;
+            let was = existing.get(id.as_str()).copied();
+            let in_place = was.filter(|folder| folder["path"] == path.as_str());
+            let was_paused = in_place.is_some_and(|folder| folder["paused"] == true);
+            let ready = match in_place {
+                Some(_) => {
+                    self.in_blocking(
+                        move |path| check_initialized(&path, was_paused),
+                        path.clone(),
+                    )
+                    .await
                 }
-                if was.is_some() {
-                    moved.insert(id.clone());
+                None => {
+                    let (adopt, excludes) = (local.replica.adopt, excludes(local));
+                    self.in_blocking(move |path| prepare(&path, adopt, &excludes), path.clone())
+                        .await
                 }
+            };
+            if let Err(outcome) = ready {
+                // Keep it, with its index, until its path is back.
+                folders.extend(in_place.map(paused));
+                report.replicas.insert(local.item_id, outcome);
+                continue;
+            }
+            if in_place.is_none() && was.is_some() {
+                moved.insert(id.clone());
             }
             let mut outcome = Outcome::Configured;
             let mut folder_type = folder_type(local.role);
-            if in_place
-                && was.is_some_and(|folder| folder["type"] == "receiveonly")
+            if in_place.is_some_and(|folder| folder["type"] == "receiveonly")
                 && folder_type != "receiveonly"
             {
-                match self.client.local_changes(&id).await {
-                    Ok(0) => {}
-                    Ok(_) => {
-                        folder_type = "receiveonly";
-                        outcome = Outcome::LocalChanges;
-                    }
-                    Err(error) => {
-                        folder_type = "receiveonly";
-                        outcome = Outcome::Failed(error.to_string());
+                // A paused folder isn't scanned, so its local changes can't
+                // be known until it runs again.
+                if was_paused || local.paused {
+                    folder_type = "receiveonly";
+                } else {
+                    match self.local_changes_now(&id).await {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            folder_type = "receiveonly";
+                            outcome = Outcome::LocalChanges;
+                        }
+                        Err(error) => {
+                            folder_type = "receiveonly";
+                            outcome = Outcome::Failed(error.to_string());
+                        }
                     }
                 }
             }
@@ -452,13 +496,21 @@ impl Driver {
             shared_with.extend(devices.iter().copied());
             folders.push(self.folder(
                 folder_template,
-                &local,
+                local,
                 folder_type,
                 device_id,
                 &peers,
                 &devices,
             ));
             report.replicas.insert(local.item_id, outcome);
+        }
+        for item in config.unusable_on(me) {
+            folders.extend(
+                existing
+                    .get(item.to_string().as_str())
+                    .map(|folder| paused(folder)),
+            );
+            report.replicas.insert(item, Outcome::Unreadable);
         }
 
         let mut this_device = current["devices"]
@@ -499,11 +551,11 @@ impl Driver {
             report.changed = true;
         }
 
-        for local in config.replicas_on(me) {
+        for local in &locals {
             if !report.replicas[&local.item_id].is_configured() {
                 continue;
             }
-            match self.sync_ignores(&local).await {
+            match self.sync_ignores(local).await {
                 Ok(false) => {}
                 Ok(true) => report.changed = true,
                 Err(outcome) => {
@@ -514,16 +566,20 @@ impl Driver {
         Ok(report)
     }
 
-    /// Sets a configured Replica's excludes, unless its path or marker is
-    /// missing, since Syncthing would recreate the path. Returns whether
-    /// they changed.
+    /// Sets a configured Replica's excludes, unless its marker is missing,
+    /// since Syncthing would recreate its path. Returns whether they
+    /// changed.
     async fn sync_ignores(&self, local: &LocalReplica<'_>) -> Result<bool, Outcome> {
         let wanted = excludes(local);
         let failed = |error: Error| Outcome::Failed(error.to_string());
-        if self.client.ignores(local.item_id).await.map_err(failed)? == wanted {
-            return Ok(false);
+        let unparsed = |error: String| {
+            Outcome::Failed(format!("Syncthing can't use the item's excludes: {error}"))
+        };
+        let (lines, error) = self.client.ignores(local.item_id).await.map_err(failed)?;
+        if lines == wanted {
+            return error.map_or(Ok(false), |error| Err(unparsed(error)));
         }
-        in_blocking(
+        self.in_blocking(
             |path| {
                 Path::new(path.as_str())
                     .join(MARKER)
@@ -538,7 +594,76 @@ impl Driver {
             .set_ignores(local.item_id, &wanted)
             .await
             .map_err(failed)?;
-        Ok(true)
+        let (_, error) = self.client.ignores(local.item_id).await.map_err(failed)?;
+        error.map_or(Ok(true), |error| Err(unparsed(error)))
+    }
+
+    /// How many local changes a folder has, scanning it first so that none
+    /// made since its last scan are missed.
+    async fn local_changes_now(&self, folder: &str) -> Result<u64, Error> {
+        self.client.scan(folder).await?;
+        self.client.local_changes(folder).await
+    }
+
+    /// The Items of `locals` whose paths overlap another's once symlinks are
+    /// resolved on this machine.
+    async fn aliases(&self, locals: &[LocalReplica<'_>]) -> BTreeSet<ItemId> {
+        let mut resolved = Vec::new();
+        for local in locals.iter().filter(|local| !local.overlaps) {
+            let real = Arc::new(Mutex::new(None));
+            let found = real.clone();
+            let _ = self
+                .in_blocking(
+                    move |path| {
+                        *found.lock().unwrap() = fs::canonicalize(path.as_str()).ok();
+                        Ok(())
+                    },
+                    local.replica.path().clone(),
+                )
+                .await;
+            let real = real.lock().unwrap().take();
+            let path = real.unwrap_or_else(|| PathBuf::from(local.replica.path().as_str()));
+            resolved.push((local.item_id, path));
+        }
+        let mut aliased = BTreeSet::new();
+        for (i, (a, a_path)) in resolved.iter().enumerate() {
+            for (b, b_path) in &resolved[i + 1..] {
+                if a_path.starts_with(b_path) || b_path.starts_with(a_path) {
+                    aliased.insert(*a);
+                    aliased.insert(*b);
+                }
+            }
+        }
+        aliased
+    }
+
+    /// Runs `check` on `path` away from the async runtime, so that a hung
+    /// filesystem only times out. While an earlier check of the same path
+    /// is still running, it isn't started again.
+    async fn in_blocking(
+        &self,
+        check: impl FnOnce(AbsPath) -> Result<(), Outcome> + Send + 'static,
+        path: AbsPath,
+    ) -> Result<(), Outcome> {
+        if !self.checking.lock().unwrap().insert(path.clone()) {
+            return Err(Outcome::PathError(
+                "an earlier check of its path hasn't finished; is its filesystem hung?".into(),
+            ));
+        }
+        let checking = self.checking.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = check(path.clone());
+            checking.lock().unwrap().remove(&path);
+            result
+        });
+        match tokio::time::timeout(PATH_TIMEOUT, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(Outcome::PathError(error.to_string())),
+            Err(_) => Err(Outcome::PathError(format!(
+                "its path didn't answer within {}s",
+                PATH_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     fn addresses(&self, ips: &[IpAddr]) -> Vec<Value> {
@@ -604,6 +729,13 @@ impl Driver {
     }
 }
 
+/// A configured folder, paused.
+fn paused(folder: &Value) -> Value {
+    let mut folder = folder.clone();
+    folder["paused"] = json!(true);
+    folder
+}
+
 fn folder_type(role: Role) -> &'static str {
     match role {
         Role::Source => "sendonly",
@@ -623,25 +755,19 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Runs `check` on `path` away from the async runtime, so that a hung
-/// filesystem only times out.
-async fn in_blocking(
-    check: impl FnOnce(AbsPath) -> Result<(), Outcome> + Send + 'static,
-    path: AbsPath,
-) -> Result<(), Outcome> {
-    let task = tokio::task::spawn_blocking(move || check(path));
-    match tokio::time::timeout(PATH_TIMEOUT, task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(Outcome::PathError(error.to_string())),
-        Err(_) => Err(Outcome::PathError(format!(
-            "its path didn't answer within {}s",
-            PATH_TIMEOUT.as_secs()
-        ))),
+/// Checks that a configured folder's path and marker are there. A folder
+/// that was paused may not have started yet, so its marker isn't needed.
+fn check_initialized(path: &AbsPath, was_paused: bool) -> Result<(), Outcome> {
+    check_exists(path)?;
+    if was_paused || Path::new(path.as_str()).join(MARKER).exists() {
+        Ok(())
+    } else {
+        Err(Outcome::Missing)
     }
 }
 
-/// Checks that an established Replica's path is still there.
-fn check_exists(path: AbsPath) -> Result<(), Outcome> {
+/// Checks that a path is a directory that is there.
+fn check_exists(path: &AbsPath) -> Result<(), Outcome> {
     match fs::metadata(path.as_str()) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(Outcome::PathError("its path isn't a directory".into())),

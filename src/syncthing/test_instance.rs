@@ -8,9 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use std::sync::Mutex;
-
-use super::{Client, Driver, Established, Report};
+use super::{Client, Driver, Report};
 use crate::config::Config;
 use crate::daemon::RETENTION_WINDOW;
 use crate::model::{AbsPath, ItemId};
@@ -23,8 +21,6 @@ pub(crate) struct Syncthing {
     pub(crate) home: TempDir,
     child: Child,
     pub(crate) driver: Driver,
-    /// What the daemon would keep for it; see [`Established`].
-    established: Mutex<Established>,
 }
 
 impl Syncthing {
@@ -93,7 +89,6 @@ impl Syncthing {
                     home,
                     child,
                     driver,
-                    established: Mutex::default(),
                 };
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -104,24 +99,13 @@ impl Syncthing {
         panic!("Syncthing didn't start");
     }
 
-    /// Reconciles as the daemon does, keeping track of established
-    /// Replicas.
+    /// Reconciles as the daemon does.
     pub(crate) async fn reconcile(&self, config: &Config, tailnet: &Tailnet) -> Report {
         let device_id = self.driver.client().device_id().await.unwrap();
-        let established = self.established.lock().unwrap().clone();
-        let report = self
-            .driver
-            .reconcile(config, tailnet, &device_id, &established)
+        self.driver
+            .reconcile(config, tailnet, &device_id)
             .await
-            .unwrap();
-        let mut established = self.established.lock().unwrap();
-        for (item, outcome) in &report.replicas {
-            if outcome.is_configured() {
-                let path = config.items[item].replicas[&tailnet.me().id].path().clone();
-                established.insert((*item, path));
-            }
-        }
-        report
+            .unwrap()
     }
 
     pub(crate) async fn config(&self) -> Value {

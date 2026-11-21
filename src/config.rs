@@ -125,6 +125,26 @@ impl ItemEntry {
     }
 }
 
+impl Config {
+    /// The Items with a Replica on `node` that exists but can't be used,
+    /// because it or its Item can't be read.
+    pub fn unusable_on(&self, node: &NodeId) -> BTreeSet<ItemId> {
+        self.problems
+            .iter()
+            .filter_map(|problem| match problem {
+                Problem::Orphaned { item, node: on } if on == node => Some(*item),
+                Problem::Unreadable { key, .. } if key.kind == REPLICA_KIND => {
+                    parse_replica_id(&key.id)
+                        .ok()
+                        .filter(|(_, on)| on == node)
+                        .map(|(item, _)| item)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// One of a Node's Replicas, with what its Syncthing should do with it.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalReplica<'a> {

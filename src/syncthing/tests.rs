@@ -111,10 +111,8 @@ async fn reconcile_configures_a_folder_once() {
     assert_eq!(folder["path"], at.as_str());
     assert_eq!(folder["versioning"]["type"], "simple");
     assert_eq!(folder["versioning"]["params"]["cleanoutDays"], "30");
-    assert_eq!(
-        syncthing.driver.client().ignores(ITEM).await.unwrap(),
-        ["*.tmp"]
-    );
+    let (ignores, error) = syncthing.driver.client().ignores(ITEM).await.unwrap();
+    assert_eq!((ignores, error), (vec!["*.tmp".to_owned()], None));
 
     // Nothing changes the second time.
     let again = syncthing.reconcile(&db.config(), &alone()).await;
@@ -168,15 +166,15 @@ fn preparing_refuses_risky_paths() {
 }
 
 #[tokio::test]
-async fn established_replicas_come_back_without_adopt() {
+async fn an_overlap_pauses_the_folder_instead_of_removing_it() {
     let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
     let at = syncthing.dir("docs");
     let db = added(&at, false);
     syncthing.reconcile(&db.config(), &alone()).await;
     fs::write(file(&at, "synced"), "data").unwrap();
+    assert!(eventually(|| file(&at, MARKER).exists()).await);
 
-    // Another Node tracks an Item nested inside it, so both overlap and
-    // its folder is left out for a while.
+    // Another Node tracks an Item nested inside it, so both overlap.
     let nested = tracked_as(OTHER, "a", &path(file(&at, "nested")));
     let mut overlapping = db.store().clone();
     overlapping.merge(nested.store(), |_| true);
@@ -184,11 +182,42 @@ async fn established_replicas_come_back_without_adopt() {
         .reconcile(&Config::new(&overlapping), &alone())
         .await;
     assert_eq!(report.replicas[&ITEM], Outcome::Overlaps);
-    assert!(syncthing.folder(ITEM).await.is_none());
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+    assert!(file(&at, MARKER).exists());
 
-    // Once the overlap is gone, it is configured again, files and all.
+    // Once the overlap is gone, it runs again.
     let report = syncthing.reconcile(&db.config(), &alone()).await;
     assert_eq!(report.replicas[&ITEM], Outcome::Configured);
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], false);
+}
+
+#[tokio::test]
+async fn an_unreadable_replica_pauses_its_folder() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    let db = tracked("a", &at);
+    syncthing.reconcile(&db.config(), &alone()).await;
+
+    // A newer heighliner rewrites the Item in a schema this one can't read.
+    let mut newer = db.store().clone();
+    newer.insert(
+        crate::record::RecordKey {
+            kind: crate::config::ITEM_KIND.to_owned(),
+            id: ITEM.to_string(),
+        },
+        crate::hlc::Hlc {
+            wall: Timestamp::from_millis(u64::MAX / 2),
+            counter: 0,
+            node: node("z"),
+        },
+        crate::record::Content::Live {
+            schema: crate::config::SCHEMA + 1,
+            fields: serde_json::Map::new(),
+        },
+    );
+    let report = syncthing.reconcile(&Config::new(&newer), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Unreadable);
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
 }
 
 #[tokio::test]
@@ -408,4 +437,90 @@ async fn moving_a_replica_starts_afresh_at_the_new_path() {
         second.as_str()
     );
     assert!(eventually(|| file(&second, MARKER).exists()).await);
+}
+
+#[tokio::test]
+async fn a_paused_mirror_isnt_promoted_until_scanned() {
+    let mut pair = Pair::start(Direction::TwoWay, true).await;
+    fs::write(file(&pair.a_path, "one"), "1").unwrap();
+    scan(&pair.a).await;
+    let synced = file(&pair.b_path, "one");
+    assert!(eventually(|| synced.exists()).await);
+
+    // The mirror is paused, its copy deleted, and then it is made a peer
+    // and resumed at once.
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("b"), |replica| {
+            replica.paused = true
+        })
+        .unwrap();
+    pair.reconcile().await;
+    fs::remove_file(&synced).unwrap();
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("b"), |replica| {
+            replica.paused = false;
+            replica.mirror = false;
+        })
+        .unwrap();
+    pair.reconcile().await;
+    assert_eq!(pair.b.folder(ITEM).await.unwrap()["type"], "receiveonly");
+    // The next round scans before deciding, and finds the deletion.
+    let (_, b_report) = pair.reconcile().await;
+    assert_eq!(b_report.replicas[&ITEM], Outcome::LocalChanges);
+    assert_eq!(pair.b.folder(ITEM).await.unwrap()["type"], "receiveonly");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(file(&pair.a_path, "one").exists());
+}
+
+#[tokio::test]
+async fn an_unavailable_path_pauses_its_folder() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    let db = tracked("a", &at);
+    syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(eventually(|| file(&at, MARKER).exists()).await);
+
+    // The disk goes away, with nothing else changing.
+    fs::rename(at.as_str(), syncthing.dir("away").as_str()).unwrap();
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Missing);
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+    assert!(!Path::new(at.as_str()).exists());
+
+    // When it comes back, the folder runs again.
+    fs::rename(syncthing.dir("away").as_str(), at.as_str()).unwrap();
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Configured);
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], false);
+}
+
+#[tokio::test]
+async fn symlinked_aliases_count_as_overlapping() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    fs::create_dir(at.as_str()).unwrap();
+    let alias = syncthing.dir("alias");
+    std::os::unix::fs::symlink(at.as_str(), alias.as_str()).unwrap();
+    let mut store = tracked("a", &at).store().clone();
+    store.merge(tracked_as(OTHER, "a", &alias).store(), |_| true);
+    let report = syncthing.reconcile(&Config::new(&store), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Overlaps);
+    assert_eq!(report.replicas[&OTHER], Outcome::Overlaps);
+}
+
+#[tokio::test]
+async fn unparseable_excludes_are_reported() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let mut db = tracked("a", &syncthing.dir("docs"));
+    syncthing.reconcile(&db.config(), &alone()).await;
+    db.update_item(Timestamp::now(), ITEM, |item| {
+        item.excludes = vec![ExcludePattern::new("[").unwrap()]
+    })
+    .unwrap();
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(
+        matches!(&report.replicas[&ITEM], Outcome::Failed(error) if error.contains("excludes")),
+        "{:?}",
+        report.replicas[&ITEM]
+    );
 }

@@ -25,7 +25,7 @@ use crate::hlc::{Hlc, Timestamp};
 use crate::model::{ItemId, NodeId};
 use crate::protocol::{self, Hello};
 use crate::record::Store;
-use crate::syncthing::{self, Driver, Established, Outcome};
+use crate::syncthing::{self, Driver, Outcome};
 use crate::tailscale::{self, Client, LocalApi, Owner, Tailnet};
 
 /// The port heighliner listens on unless configured otherwise.
@@ -57,10 +57,6 @@ struct SavedState {
     format: u32,
     /// The user whose Fleet the records belong to.
     owner: Owner,
-    /// The Replicas set up in this Node's Syncthing, which aren't
-    /// replicated.
-    #[serde(default)]
-    established: Established,
     /// The clock's latest reading, so it resumes after it on restart. Its
     /// node is the Node the state belongs to.
     clock: Hlc,
@@ -242,8 +238,6 @@ pub struct Daemon<T> {
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
     driver: Option<Driver>,
-    /// The Replicas set up in this Node's Syncthing; see [`Established`].
-    established: Mutex<Established>,
     /// The last reconcile's outcome for each Replica, to log changes only.
     outcomes: Mutex<BTreeMap<ItemId, Outcome>>,
 }
@@ -270,10 +264,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
             Err(fs::TryLockError::Error(source)) => return Err(state_error(&lock_file)(source)),
         }
         let state_file = state_dir.join(STATE_FILE);
-        let (db, established) = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
+        let db = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
         // Count the state as it was opened as saved, so nothing is written
         // until it changes; a daemon that changed nothing writes no file.
-        let saved = Mutex::new(snapshot(&db, tailnet.owner(), &established));
+        let saved = Mutex::new(snapshot(&db, tailnet.owner()));
         Ok(Self {
             api,
             port,
@@ -283,7 +277,6 @@ impl<T: LocalApi + Clone> Daemon<T> {
             db: Arc::new(Mutex::new(db)),
             saved,
             driver: None,
-            established: Mutex::new(established),
             outcomes: Mutex::default(),
         })
     }
@@ -466,24 +459,24 @@ impl<T: LocalApi + Clone> Daemon<T> {
             tracing::warn!(%error, "can't publish this Node's Syncthing device ID");
         }
         let config = self.db.lock().unwrap().config();
-        let established = self.established.lock().unwrap().clone();
-        match driver
-            .reconcile(&config, tailnet, &device_id, &established)
-            .await
-        {
+        match driver.reconcile(&config, tailnet, &device_id).await {
             Ok(report) => {
                 let me = &tailnet.me().id;
                 let mut outcomes = self.outcomes.lock().unwrap();
-                let mut established = self.established.lock().unwrap();
                 for (item, outcome) in &report.replicas {
-                    let replica = &config.items[item].replicas[me];
-                    if outcome.is_configured() {
-                        established.insert((*item, replica.path().clone()));
-                    }
-                    if *outcome != Outcome::Configured && outcomes.get(item) != Some(outcome) {
-                        let name = &config.items[item].item.name;
-                        let path = replica.path();
-                        tracing::warn!(%item, %name, %path, "this Node's replica {outcome}");
+                    // An unreadable Replica's Item and path aren't known.
+                    let entry = config.items.get(item);
+                    let name = entry.map_or("", |entry| entry.item.name.as_str());
+                    let path = entry
+                        .and_then(|entry| entry.replicas.get(me))
+                        .map_or("", |replica| replica.path().as_str());
+                    match outcomes.get(item) {
+                        Some(before) if before == outcome => {}
+                        Some(_) if *outcome == Outcome::Configured => {
+                            tracing::info!(%item, %name, %path, "this Node's replica {outcome} again");
+                        }
+                        None if *outcome == Outcome::Configured => {}
+                        _ => tracing::warn!(%item, %name, %path, "this Node's replica {outcome}"),
                     }
                 }
                 *outcomes = report.replicas.clone();
@@ -499,11 +492,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Writes the records and clock to the state file, if they changed.
     pub fn save(&self) -> Result<(), Error> {
         let mut saved = self.saved.lock().unwrap();
-        let bytes = snapshot(
-            &self.db.lock().unwrap(),
-            self.tailnet.owner(),
-            &self.established.lock().unwrap(),
-        );
+        let bytes = snapshot(&self.db.lock().unwrap(), self.tailnet.owner());
         if *saved == bytes {
             return Ok(());
         }
@@ -517,11 +506,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
 }
 
 /// The state file's contents for `db`, a copy of `owner`'s Fleet.
-fn snapshot(db: &ConfigDb, owner: Owner, established: &Established) -> Vec<u8> {
+fn snapshot(db: &ConfigDb, owner: Owner) -> Vec<u8> {
     let state = SavedState {
         format: STATE_FORMAT,
         owner,
-        established: established.clone(),
         clock: db.last_reading(),
         records: db.store().clone(),
     };
@@ -530,11 +518,11 @@ fn snapshot(db: &ConfigDb, owner: Owner, established: &Established) -> Vec<u8> {
 
 /// Reads the state file for `node` of `owner`'s Fleet, or starts empty if
 /// there is none.
-fn load(path: &Path, node: NodeId, owner: Owner) -> Result<(ConfigDb, Established), Error> {
+fn load(path: &Path, node: NodeId, owner: Owner) -> Result<ConfigDb, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok((ConfigDb::new(node, Store::default()), Established::new()));
+            return Ok(ConfigDb::new(node, Store::default()));
         }
         Err(source) => {
             return Err(Error::State {
@@ -567,10 +555,7 @@ fn load(path: &Path, node: NodeId, owner: Owner) -> Result<(ConfigDb, Establishe
             current: node,
         });
     }
-    Ok((
-        ConfigDb::resume(node, saved.records, &saved.clock),
-        saved.established,
-    ))
+    Ok(ConfigDb::resume(node, saved.records, &saved.clock))
 }
 
 /// Replaces `path` with `bytes`, readable only by this user, so that a

@@ -88,9 +88,13 @@ fn main() -> ExitCode {
 }
 
 fn run_daemon(options: daemon::Options) -> Result<(), daemon::Error> {
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("a tokio runtime starts")
-        .block_on(daemon::run(options))
+        .expect("a tokio runtime starts");
+    let result = runtime.block_on(daemon::run(options));
+    // The daemon has saved its state by now. A path check stuck on a hung
+    // filesystem would otherwise keep the process from exiting.
+    runtime.shutdown_background();
+    result
 }

@@ -112,7 +112,10 @@ async fn reconcile_configures_a_folder_once() {
     assert_eq!(folder["versioning"]["type"], "simple");
     assert_eq!(folder["versioning"]["params"]["cleanoutDays"], "30");
     let (ignores, error) = syncthing.driver.client().ignores(ITEM).await.unwrap();
-    assert_eq!((ignores, error), (vec!["*.tmp".to_owned()], None));
+    assert_eq!(
+        (ignores, error),
+        (ignore_lines(&["*.tmp".to_owned()]), None)
+    );
 
     // Nothing changes the second time.
     let again = syncthing.reconcile(&db.config(), &alone()).await;
@@ -162,6 +165,30 @@ fn preparing_refuses_risky_paths() {
     assert_eq!(
         fs::read_to_string(file(&own, IGNORE_FILE)).unwrap(),
         "precious\n"
+    );
+    // One that holds exactly the excludes is the Replica's own.
+    fs::write(file(&own, IGNORE_FILE), "precious\n").unwrap();
+    prepare(&own, true, &["precious".to_owned()]).unwrap();
+    // A symlinked one isn't followed.
+    let linked = path(dir.path().join("linked"));
+    fs::create_dir(linked.as_str()).unwrap();
+    let outside = dir.path().join("outside");
+    std::os::unix::fs::symlink(&outside, file(&linked, IGNORE_FILE)).unwrap();
+    assert_eq!(prepare(&linked, true, &[]), Err(Outcome::OwnIgnoreFile));
+    assert!(!outside.exists());
+}
+
+#[test]
+fn preparing_again_takes_the_new_excludes() {
+    // As when a round prepared a path but Syncthing never added its
+    // folder, and the excludes changed before the next.
+    let dir = tempfile::tempdir().unwrap();
+    let at = path(dir.path().join("new"));
+    prepare(&at, false, &["*.tmp".to_owned()]).unwrap();
+    prepare(&at, false, &["*.bak".to_owned()]).unwrap();
+    assert_eq!(
+        fs::read_to_string(file(&at, IGNORE_FILE)).unwrap(),
+        as_file(&ignore_lines(&["*.bak".to_owned()]))
     );
 }
 
@@ -533,6 +560,59 @@ async fn unparseable_excludes_are_reported() {
         "{:?}",
         report.replicas[&ITEM]
     );
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+}
+
+#[tokio::test]
+async fn a_resumed_folder_runs_only_with_its_new_excludes() {
+    let mut pair = Pair::start(Direction::TwoWay, false).await;
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("a"), |replica| {
+            replica.paused = true
+        })
+        .unwrap();
+    pair.reconcile().await;
+    // Made while paused, and excluded before it runs again.
+    fs::write(file(&pair.a_path, "private"), "mine").unwrap();
+    pair.db
+        .update_item(Timestamp::now(), ITEM, |item| {
+            item.excludes = vec![ExcludePattern::new("private").unwrap()]
+        })
+        .unwrap();
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("a"), |replica| {
+            replica.paused = false
+        })
+        .unwrap();
+    let (a_report, _) = pair.reconcile().await;
+    assert_eq!(a_report.replicas[&ITEM], Outcome::Configured);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!file(&pair.b_path, "private").exists());
+}
+
+#[tokio::test]
+async fn a_new_item_at_an_untracked_ones_path_waits_for_its_removal() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    let db = tracked("a", &at);
+    syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(eventually(|| file(&at, MARKER).exists()).await);
+
+    // Untracked, and tracked again as a new Item, in one round.
+    let mut db = db;
+    db.untrack(Timestamp::now(), ITEM).unwrap();
+    let mut store = db.store().clone();
+    store.merge(tracked_as(OTHER, "a", &at).store(), |_| true);
+    let config = Config::new(&store);
+    let report = syncthing.reconcile(&config, &alone()).await;
+    assert_eq!(report.replicas[&OTHER], Outcome::Overlaps);
+    assert!(syncthing.folder(ITEM).await.is_none());
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let report = syncthing.reconcile(&config, &alone()).await;
+    assert_eq!(report.replicas[&OTHER], Outcome::Configured);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(file(&at, MARKER).exists());
 }
 
 #[tokio::test]

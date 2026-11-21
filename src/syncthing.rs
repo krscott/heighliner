@@ -19,7 +19,8 @@
 //! - A Replica is first set up at an empty path, or at a missing one whose
 //!   parent exists (so an unmounted disk isn't filled in its place), or
 //!   with its `adopt` flag. A path that already holds files is otherwise
-//!   refused, and so is one with its own `.stignore`.
+//!   refused, and so is one with its own `.stignore`. A new folder waits
+//!   until any other folder at an overlapping path has been removed.
 //! - A configured folder is removed only when its Replica is removed or
 //!   its Item untracked. While it can't be synced for a while (its path is
 //!   missing, it overlaps another, or its records can't be read or haven't
@@ -31,6 +32,11 @@
 //!   removes the marker of a configured folder and never recreates a
 //!   configured folder's missing path, so a missing or unmounted path is an
 //!   error rather than everything having been deleted.
+//! - A configured folder's new excludes are applied before it runs with
+//!   the rest of its new configuration, and while they can't be, it is
+//!   paused; a new folder's are written before Syncthing first scans it.
+//!   Heighliner replaces a `.stignore` only if it wrote it, or it holds
+//!   exactly the excludes.
 //! - A mirror is made to send only while it runs and right after a scan
 //!   finds no local changes; otherwise it stays receive-only.
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
@@ -317,7 +323,8 @@ pub enum Outcome {
     /// It was a mirror and has local changes, so its folder stays
     /// receive-only instead of starting to send them.
     LocalChanges,
-    /// It overlaps another Replica on this Node, so it isn't synced.
+    /// It overlaps another Replica on this Node, or a folder Syncthing has
+    /// yet to remove, so it isn't synced.
     Overlaps,
     /// Its path already holds files, and the Replica doesn't adopt them.
     NotEmpty,
@@ -352,7 +359,9 @@ impl fmt::Display for Outcome {
             Self::LocalChanges => f.write_str(
                 "has changes made locally while it was a mirror, so it stays receive-only; make it a mirror again, or undo the changes (Syncthing lists them as locally changed items)",
             ),
-            Self::Overlaps => f.write_str("overlaps another replica on this Node, so it isn't synced"),
+            Self::Overlaps => f.write_str(
+                "overlaps another replica, or a folder Syncthing is still removing, on this Node, so it isn't synced",
+            ),
             Self::NotEmpty => f.write_str(
                 "can't start: its path already holds files; add the replica again with adopt to merge them",
             ),
@@ -448,6 +457,7 @@ impl Driver {
         let mut folders = Vec::new();
         let mut shared_with: BTreeSet<&NodeId> = BTreeSet::new();
         let mut moved = BTreeSet::new();
+        let mut fresh = Vec::new();
         for local in &locals {
             let id = local.item_id.to_string();
             let path = local.replica.path();
@@ -460,9 +470,29 @@ impl Driver {
             let in_place = was.filter(|folder| folder["path"] == path.as_str());
             let was_paused = in_place.is_some_and(|folder| folder["paused"] == true);
             let ready = match in_place {
-                Some(_) => {
-                    self.in_blocking(|path| check_initialized(&path), path.clone())
+                // The excludes are applied before the folder runs with its
+                // new configuration, so that it never scans with old ones.
+                Some(_) => match self
+                    .in_blocking(|path| check_initialized(&path), path.clone())
+                    .await
+                {
+                    Ok(()) => self
+                        .sync_ignores(local)
                         .await
+                        .map(|changed| report.changed |= changed),
+                    Err(outcome) => Err(outcome),
+                },
+                // Syncthing removes a folder's marker when the folder goes,
+                // so a new one waits for any other at its path to go first.
+                None if existing.iter().any(|(other, folder)| {
+                    *other != id
+                        && folder["path"]
+                            .as_str()
+                            .and_then(|other| AbsPath::new(other).ok())
+                            .is_some_and(|other| other.overlaps(path))
+                }) =>
+                {
+                    Err(Outcome::Overlaps)
                 }
                 None => {
                     let (adopt, excludes) = (local.replica.adopt, excludes(local));
@@ -476,8 +506,11 @@ impl Driver {
                 report.replicas.insert(local.item_id, outcome);
                 continue;
             }
-            if in_place.is_none() && was.is_some() {
-                moved.insert(id.clone());
+            if in_place.is_none() {
+                fresh.push(local);
+                if was.is_some() {
+                    moved.insert(id.clone());
+                }
             }
             let mut outcome = Outcome::Configured;
             let mut folder_type = folder_type(local.role);
@@ -489,15 +522,10 @@ impl Driver {
                 if was_paused || local.paused {
                     folder_type = "receiveonly";
                 } else {
-                    // The scan must use the Item's current excludes, or it
-                    // would miss local changes to files they now include.
-                    let scanned = match self.sync_ignores(local).await {
-                        Ok(_) => self
-                            .local_changes_now(&id)
-                            .await
-                            .map_err(|error| Outcome::Failed(error.to_string())),
-                        Err(outcome) => Err(outcome),
-                    };
+                    let scanned = self
+                        .local_changes_now(&id)
+                        .await
+                        .map_err(|error| Outcome::Failed(error.to_string()));
                     match scanned {
                         Ok(0) => {}
                         Ok(_) => {
@@ -589,10 +617,9 @@ impl Driver {
             report.changed = true;
         }
 
-        for local in &locals {
-            if !report.replicas[&local.item_id].is_configured() {
-                continue;
-            }
+        // A new folder starts with the `.stignore` prepared for it; this
+        // checks that Syncthing can use it.
+        for local in fresh {
             match self.sync_ignores(local).await {
                 Ok(false) => {}
                 Ok(true) => report.changed = true,
@@ -608,7 +635,7 @@ impl Driver {
     /// since Syncthing would recreate its path. Returns whether they
     /// changed.
     async fn sync_ignores(&self, local: &LocalReplica<'_>) -> Result<bool, Outcome> {
-        let wanted = excludes(local);
+        let wanted = ignore_lines(&excludes(local));
         let failed = |error: Error| Outcome::Failed(error.to_string());
         let unparsed = |error: String| {
             Outcome::Failed(format!("Syncthing can't use the item's excludes: {error}"))
@@ -802,7 +829,12 @@ fn folder_type(role: Role) -> &'static str {
     }
 }
 
-/// An Item's exclude patterns, as `.stignore` lines.
+/// The first line of each `.stignore` heighliner writes, so that it can
+/// tell its own from a user's.
+const IGNORE_HEADER: &str =
+    "// Written by heighliner from the item's excludes; edit those instead.";
+
+/// An Item's exclude patterns.
 fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
     local
         .entry
@@ -811,6 +843,18 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
         .iter()
         .map(|pattern| pattern.as_str().to_owned())
         .collect()
+}
+
+/// The `.stignore` lines for `excludes`.
+fn ignore_lines(excludes: &[String]) -> Vec<String> {
+    std::iter::once(IGNORE_HEADER.to_owned())
+        .chain(excludes.iter().cloned())
+        .collect()
+}
+
+/// `lines` as a file.
+fn as_file(lines: &[String]) -> String {
+    lines.iter().map(|line| format!("{line}\n")).collect()
 }
 
 /// Checks that a configured folder's path and marker are there.
@@ -836,11 +880,14 @@ fn check_exists(path: &AbsPath) -> Result<(), Outcome> {
 /// Gets a new Replica's path ready: creates it if it's missing and its
 /// parent exists, refuses it if it holds files the Replica doesn't adopt
 /// or its own `.stignore`, and writes the exclude patterns before Syncthing
-/// first scans it. Running it again on a path it prepared succeeds.
+/// first scans it. Running it again on a path it prepared succeeds, even
+/// once the excludes have changed. A `.stignore` holding exactly the
+/// excludes counts as the Replica's own.
 fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outcome> {
     let path = Path::new(path.as_str());
     let error = |error: io::Error| Outcome::PathError(error.to_string());
-    let lines: String = excludes.iter().map(|line| format!("{line}\n")).collect();
+    let ignore_file = path.join(IGNORE_FILE);
+    let mut ignore_file_exists = false;
     match fs::read_dir(path) {
         Ok(entries) => {
             for entry in entries {
@@ -852,9 +899,18 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
                     return Err(Outcome::NotEmpty);
                 }
             }
-            match fs::read_to_string(path.join(IGNORE_FILE)) {
-                Ok(existing) if existing != lines => return Err(Outcome::OwnIgnoreFile),
-                Ok(_) => {}
+            match fs::symlink_metadata(&ignore_file) {
+                // Not a symlink, so writing it can't reach outside the path.
+                Ok(metadata) if metadata.is_file() => {
+                    let existing = fs::read_to_string(&ignore_file).map_err(error)?;
+                    let ours = existing.lines().next() == Some(IGNORE_HEADER)
+                        || existing == as_file(excludes);
+                    if !ours {
+                        return Err(Outcome::OwnIgnoreFile);
+                    }
+                    ignore_file_exists = true;
+                }
+                Ok(_) => return Err(Outcome::OwnIgnoreFile),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(error(e)),
             }
@@ -880,7 +936,18 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(error(e)),
     }
-    fs::write(path.join(IGNORE_FILE), lines).map_err(error)
+    let lines = as_file(&ignore_lines(excludes));
+    if ignore_file_exists {
+        fs::write(&ignore_file, lines).map_err(error)
+    } else {
+        // Fails rather than following a symlink made meanwhile.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&ignore_file)
+            .and_then(|mut file| io::Write::write_all(&mut file, lines.as_bytes()))
+            .map_err(error)
+    }
 }
 
 /// Sets the options that keep Syncthing on the tailnet.

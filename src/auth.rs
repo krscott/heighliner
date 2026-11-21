@@ -13,7 +13,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -144,8 +144,9 @@ impl<T: LocalApi> Authorizer<T> {
 /// Each connection is authorized as it is accepted, before anything is
 /// read from it; a refused caller gets a single error response and the
 /// connection is closed. Each request on an accepted connection is
-/// authorized again, since either device can change while it is open. A caller that doesn't send
-/// a request's headers within [`HEADER_TIMEOUT`] is disconnected.
+/// authorized again, since either device can change while it is open. A
+/// caller that doesn't send a request's headers within [`HEADER_TIMEOUT`]
+/// is disconnected.
 pub async fn serve<T: LocalApi>(
     listener: TcpListener,
     router: Router,
@@ -173,6 +174,7 @@ async fn serve_with<T: LocalApi>(
     header_timeout: Duration,
 ) -> Infallible {
     let unauthorized = Arc::new(Semaphore::new(MAX_UNAUTHORIZED));
+    let mut last_warned = None;
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -184,7 +186,11 @@ async fn serve_with<T: LocalApi>(
             }
         };
         let Ok(permit) = unauthorized.clone().try_acquire_owned() else {
-            tracing::debug!(%addr, "too many unauthorized connections; closing");
+            // Logged at most once a minute, since a flood would repeat it.
+            if last_warned.is_none_or(|at: Instant| at.elapsed() > Duration::from_secs(60)) {
+                tracing::warn!(%addr, "too many unauthorized connections; closing new ones");
+                last_warned = Some(Instant::now());
+            }
             continue;
         };
         let authorizer = authorizer.clone();

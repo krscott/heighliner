@@ -601,7 +601,10 @@ async fn an_alias_of_overlapping_replicas_overlaps_too() {
     std::os::unix::fs::symlink(at.as_str(), alias.as_str()).unwrap();
     let third = ItemId::from_u128(0x123);
     let mut store = tracked("a", &at).store().clone();
-    store.merge(tracked_as(OTHER, "a", &path(file(&at, "nested"))).store(), |_| true);
+    store.merge(
+        tracked_as(OTHER, "a", &path(file(&at, "nested"))).store(),
+        |_| true,
+    );
     store.merge(tracked_as(third, "a", &alias).store(), |_| true);
     let report = syncthing.reconcile(&Config::new(&store), &alone()).await;
     assert_eq!(report.replicas[&third], Outcome::Overlaps);

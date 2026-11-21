@@ -94,6 +94,7 @@ pub enum Error {
     },
     Timeout {
         path: String,
+        after: Duration,
     },
     Status {
         path: String,
@@ -123,7 +124,11 @@ impl fmt::Display for Error {
                 socket.display()
             ),
             Self::Http { path, source } => write!(f, "Syncthing request {path} failed: {source}"),
-            Self::Timeout { path } => write!(f, "Syncthing didn't answer {path} in time"),
+            Self::Timeout { path, after } => write!(
+                f,
+                "Syncthing didn't answer {path} within {}s",
+                after.as_secs()
+            ),
             Self::Status { path, status, body } => {
                 write!(
                     f,
@@ -226,6 +231,7 @@ impl Client {
                 .await
                 .map_err(|_| Error::Timeout {
                     path: path.to_owned(),
+                    after: timeout,
                 })??;
         if !status.is_success() {
             return Err(Error::Status {
@@ -486,7 +492,10 @@ impl Driver {
                     // The scan must use the Item's current excludes, or it
                     // would miss local changes to files they now include.
                     let scanned = match self.sync_ignores(local).await {
-                        Ok(_) => self.local_changes_now(&id).await.map_err(|error| Outcome::Failed(error.to_string())),
+                        Ok(_) => self
+                            .local_changes_now(&id)
+                            .await
+                            .map_err(|error| Outcome::Failed(error.to_string())),
                         Err(outcome) => Err(outcome),
                     };
                     match scanned {
@@ -853,6 +862,12 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
         Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Outcome::Missing),
+            // Not there to read, yet there to create: a dangling symlink.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(Outcome::PathError(
+                    "its path is a symlink to something that doesn't exist".into(),
+                ));
+            }
             Err(e) => return Err(error(e)),
         },
         Err(e) => return Err(error(e)),

@@ -424,6 +424,9 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
             }
         }
+        // Keep what was merged even if configuring Syncthing, which can be
+        // slow, is interrupted.
+        self.save()?;
         round.syncthing = self.drive(&tailnet).await;
         self.db
             .lock()
@@ -640,7 +643,15 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = pulls.tick() => match daemon.pull_round().await {
+            _ = pulls.tick() => {
+                // A round can take a while, for example scanning a mirror
+                // before it starts to send, so stop signals interrupt it.
+                let round = tokio::select! {
+                    round = daemon.pull_round() => round,
+                    _ = terminate.recv() => return Ok(()),
+                    _ = interrupt.recv() => return Ok(()),
+                };
+                match round {
                 Err(Error::AddressesChanged) => {
                     tracing::info!("this device's Tailscale addresses changed; listening on the new ones");
                     // Stop the servers and their connections first, so the
@@ -651,7 +662,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Err(error @ Error::IdentityChanged) => return Err(error),
                 Err(error) => tracing::warn!(%error, "pulling records failed"),
                 Ok(_) => {}
-            },
+                }
+            }
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
             _ = terminate.recv() => return Ok(()),
             _ = interrupt.recv() => return Ok(()),

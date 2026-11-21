@@ -33,6 +33,13 @@ enum Command {
         /// Seconds between pulls of the other Nodes' records.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         pull_every: u64,
+        /// Syncthing's GUI and REST API socket. Without it, the daemon
+        /// doesn't drive Syncthing.
+        #[arg(long, requires = "syncthing_api_key_file")]
+        syncthing_socket: Option<PathBuf>,
+        /// A file holding Syncthing's API key.
+        #[arg(long, requires = "syncthing_socket")]
+        syncthing_api_key_file: Option<PathBuf>,
     },
 }
 
@@ -56,11 +63,19 @@ fn main() -> ExitCode {
             port,
             tailscale_socket,
             pull_every,
+            syncthing_socket,
+            syncthing_api_key_file,
         } => run_daemon(daemon::Options {
             state_dir,
             port,
             tailscale_socket,
             pull_every: Duration::from_secs(pull_every),
+            syncthing: syncthing_socket.zip(syncthing_api_key_file).map(
+                |(socket, api_key_file)| daemon::SyncthingOptions {
+                    socket,
+                    api_key_file,
+                },
+            ),
         }),
     };
     match result {
@@ -73,9 +88,13 @@ fn main() -> ExitCode {
 }
 
 fn run_daemon(options: daemon::Options) -> Result<(), daemon::Error> {
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("a tokio runtime starts")
-        .block_on(daemon::run(options))
+        .expect("a tokio runtime starts");
+    let result = runtime.block_on(daemon::run(options));
+    // The daemon has saved its state by now. A path check stuck on a hung
+    // filesystem would otherwise keep the process from exiting.
+    runtime.shutdown_background();
+    result
 }

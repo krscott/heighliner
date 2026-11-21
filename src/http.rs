@@ -1,6 +1,6 @@
-//! A minimal HTTP/1.1 client for GET requests over an open connection.
+//! A minimal HTTP/1.1 client for one request over an open connection.
 
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::header::HOST;
 use hyper::{Request, StatusCode};
@@ -12,8 +12,30 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Sends a GET for `path`, with `host` as the Host header, over `stream`,
-/// and returns the status and body.
+/// Sends `request` over `stream`, with `host` as the Host header, and
+/// returns the status and body.
+pub(crate) async fn send<S>(
+    stream: S,
+    host: &str,
+    mut request: Request<Full<Bytes>>,
+) -> Result<(StatusCode, Bytes), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(connection);
+    request.headers_mut().insert(HOST, host.parse()?);
+    let response = sender.send_request(request).await?;
+    let status = response.status();
+    let body = Limited::new(response.into_body(), MAX_BODY)
+        .collect()
+        .await?
+        .to_bytes();
+    Ok((status, body))
+}
+
+/// Sends a GET for `path`.
 pub(crate) async fn get<S>(
     stream: S,
     host: &str,
@@ -22,17 +44,5 @@ pub(crate) async fn get<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut sender, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    tokio::spawn(connection);
-    let request = Request::get(path)
-        .header(HOST, host)
-        .body(Empty::<Bytes>::new())?;
-    let response = sender.send_request(request).await?;
-    let status = response.status();
-    let body = Limited::new(response.into_body(), MAX_BODY)
-        .collect()
-        .await?
-        .to_bytes();
-    Ok((status, body))
+    send(stream, host, Request::get(path).body(Full::default())?).await
 }

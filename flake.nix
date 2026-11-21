@@ -42,6 +42,7 @@
             rustfmt
             shfmt
             shellcheck
+            syncthing
             bash
           ];
         };

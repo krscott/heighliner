@@ -118,16 +118,72 @@ impl ItemEntry {
         Some(self.item.direction.role(node, replica.mirror))
     }
 
-    /// Whether the Replica on `node` is paused, directly or through its Item.
-    pub fn is_paused(&self, node: &NodeId) -> Option<bool> {
-        let replica = self.replicas.get(node)?;
-        Some(self.item.paused || replica.paused)
-    }
-
     fn has_sender(&self) -> bool {
         self.replicas
             .keys()
             .any(|node| self.role(node) != Some(Role::Mirror))
+    }
+}
+
+impl Config {
+    /// Whether the Replica of `item` on `node` was removed, or the Item
+    /// untracked, as far as the records still show.
+    pub fn was_removed(&self, item: ItemId, node: &NodeId) -> bool {
+        self.untracked.contains(&item) || self.removed.contains(&(item, node.clone()))
+    }
+
+    /// The Items with a Replica on `node` that exists but can't be used,
+    /// because it or its Item can't be read.
+    pub fn unusable_on(&self, node: &NodeId) -> BTreeSet<ItemId> {
+        self.problems
+            .iter()
+            .filter_map(|problem| match problem {
+                Problem::Orphaned { item, node: on } if on == node => Some(*item),
+                Problem::Unreadable { key, .. } if key.kind == REPLICA_KIND => {
+                    parse_replica_id(&key.id)
+                        .ok()
+                        .filter(|(_, on)| on == node)
+                        .map(|(item, _)| item)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// One of a Node's Replicas, with what its Syncthing should do with it.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalReplica<'a> {
+    pub item_id: ItemId,
+    pub entry: &'a ItemEntry,
+    pub replica: &'a Replica,
+    pub role: Role,
+    /// Paused directly or through its Item.
+    pub paused: bool,
+    /// Overlaps another Replica on the Node, so it must not be synced.
+    pub overlaps: bool,
+}
+
+impl Config {
+    /// The Replicas on `node`, in Item order.
+    pub fn replicas_on(&self, node: &NodeId) -> Vec<LocalReplica<'_>> {
+        self.items
+            .iter()
+            .filter_map(|(item_id, entry)| {
+                let replica = entry.replicas.get(node)?;
+                let overlaps = self.problems.iter().any(|problem| {
+                    matches!(problem, Problem::Overlap { node: on, items } if on == node && items.contains(item_id))
+                });
+                Some(LocalReplica {
+                    item_id: *item_id,
+                    entry,
+                    replica,
+                    role: entry.role(node)?,
+                    paused: entry.item.paused || replica.paused,
+                    overlaps,
+                })
+            })
+            .collect()
     }
 }
 
@@ -185,6 +241,9 @@ pub struct Config {
     /// What each Node has published about itself.
     pub nodes: BTreeMap<NodeId, NodeInfo>,
     pub problems: Vec<Problem>,
+    /// Replicas whose record is a tombstone, and Items untracked.
+    removed: BTreeSet<(ItemId, NodeId)>,
+    untracked: BTreeSet<ItemId>,
 }
 
 /// The readable settings in an Item record.
@@ -223,6 +282,7 @@ impl Config {
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
                         None => {
+                            config.untracked.insert(id);
                             let last_live = record
                                 .versions()
                                 .rev()
@@ -246,7 +306,9 @@ impl Config {
                             replicas.entry(item).or_default().insert(node, replica);
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
-                        None => {}
+                        None => {
+                            config.removed.insert((item, node));
+                        }
                     }
                 }
                 NODE_KIND => {
@@ -472,15 +534,17 @@ impl ConfigDb {
             .prune(now, window, |key| referenced.contains(key));
     }
 
-    /// Creates an Item with its first Replica.
+    /// Creates an Item with its first Replica, which adopts the files at
+    /// its path: tracking is how existing files become an Item.
     pub fn track(
         &mut self,
         now: Timestamp,
         id: ItemId,
         item: Item,
         node: &NodeId,
-        replica: Replica,
+        mut replica: Replica,
     ) -> Result<(), EditError> {
+        replica.adopt = true;
         if self.store.get(&item_key(id)).is_some() {
             return Err(EditError::ItemExists(id));
         }

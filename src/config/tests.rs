@@ -27,6 +27,11 @@ fn t(millis: u64) -> Timestamp {
     Timestamp::from_millis(millis)
 }
 
+fn assert_nothing_tracked(config: &Config) {
+    assert!(config.items.is_empty(), "{config:?}");
+    assert_eq!(config.problems, []);
+}
+
 fn db(id: &str) -> ConfigDb {
     ConfigDb::new(node(id), Store::default())
 }
@@ -202,7 +207,7 @@ fn concurrent_rename_and_untrack_is_flagged() {
         ]
     );
     a.untrack(t(22), ITEM).unwrap();
-    assert_eq!(a.config(), Config::default());
+    assert_nothing_tracked(&a.config());
 }
 
 #[test]
@@ -329,7 +334,7 @@ fn merge_leaves_out_versions_from_far_ahead() {
         .unwrap();
     let mut a = db("a");
     assert_eq!(a.merge(ahead.store(), t(0)), 2);
-    assert_eq!(a.config(), Config::default());
+    assert_nothing_tracked(&a.config());
     assert_eq!(a.merge(ahead.store(), t(1)), 0);
     assert!(a.config().items.contains_key(&ITEM));
 }
@@ -439,7 +444,7 @@ fn untrack_removes_every_replica() {
     a.add_replica(t(2), ITEM, &node("b"), replica("/x"))
         .unwrap();
     a.untrack(t(3), ITEM).unwrap();
-    assert_eq!(a.config(), Config::default());
+    assert_nothing_tracked(&a.config());
     assert_eq!(a.untrack(t(4), ITEM), Err(EditError::UnknownItem(ITEM)));
     a.prune(t(4).saturating_add(DAY * 31), DAY * 30);
     assert_eq!(a.store(), &Store::default());
@@ -544,7 +549,7 @@ fn unreadable_records_are_kept_but_not_used() {
             Err(EditError::UnknownItem(ITEM))
         );
         a.untrack(t(2), ITEM).unwrap();
-        assert_eq!(a.config(), Config::default());
+        assert_nothing_tracked(&a.config());
     }
 }
 

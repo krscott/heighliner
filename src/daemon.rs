@@ -2,7 +2,7 @@
 //! pulls the other Nodes' records on a timer, and keeps its copy of all
 //! records in a state file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -22,15 +22,17 @@ use crate::auth::{self, Authorizer};
 use crate::config::ConfigDb;
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
-use crate::model::NodeId;
+use crate::model::{ItemId, NodeId};
 use crate::protocol::{self, Hello};
 use crate::record::Store;
+use crate::syncthing::{self, Driver, Outcome};
 use crate::tailscale::{self, Client, LocalApi, Owner, Tailnet};
 
 /// The port heighliner listens on unless configured otherwise.
 pub const DEFAULT_PORT: u16 = 7130;
 
-/// How long superseded record versions and tombstones are kept.
+/// How long superseded record versions, tombstones and Displaced Versions
+/// are kept.
 pub const RETENTION_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long each of a device's addresses may take to answer hello. Devices
@@ -97,6 +99,11 @@ pub enum Error {
     StateLocked {
         path: PathBuf,
     },
+    /// The file with Syncthing's API key can't be read or used.
+    ApiKey {
+        path: PathBuf,
+        reason: String,
+    },
     Listen {
         addr: SocketAddr,
         source: io::Error,
@@ -157,6 +164,11 @@ impl fmt::Display for Error {
             Self::StateLocked { path } => {
                 write!(f, "another heighliner daemon is using {}", path.display())
             }
+            Self::ApiKey { path, reason } => write!(
+                f,
+                "can't use Syncthing's API key from {}: {reason}",
+                path.display()
+            ),
             Self::Listen { addr, source } => write!(f, "can't listen on {addr}: {source}"),
             Self::NoAddress => {
                 f.write_str("can't listen on any of this device's Tailscale addresses")
@@ -184,6 +196,7 @@ impl std::error::Error for Error {
             | Self::StateNode { .. }
             | Self::StateOwner { .. }
             | Self::StateLocked { .. }
+            | Self::ApiKey { .. }
             | Self::NoAddress
             | Self::AddressesChanged
             | Self::IdentityChanged => None,
@@ -206,6 +219,9 @@ pub struct Round {
     pub incompatible: Vec<(NodeId, Hello)>,
     /// The Nodes that answered but whose records couldn't be pulled.
     pub failed: Vec<NodeId>,
+    /// What configuring Syncthing did, if the daemon drives Syncthing and
+    /// could reach it.
+    pub syncthing: Option<syncthing::Report>,
 }
 
 /// One Node's daemon.
@@ -221,6 +237,9 @@ pub struct Daemon<T> {
     /// What was last written to the state file, to skip unchanged writes.
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
+    driver: Option<Driver>,
+    /// The last reconcile's outcome for each Replica, to log changes only.
+    outcomes: Mutex<BTreeMap<ItemId, Outcome>>,
 }
 
 impl<T: LocalApi + Clone> Daemon<T> {
@@ -257,7 +276,15 @@ impl<T: LocalApi + Clone> Daemon<T> {
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
             saved,
+            driver: None,
+            outcomes: Mutex::default(),
         })
+    }
+
+    /// Makes the daemon configure Syncthing through `driver` each round.
+    pub fn with_driver(mut self, driver: Driver) -> Self {
+        self.driver = Some(driver);
+        self
     }
 
     pub fn db(&self) -> &Arc<Mutex<ConfigDb>> {
@@ -397,6 +424,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
             }
         }
+        // Keep what was merged even if configuring Syncthing, which can be
+        // slow, is interrupted.
+        self.save()?;
+        round.syncthing = self.drive(&tailnet).await;
         self.db
             .lock()
             .unwrap()
@@ -409,6 +440,56 @@ impl<T: LocalApi + Clone> Daemon<T> {
         );
         self.save()?;
         Ok(round)
+    }
+
+    /// Publishes Syncthing's device ID and configures Syncthing to match the
+    /// configuration, as this device's status `tailnet` describes it.
+    async fn drive(&self, tailnet: &Tailnet) -> Option<syncthing::Report> {
+        let driver = self.driver.as_ref()?;
+        let device_id = match driver.client().device_id().await {
+            Ok(device_id) => device_id,
+            Err(error) => {
+                tracing::warn!(%error, "can't reach Syncthing");
+                return None;
+            }
+        };
+        if let Err(error) = self
+            .db
+            .lock()
+            .unwrap()
+            .set_device_id(Timestamp::now(), device_id.clone())
+        {
+            tracing::warn!(%error, "can't publish this Node's Syncthing device ID");
+        }
+        let config = self.db.lock().unwrap().config();
+        match driver.reconcile(&config, tailnet, &device_id).await {
+            Ok(report) => {
+                let me = &tailnet.me().id;
+                let mut outcomes = self.outcomes.lock().unwrap();
+                for (item, outcome) in &report.replicas {
+                    // An unreadable Replica's Item and path aren't known.
+                    let entry = config.items.get(item);
+                    let name = entry.map_or("", |entry| entry.item.name.as_str());
+                    let path = entry
+                        .and_then(|entry| entry.replicas.get(me))
+                        .map_or("", |replica| replica.path().as_str());
+                    match outcomes.get(item) {
+                        Some(before) if before == outcome => {}
+                        Some(_) if *outcome == Outcome::Configured => {
+                            tracing::info!(%item, %name, %path, "this Node's replica {outcome} again");
+                        }
+                        None if *outcome == Outcome::Configured => {}
+                        _ => tracing::warn!(%item, %name, %path, "this Node's replica {outcome}"),
+                    }
+                }
+                *outcomes = report.replicas.clone();
+                Some(report)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "configuring Syncthing failed");
+                None
+            }
+        }
     }
 
     /// Writes the records and clock to the state file, if they changed.
@@ -512,6 +593,17 @@ pub struct Options {
     pub port: u16,
     pub tailscale_socket: PathBuf,
     pub pull_every: Duration,
+    /// How to reach Syncthing, if the daemon is to drive it.
+    pub syncthing: Option<SyncthingOptions>,
+}
+
+/// How the daemon reaches the Syncthing instance it drives.
+#[derive(Clone, Debug)]
+pub struct SyncthingOptions {
+    /// Syncthing's GUI and REST API socket.
+    pub socket: PathBuf,
+    /// A file holding Syncthing's API key.
+    pub api_key_file: PathBuf,
 }
 
 /// Runs the daemon. It waits for tailscaled to be ready, then serves and
@@ -521,6 +613,17 @@ pub struct Options {
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
     let mut daemon = open_when_ready(api, &options.state_dir, options.port).await?;
+    if let Some(syncthing) = &options.syncthing {
+        let path = &syncthing.api_key_file;
+        let api_key_error = |reason: String| Error::ApiKey {
+            path: path.clone(),
+            reason,
+        };
+        let api_key = fs::read_to_string(path).map_err(|error| api_key_error(error.to_string()))?;
+        let client = syncthing::Client::new(&syncthing.socket, api_key.trim())
+            .map_err(|error| api_key_error(error.to_string()))?;
+        daemon = daemon.with_driver(Driver::new(client, RETENTION_WINDOW));
+    }
     let stopped = serve(&mut daemon, options.pull_every).await;
     // Whatever stopped the daemon, keep what it merged since the last save.
     if let Err(error) = daemon.save() {
@@ -540,7 +643,15 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = pulls.tick() => match daemon.pull_round().await {
+            _ = pulls.tick() => {
+                // A round can take a while, for example scanning a mirror
+                // before it starts to send, so stop signals interrupt it.
+                let round = tokio::select! {
+                    round = daemon.pull_round() => round,
+                    _ = terminate.recv() => return Ok(()),
+                    _ = interrupt.recv() => return Ok(()),
+                };
+                match round {
                 Err(Error::AddressesChanged) => {
                     tracing::info!("this device's Tailscale addresses changed; listening on the new ones");
                     // Stop the servers and their connections first, so the
@@ -551,7 +662,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Err(error @ Error::IdentityChanged) => return Err(error),
                 Err(error) => tracing::warn!(%error, "pulling records failed"),
                 Ok(_) => {}
-            },
+                }
+            }
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
             _ = terminate.recv() => return Ok(()),
             _ = interrupt.recv() => return Ok(()),

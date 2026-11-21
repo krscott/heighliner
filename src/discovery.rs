@@ -8,25 +8,27 @@ use tokio::task::JoinSet;
 use crate::protocol::{self, Hello};
 use crate::tailscale::{Device, Tailnet};
 
-/// A device that answered the Node protocol's hello, the address it
-/// answered on, and what it said.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A device that answered on heighliner's port, the address it answered
+/// on, and its answer to hello, which can be an error, such as a refusal.
+#[derive(Debug)]
 pub struct Found {
     pub device: Device,
     pub addr: SocketAddr,
-    pub hello: Hello,
+    pub hello: Result<Hello, protocol::Error>,
 }
 
-/// Finds the devices owned by this device's owner that answer the Node
-/// protocol's hello on `port`. Each device's addresses are tried in turn,
-/// each for at most `timeout`; devices are asked concurrently.
+/// Asks the devices owned by this device's owner for the Node protocol's
+/// hello on `port`, and returns the ones that answered. Each device's
+/// addresses are tried in turn until one answers, each for at most
+/// `timeout`; devices are asked concurrently.
 pub async fn discover(tailnet: &Tailnet, port: u16, timeout: Duration) -> Vec<Found> {
     let mut probes = JoinSet::new();
     for device in tailnet.owned_devices().cloned() {
         probes.spawn(async move {
             for ip in &device.ips {
                 let addr = SocketAddr::new(*ip, port);
-                if let Ok(hello) = protocol::hello(addr, timeout).await {
+                let hello = protocol::hello(addr, timeout).await;
+                if !hello.as_ref().is_err_and(protocol::Error::is_unreachable) {
                     return Some(Found {
                         device,
                         addr,
@@ -61,14 +63,22 @@ mod tests {
             protocol::HELLO_PATH,
             get(|| async { axum::Json(Hello::ours()) }),
         );
+        // Answers, but refuses.
+        let refusing = Router::new().route(
+            protocol::HELLO_PATH,
+            get(|| async { (axum::http::StatusCode::FORBIDDEN, "no") }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, hello).await });
-        // Accepts connections on the same port, but isn't heighliner.
+        let listener = TcpListener::bind(("127.0.0.5", port)).await.unwrap();
+        tokio::spawn(async move { axum::serve(listener, refusing).await });
+        // Accepts connections on the same port, but never answers.
         let silent = TcpListener::bind(("127.0.0.4", port)).await.unwrap();
         tokio::spawn(async move {
-            loop {
-                let _ = silent.accept().await;
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                held.push(stream);
             }
         });
 
@@ -83,8 +93,9 @@ mod tests {
                 answering,
                 // Owned, but nothing listens.
                 device("idle", OWNER, "127.0.0.3"),
-                // Listens, but doesn't speak the protocol.
+                // Listens, but never answers.
                 device("silent", OWNER, "127.0.0.4"),
+                device("refusing", OWNER, "127.0.0.5"),
                 // Answers, but isn't the owner's.
                 device("friend", OTHER, "127.0.0.1"),
                 tagged,
@@ -93,12 +104,16 @@ mod tests {
         .unwrap();
 
         let found = discover(&tailnet, port, Duration::from_millis(500)).await;
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].device.name, "answering");
+        let names: Vec<_> = found.iter().map(|f| f.device.name.as_str()).collect();
+        assert_eq!(names, ["answering", "refusing"]);
         assert_eq!(
             found[0].addr,
             SocketAddr::new("127.0.0.1".parse().unwrap(), port)
         );
-        assert_eq!(found[0].hello, Hello::ours());
+        assert_eq!(found[0].hello.as_ref().unwrap(), &Hello::ours());
+        assert!(matches!(
+            found[1].hello,
+            Err(protocol::Error::Status { .. })
+        ));
     }
 }

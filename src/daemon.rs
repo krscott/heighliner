@@ -1,11 +1,13 @@
 //! The daemon: serves the Node protocol on this Node's Tailscale addresses,
-//! pulls the other Nodes' records on a timer, and keeps its own records in
-//! a state file.
+//! pulls the other Nodes' records on a timer, and keeps its copy of all
+//! records in a state file.
 
+use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,13 +24,17 @@ use crate::hlc::{Hlc, Timestamp};
 use crate::model::NodeId;
 use crate::protocol::{self, Hello};
 use crate::record::Store;
-use crate::tailscale::{self, Client, LocalApi};
+use crate::tailscale::{self, Client, LocalApi, Tailnet};
 
 /// The port heighliner listens on unless configured otherwise.
 pub const DEFAULT_PORT: u16 = 7130;
 
-/// How long another Node may take to answer hello. Most devices are often
-/// offline, and every pull round waits this long for each of them.
+/// How long superseded record versions and tombstones are kept.
+pub const RETENTION_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How long each of a device's addresses may take to answer hello. Devices
+/// are asked concurrently, so a round waits this long for each address of
+/// an offline device.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long pulling another Node's records may take.
@@ -43,7 +49,8 @@ const STATE_FORMAT: u32 = 1;
 #[derive(Serialize, Deserialize)]
 struct SavedState {
     format: u32,
-    /// The clock's latest reading, so it resumes after it on restart.
+    /// The clock's latest reading, so it resumes after it on restart. Its
+    /// node is the Node the state belongs to.
     clock: Hlc,
     records: Store,
 }
@@ -69,11 +76,35 @@ pub enum Error {
         path: PathBuf,
         format: u32,
     },
+    /// The state was saved by another Tailscale node, for example before
+    /// this device logged in again with a new identity.
+    StateNode {
+        path: PathBuf,
+        saved: NodeId,
+        current: NodeId,
+    },
     Listen {
         addr: SocketAddr,
         source: io::Error,
     },
-    Serve(io::Error),
+    /// None of this device's Tailscale addresses could be listened on, for
+    /// example because the tailnet interface isn't up yet.
+    NoAddress,
+    /// This device's Tailscale addresses changed since the daemon started.
+    AddressesChanged,
+    Serve(tokio::task::JoinError),
+}
+
+impl Error {
+    /// Whether starting again later may succeed, as when tailscaled is
+    /// still coming up.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Tailscale(tailscale::Error::Tagged) => false,
+            Self::Tailscale(_) | Self::NoAddress => true,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -89,8 +120,23 @@ impl fmt::Display for Error {
                 "{} has format {format}, but this heighliner reads format {STATE_FORMAT}; run a newer heighliner",
                 path.display()
             ),
+            Self::StateNode {
+                path,
+                saved,
+                current,
+            } => write!(
+                f,
+                "{} belongs to Tailscale node {saved}, but this device is now {current}; its Replicas would belong to a Node that no longer exists. Move the file aside to start this Node afresh, then add its Replicas again",
+                path.display()
+            ),
             Self::Listen { addr, source } => write!(f, "can't listen on {addr}: {source}"),
-            Self::Serve(source) => write!(f, "serving stopped: {source}"),
+            Self::NoAddress => {
+                f.write_str("can't listen on any of this device's Tailscale addresses")
+            }
+            Self::AddressesChanged => f.write_str(
+                "this device's Tailscale addresses changed; restarting to listen on the new ones",
+            ),
+            Self::Serve(error) => write!(f, "a server failed: {error}"),
         }
     }
 }
@@ -99,11 +145,13 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Tailscale(error) => Some(error),
-            Self::State { source, .. } | Self::Listen { source, .. } | Self::Serve(source) => {
-                Some(source)
-            }
+            Self::State { source, .. } | Self::Listen { source, .. } => Some(source),
             Self::StateDecode { source, .. } => Some(source),
-            Self::StateFormat { .. } => None,
+            Self::Serve(error) => Some(error),
+            Self::StateFormat { .. }
+            | Self::StateNode { .. }
+            | Self::NoAddress
+            | Self::AddressesChanged => None,
         }
     }
 }
@@ -121,7 +169,7 @@ pub struct Round {
     pub pulled: Vec<NodeId>,
     /// The Nodes that speak another major version of the protocol.
     pub incompatible: Vec<(NodeId, Hello)>,
-    /// The Nodes that answered hello but whose records couldn't be pulled.
+    /// The Nodes that answered but whose records couldn't be pulled.
     pub failed: Vec<NodeId>,
 }
 
@@ -129,9 +177,12 @@ pub struct Round {
 pub struct Daemon<T> {
     api: T,
     port: u16,
+    /// The status when the daemon started.
+    tailnet: Tailnet,
     state_file: PathBuf,
     db: Arc<Mutex<ConfigDb>>,
     /// What was last written to the state file, to skip unchanged writes.
+    /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
 }
 
@@ -149,6 +200,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         Ok(Self {
             api,
             port,
+            tailnet,
             state_file,
             db: Arc::new(Mutex::new(db)),
             saved: Mutex::new(Vec::new()),
@@ -160,16 +212,21 @@ impl<T: LocalApi + Clone> Daemon<T> {
     }
 
     /// Starts serving the Node protocol on each of this device's Tailscale
-    /// addresses. The servers run until one fails.
-    pub async fn listen(&self) -> Result<JoinSet<io::Result<()>>, Error> {
-        let authorizer = Arc::new(Authorizer::new(self.api.clone()).await?);
-        let tailnet = self.api.status().await?;
+    /// addresses. An address that isn't configured on this machine is
+    /// skipped, unless none can be used.
+    pub async fn listen(&self) -> Result<JoinSet<Infallible>, Error> {
+        let authorizer = Arc::new(Authorizer::for_tailnet(self.api.clone(), &self.tailnet));
         let mut servers = JoinSet::new();
-        for ip in &tailnet.me().ips {
+        for ip in &self.tailnet.me().ips {
             let addr = SocketAddr::new(*ip, self.port);
-            let listener = TcpListener::bind(addr)
-                .await
-                .map_err(|source| Error::Listen { addr, source })?;
+            let listener = match TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => {
+                    tracing::warn!(%addr, %error, "skipping an address this machine doesn't have");
+                    continue;
+                }
+                Err(source) => return Err(Error::Listen { addr, source }),
+            };
             tracing::info!(%addr, "serving the Node protocol");
             servers.spawn(auth::serve(
                 listener,
@@ -177,51 +234,79 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 authorizer.clone(),
             ));
         }
+        if servers.is_empty() {
+            return Err(Error::NoAddress);
+        }
         Ok(servers)
     }
 
-    /// Pulls and merges the records of every Node that answers, then saves.
+    /// Pulls and merges the records of every Node that answers, drops
+    /// versions older than the Retention Window, then saves.
     pub async fn pull_round(&self) -> Result<Round, Error> {
         let tailnet = self.api.status().await?;
-        let found = discovery::discover(&tailnet, self.port, HELLO_TIMEOUT).await;
-        let mut pulls = JoinSet::new();
-        for found in found {
-            pulls.spawn(async move {
-                let pulled = protocol::pull(found.addr, &found.hello, PULL_TIMEOUT).await;
-                (found, pulled)
-            });
+        let addresses = |tailnet: &Tailnet| {
+            tailnet
+                .me()
+                .ips
+                .iter()
+                .copied()
+                .collect::<BTreeSet<IpAddr>>()
+        };
+        if addresses(&tailnet) != addresses(&self.tailnet) {
+            return Err(Error::AddressesChanged);
         }
         let mut round = Round::default();
-        for (found, pulled) in pulls.join_all().await {
-            let node = found.device.id;
-            let name = found.device.name;
+        let mut pulls = JoinSet::new();
+        for discovery::Found {
+            device,
+            addr,
+            hello,
+        } in discovery::discover(&tailnet, self.port, HELLO_TIMEOUT).await
+        {
+            match hello {
+                Ok(hello) if hello.protocol == protocol::MAJOR => {
+                    pulls.spawn(async move {
+                        let pulled = protocol::pull(addr, &hello, PULL_TIMEOUT).await;
+                        (device, pulled)
+                    });
+                }
+                Ok(hello) => {
+                    let error = protocol::Error::Incompatible {
+                        addr,
+                        theirs: hello.clone(),
+                    };
+                    tracing::warn!(node = %device.name, %error, "not exchanging records");
+                    round.incompatible.push((device.id, hello));
+                }
+                Err(error) => {
+                    tracing::warn!(node = %device.name, %error, "a Node answered with an error");
+                    round.failed.push(device.id);
+                }
+            }
+        }
+        for (device, pulled) in pulls.join_all().await {
             match pulled {
                 Ok(store) => {
                     let rejected = self.db.lock().unwrap().merge(&store, Timestamp::now());
                     if rejected > 0 {
                         tracing::warn!(
-                            node = %name,
+                            from = %device.name,
                             rejected,
-                            "left out versions from a Node whose clock is ahead"
+                            "left out versions written more than 5 minutes ahead of this Node's clock; check the clocks of the Nodes and of this machine"
                         );
                     }
-                    round.pulled.push(node);
-                }
-                Err(protocol::Error::Incompatible { theirs, .. }) => {
-                    tracing::warn!(
-                        node = %name,
-                        theirs = theirs.protocol,
-                        ours = protocol::MAJOR,
-                        "not exchanging records with a Node that speaks another protocol version"
-                    );
-                    round.incompatible.push((node, theirs));
+                    round.pulled.push(device.id);
                 }
                 Err(error) => {
-                    tracing::warn!(node = %name, %error, "can't pull records");
-                    round.failed.push(node);
+                    tracing::warn!(node = %device.name, %error, "can't pull records");
+                    round.failed.push(device.id);
                 }
             }
         }
+        self.db
+            .lock()
+            .unwrap()
+            .prune(Timestamp::now(), RETENTION_WINDOW);
         tracing::debug!(
             pulled = round.pulled.len(),
             incompatible = round.incompatible.len(),
@@ -234,6 +319,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
 
     /// Writes the records and clock to the state file, if they changed.
     pub fn save(&self) -> Result<(), Error> {
+        let mut saved = self.saved.lock().unwrap();
         let state = {
             let db = self.db.lock().unwrap();
             SavedState {
@@ -243,7 +329,6 @@ impl<T: LocalApi + Clone> Daemon<T> {
             }
         };
         let bytes = serde_json::to_vec(&state).expect("the state serializes");
-        let mut saved = self.saved.lock().unwrap();
         if *saved == bytes {
             return Ok(());
         }
@@ -282,9 +367,14 @@ fn load(path: &Path, node: NodeId) -> Result<ConfigDb, Error> {
         });
     }
     let saved: SavedState = serde_json::from_slice(&bytes).map_err(decode_error)?;
-    let mut db = ConfigDb::new(node, saved.records);
-    db.observe(&saved.clock);
-    Ok(db)
+    if saved.clock.node != node {
+        return Err(Error::StateNode {
+            path: path.to_owned(),
+            saved: saved.clock.node,
+            current: node,
+        });
+    }
+    Ok(ConfigDb::resume(node, saved.records, &saved.clock))
 }
 
 /// Replaces `path` with `bytes`, readable only by this user, so that a
@@ -315,28 +405,46 @@ pub struct Options {
     pub pull_every: Duration,
 }
 
-/// Runs the daemon until serving fails.
+/// Runs the daemon. It waits for tailscaled to be ready, then serves and
+/// pulls until a server fails or this device's addresses change.
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
-    let daemon = Daemon::open(api, &options.state_dir, options.port).await?;
-    let mut servers = daemon.listen().await?;
+    let (daemon, mut servers) = start(api, &options.state_dir, options.port).await?;
     let mut pulls = tokio::time::interval(options.pull_every);
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = pulls.tick() => {
-                if let Err(error) = daemon.pull_round().await {
-                    tracing::warn!(%error, "pulling records failed");
-                }
+            _ = pulls.tick() => match daemon.pull_round().await {
+                Err(error @ Error::AddressesChanged) => return Err(error),
+                Err(error) => tracing::warn!(%error, "pulling records failed"),
+                Ok(_) => {}
+            },
+            Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
+        }
+    }
+}
+
+/// Opens the daemon and starts its servers, retrying while tailscaled
+/// isn't ready.
+async fn start(
+    api: Client,
+    state_dir: &Path,
+    port: u16,
+) -> Result<(Daemon<Client>, JoinSet<Infallible>), Error> {
+    let mut delay = Duration::from_secs(1);
+    loop {
+        let started = async {
+            let daemon = Daemon::open(api.clone(), state_dir, port).await?;
+            let servers = daemon.listen().await?;
+            Ok::<_, Error>((daemon, servers))
+        };
+        match started.await {
+            Err(error) if error.is_transient() => {
+                tracing::warn!(%error, "can't start yet; retrying in {}s", delay.as_secs());
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
             }
-            Some(served) = servers.join_next() => {
-                let error = match served {
-                    Ok(Ok(())) => io::Error::other("a server stopped"),
-                    Ok(Err(error)) => error,
-                    Err(error) => io::Error::other(error),
-                };
-                return Err(Error::Serve(error));
-            }
+            started => return started,
         }
     }
 }

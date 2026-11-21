@@ -8,20 +8,26 @@
 //! passes, including other local users and traffic the device forwards;
 //! Nodes are single-user devices.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use tokio::net::TcpListener;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::model::NodeId;
-use crate::tailscale::{self, Identity, LocalApi, Owner};
+use crate::tailscale::{self, Identity, LocalApi, Owner, Tailnet};
 
 /// Checks callers against the user who owns this Node.
 ///
@@ -65,26 +71,30 @@ impl fmt::Display for Denied {
     }
 }
 
-impl IntoResponse for Denied {
-    fn into_response(self) -> Response {
+impl Denied {
+    /// The status and body to answer with. Lookup details stay in the log,
+    /// away from unidentified callers.
+    fn answer(&self) -> (StatusCode, String) {
         match self {
-            Self::NotOnTailnet(_) | Self::NotOwned(_) => {
-                (StatusCode::FORBIDDEN, self.to_string()).into_response()
-            }
-            // The details stay in the log, away from unidentified callers.
+            Self::NotOnTailnet(_) | Self::NotOwned(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Self::Lookup(_) => {
                 tracing::warn!("{self}");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "can't identify the caller right now; see heighliner's log",
+                    "can't identify the caller right now; see heighliner's log".to_owned(),
                 )
-                    .into_response()
             }
             Self::OwnerChanged => {
                 tracing::error!("{self}");
-                (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
             }
         }
+    }
+}
+
+impl IntoResponse for Denied {
+    fn into_response(self) -> Response {
+        self.answer().into_response()
     }
 }
 
@@ -92,11 +102,16 @@ impl<T: LocalApi> Authorizer<T> {
     /// Reads this Node's owner from `api`. Fails if this device is tagged.
     pub async fn new(api: T) -> Result<Self, tailscale::Error> {
         let tailnet = api.status().await?;
-        Ok(Self {
+        Ok(Self::for_tailnet(api, &tailnet))
+    }
+
+    /// Uses the owner in a status `api` just gave.
+    pub fn for_tailnet(api: T, tailnet: &Tailnet) -> Self {
+        Self {
             owner: tailnet.owner(),
             me: tailnet.me().id.clone(),
             api,
-        })
+        }
     }
 
     /// Identifies the caller at `addr`, if it may make requests.
@@ -121,33 +136,91 @@ impl<T: LocalApi> Authorizer<T> {
     }
 }
 
-/// Serves `router` on `listener`, refusing every request, including ones
-/// for unknown routes, that `authorizer` refuses. Handlers get the caller's
-/// [`Identity`] as a request extension.
+/// Serves `router` on `listener` to the callers `authorizer` accepts.
+/// Handlers get the caller's [`Identity`] as a request extension.
+///
+/// Each connection is authorized as it is accepted, before anything is
+/// read from it; a refused caller gets a single error response and the
+/// connection is closed. Each request on an accepted connection checks
+/// again that this device still has its owner. A caller that doesn't send
+/// a request's headers within [`HEADER_TIMEOUT`] is disconnected.
 pub async fn serve<T: LocalApi>(
     listener: TcpListener,
     router: Router,
     authorizer: Arc<Authorizer<T>>,
-) -> io::Result<()> {
-    let app = router.layer(middleware::from_fn_with_state(authorizer, require_owner));
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+) -> Infallible {
+    serve_with(listener, router, authorizer, HEADER_TIMEOUT).await
 }
 
-async fn require_owner<T: LocalApi>(
+/// How long a caller has to send a request's headers.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn serve_with<T: LocalApi>(
+    listener: TcpListener,
+    router: Router,
+    authorizer: Arc<Authorizer<T>>,
+    header_timeout: Duration,
+) -> Infallible {
+    let router = router.layer(middleware::from_fn_with_state(
+        authorizer.clone(),
+        still_owned,
+    ));
+    loop {
+        let (stream, addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // For example, out of file descriptors; try again shortly.
+                tracing::warn!(%error, "can't accept a connection");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let authorizer = authorizer.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            match authorizer.authorize(addr).await {
+                Ok(identity) => {
+                    let service = TowerToHyperService::new(router.layer(Extension(identity)));
+                    let connection = http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(header_timeout)
+                        .serve_connection(TokioIo::new(stream), service);
+                    if let Err(error) = connection.await {
+                        tracing::debug!(%addr, %error, "connection ended");
+                    }
+                }
+                Err(denied) => refuse(stream, &denied, header_timeout).await,
+            }
+        });
+    }
+}
+
+/// Sends `denied`'s answer without reading the request, then closes.
+async fn refuse(mut stream: TcpStream, denied: &Denied, timeout: Duration) {
+    let (status, body) = denied.answer();
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let send = async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await?;
+        // Read what the caller sent until it closes, so that closing doesn't
+        // reset the connection before the caller reads the answer.
+        let mut discard = [0; 4096];
+        while stream.read(&mut discard).await? > 0 {}
+        io::Result::Ok(())
+    };
+    let _ = tokio::time::timeout(timeout, send).await;
+}
+
+async fn still_owned<T: LocalApi>(
     State(authorizer): State<Arc<Authorizer<T>>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
-    match authorizer.authorize(addr).await {
-        Ok(identity) => {
-            request.extensions_mut().insert(identity);
-            next.run(request).await
-        }
+    match authorizer.check_owner().await {
+        Ok(()) => next.run(request).await,
         Err(denied) => denied.into_response(),
     }
 }
@@ -269,6 +342,47 @@ mod tests {
             authorizer.authorize(laptop).await,
             Err(Denied::OwnerChanged)
         ));
+    }
+
+    /// Connects to `server` from `from`.
+    async fn connect_from(from: &str, server: SocketAddr) -> TcpStream {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket
+            .bind(SocketAddr::new(from.parse().unwrap(), 0))
+            .unwrap();
+        socket.connect(server).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn strangers_are_answered_before_they_send_anything() {
+        let server = start(fake()).await;
+        let mut stream = connect_from("127.0.0.6", server).await;
+        let mut answer = String::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(answer.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{answer}");
+        assert!(answer.contains("is not on the tailnet"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn idle_connections_are_closed() {
+        let authorizer = Arc::new(Authorizer::new(fake()).await.unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        tokio::spawn(serve_with(
+            listener,
+            Router::new(),
+            authorizer,
+            Duration::from_millis(200),
+        ));
+        let mut stream = connect_from("127.0.0.2", server).await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("the server closes an idle connection")
+            .unwrap();
     }
 
     #[tokio::test]

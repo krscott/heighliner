@@ -1,4 +1,5 @@
-//! The Fleet's configuration: Items and Replicas stored as records.
+//! The Fleet's configuration: Items, Replicas and what each Node publishes
+//! about itself, stored as records.
 //!
 //! [`Config`] is derived from a [`Store`], so every merge result has a valid
 //! configuration. Merges can produce situations local edits never would, such
@@ -363,6 +364,9 @@ pub enum EditError {
     LastReplica {
         item: ItemId,
     },
+    /// The record exists, but this version can't read it, so it can't be
+    /// edited without losing what it holds.
+    Unreadable(RecordKey),
     /// The edit would cause a Problem that wasn't there before.
     WouldCause(Problem),
 }
@@ -381,6 +385,11 @@ impl fmt::Display for EditError {
             Self::LastReplica { item } => write!(
                 f,
                 "that is the last replica of item {item}; untrack the item instead"
+            ),
+            Self::Unreadable(key) => write!(
+                f,
+                "record {}/{} was written by a newer heighliner; upgrade to edit it",
+                key.kind, key.id
             ),
             Self::WouldCause(problem) => write!(f, "refused, because {problem}"),
         }
@@ -413,16 +422,19 @@ impl ConfigDb {
         self.clock.node()
     }
 
-    /// The clock's latest reading. Persist it with the store and pass it
-    /// to [`ConfigDb::observe`] when reopening, so the clock resumes after
-    /// it even if pruning removed the versions that carried it.
-    pub fn last_reading(&self) -> Hlc {
-        self.clock.last()
+    /// Reopens a saved `store` whose clock's last reading was `last`, so
+    /// the clock resumes after it even if pruning removed the versions that
+    /// carried it.
+    pub fn resume(node: NodeId, store: Store, last: &Hlc) -> Self {
+        let mut db = Self::new(node, store);
+        db.clock.observe(last);
+        db
     }
 
-    /// Makes later local edits supersede `hlc`.
-    pub fn observe(&mut self, hlc: &Hlc) {
-        self.clock.observe(hlc);
+    /// The clock's latest reading, to save with the store for
+    /// [`ConfigDb::resume`].
+    pub fn last_reading(&self) -> Hlc {
+        self.clock.last()
     }
 
     pub fn store(&self) -> &Store {
@@ -593,11 +605,15 @@ impl ConfigDb {
     }
 
     /// Publishes this Node's Syncthing device ID.
+    /// Does nothing if it is unchanged.
     pub fn set_device_id(&mut self, now: Timestamp, device_id: DeviceId) -> Result<(), EditError> {
         let key = node_key(self.node());
         let mut info = NodeInfo::new(device_id);
-        if let Some(original) = self.config().nodes.remove(self.node()) {
-            info.keep_unknown_fields(original);
+        match self.config().nodes.remove(self.node()) {
+            Some(original) if original.device_id == info.device_id => return Ok(()),
+            Some(original) => info.keep_unknown_fields(original),
+            None if is_live(self.store.get(&key)) => return Err(EditError::Unreadable(key)),
+            None => {}
         }
         self.edit(|db| db.write(now, key, &info))
     }

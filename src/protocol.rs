@@ -1,9 +1,9 @@
 //! The Node protocol: the HTTP API daemons use to talk to each other.
 //!
 //! Daemons pull each other's records. `GET /node/hello` says which major
-//! version of the protocol a Node speaks, and never changes shape. Every
-//! other route sits under `/node/v<major>/`, and Nodes whose majors differ
-//! don't exchange records.
+//! version of the protocol a Node speaks; every version keeps its
+//! `protocol` and `heighliner` fields. Every other route sits under
+//! `/node/v<major>/`, and Nodes whose majors differ don't exchange records.
 //!
 //! The routes are served through [`crate::auth::serve`], so only the
 //! owner's devices can use them.
@@ -50,8 +50,9 @@ impl Hello {
     }
 }
 
-/// The Node protocol's routes, serving the records in `db`.
-pub fn router(db: Arc<Mutex<ConfigDb>>) -> Router {
+/// The Node protocol's routes, serving the records in `db`. Serve them
+/// only through [`crate::auth::serve`].
+pub(crate) fn router(db: Arc<Mutex<ConfigDb>>) -> Router {
     Router::new()
         .route(HELLO_PATH, get(|| async { Json(Hello::ours()) }))
         .route(RECORDS_PATH, get(records))
@@ -111,11 +112,21 @@ impl fmt::Display for Error {
                 };
                 write!(
                     f,
-                    "{addr} runs heighliner {} (protocol {}), but this Node speaks protocol {MAJOR}; {upgrade}",
-                    theirs.heighliner, theirs.protocol
+                    "{addr} runs heighliner {} (protocol {}), but this Node runs {} (protocol {MAJOR}); {upgrade}",
+                    theirs.heighliner,
+                    theirs.protocol,
+                    env!("CARGO_PKG_VERSION")
                 )
             }
         }
+    }
+}
+
+impl Error {
+    /// Whether nothing answered at all, as when the device is offline or
+    /// doesn't run heighliner.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Connect { .. } | Self::Timeout { .. })
     }
 }
 

@@ -79,11 +79,7 @@ impl Clock {
             }
         };
         self.last = (wall, counter);
-        Hlc {
-            wall,
-            counter,
-            node: self.node.clone(),
-        }
+        self.last()
     }
 
     /// The latest reading taken or observed, to persist so that a reopened

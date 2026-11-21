@@ -345,8 +345,7 @@ fn reopening_resumes_after_the_saved_clock_reading() {
     a.prune(t(1_001).saturating_add(DAY * 31), DAY * 30);
     assert_eq!(a.store(), &Store::default());
 
-    let mut reopened = ConfigDb::new(node("a"), a.store().clone());
-    reopened.observe(&reading);
+    let mut reopened = ConfigDb::resume(node("a"), a.store().clone(), &reading);
     reopened
         .track(t(5), OTHER, two_way("y"), &node("a"), replica("/y"))
         .unwrap();
@@ -367,6 +366,27 @@ fn nodes_publish_their_device_ids() {
     assert_eq!(config.nodes.len(), 2);
     assert_eq!(config.nodes[&node("a")].device_id, first);
     assert_eq!(config.problems, []);
+
+    // Setting the same ID again writes nothing.
+    let before = a.store().clone();
+    a.set_device_id(t(3), first).unwrap();
+    assert_eq!(a.store(), &before);
+}
+
+#[test]
+fn an_unreadable_node_record_is_not_overwritten() {
+    let future = foreign_store(vec![(
+        node_key(&node("a")),
+        live(SCHEMA + 1, json!({"device_id": "x", "future": true})),
+    )]);
+    let mut a = db("a");
+    a.merge(&future, t(2));
+    let id =
+        DeviceId::new("MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD").unwrap();
+    assert_eq!(
+        a.set_device_id(t(3), id),
+        Err(EditError::Unreadable(node_key(&node("a"))))
+    );
 }
 
 #[test]

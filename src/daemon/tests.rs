@@ -129,3 +129,69 @@ async fn unknown_state_formats_are_refused() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn state_from_another_node_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    track(&before, "docs");
+    before.save().unwrap();
+
+    let error = Daemon::open(tailnet("127.0.0.9", &[]), dir.path(), 1)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::StateNode { .. }));
+    assert!(error.to_string().contains("Move the file aside"), "{error}");
+}
+
+#[tokio::test]
+async fn addresses_this_machine_lacks_are_skipped() {
+    let port = free_port().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut me = device("127.0.0.1", OWNER, "127.0.0.1");
+    // TEST-NET-1: never configured on a machine.
+    me.ips.push("192.0.2.1".parse().unwrap());
+    let daemon = Daemon::open(Fake::new(me), dir.path(), port).await.unwrap();
+    assert_eq!(daemon.listen().await.unwrap().len(), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = Daemon::open(Fake::new(device("x", OWNER, "192.0.2.1")), dir.path(), port)
+        .await
+        .unwrap();
+    assert!(matches!(nowhere.listen().await, Err(Error::NoAddress)));
+}
+
+#[tokio::test]
+async fn changed_addresses_stop_the_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = tailnet("127.0.0.1", &[]);
+    let daemon = Daemon::open(fake.clone(), dir.path(), 1).await.unwrap();
+    let mut moved = device("127.0.0.1", OWNER, "127.0.0.1");
+    moved.ips = vec!["127.0.0.8".parse().unwrap()];
+    fake.set_me(moved);
+    assert!(matches!(
+        daemon.pull_round().await,
+        Err(Error::AddressesChanged)
+    ));
+}
+
+#[tokio::test]
+async fn nodes_that_refuse_are_reported() {
+    let port = free_port().await;
+    let refusing = Router::new().route(
+        protocol::HELLO_PATH,
+        get(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "busy") }),
+    );
+    let listener = TcpListener::bind(("127.0.0.3", port)).await.unwrap();
+    tokio::spawn(async move { axum::serve(listener, refusing).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let b = Daemon::open(tailnet("127.0.0.2", &["127.0.0.3"]), dir.path(), port)
+        .await
+        .unwrap();
+    let round = b.pull_round().await.unwrap();
+    assert_eq!(round.failed, [NodeId::new("n-127.0.0.3").unwrap()]);
+}

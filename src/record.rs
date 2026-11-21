@@ -125,7 +125,7 @@ impl Record {
 
 /// A set of records.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
+#[serde(from = "Vec<Value>", into = "Vec<WireRecord>")]
 pub struct Store {
     records: BTreeMap<RecordKey, Record>,
 }
@@ -197,17 +197,39 @@ struct WireVersion {
     content: Content,
 }
 
-impl From<Vec<WireRecord>> for Store {
-    fn from(records: Vec<WireRecord>) -> Self {
+/// A record as read: each version is decoded on its own, so one bad
+/// version doesn't cost the rest.
+#[derive(Deserialize)]
+struct LenientRecord {
+    kind: String,
+    id: String,
+    versions: Vec<Value>,
+}
+
+/// Decodes records one at a time, skipping (and logging) any that can't be
+/// read, so that one bad record from another Node doesn't cost the rest.
+impl From<Vec<Value>> for Store {
+    fn from(records: Vec<Value>) -> Self {
         let mut store = Self::default();
+        let mut skipped = 0;
         for record in records {
+            let Ok(record) = serde_json::from_value::<LenientRecord>(record) else {
+                skipped += 1;
+                continue;
+            };
             let key = RecordKey {
                 kind: record.kind,
                 id: record.id,
             };
             for version in record.versions {
-                store.insert(key.clone(), version.hlc, version.content);
+                match serde_json::from_value::<WireVersion>(version) {
+                    Ok(version) => store.insert(key.clone(), version.hlc, version.content),
+                    Err(_) => skipped += 1,
+                }
             }
+        }
+        if skipped > 0 {
+            tracing::warn!(skipped, "skipped records or versions that can't be read");
         }
         store
     }
@@ -336,6 +358,23 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].1, &live(1));
         assert!(store.get(&key("k", "2")).is_none());
+    }
+
+    #[test]
+    fn unreadable_versions_are_skipped() {
+        let json = serde_json::json!([
+            {"kind": "k", "id": "1", "versions": [
+                {"hlc": {"wall": 1, "counter": 0, "node": "a"}, "content": {"state": "deleted"}},
+                {"hlc": {"wall": 2, "counter": 0, "node": "a b"}, "content": {"state": "deleted"}},
+            ]},
+            {"kind": "k"},
+            {"kind": "k", "id": "2", "versions": [
+                {"hlc": {"wall": 1, "counter": 0, "node": "a"}, "content": {"state": "archived"}},
+            ]},
+        ]);
+        let store: Store = serde_json::from_value(json).unwrap();
+        assert_eq!(store.records().count(), 1);
+        assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 1);
     }
 
     #[test]

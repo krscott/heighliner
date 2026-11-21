@@ -31,19 +31,25 @@ enum Command {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         tailscale_socket: PathBuf,
         /// Seconds between pulls of the other Nodes' records.
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         pull_every: u64,
     },
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
+    let terminal = std::io::stderr().is_terminal();
+    let logs = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(terminal)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+        );
+    // Elsewhere, such as under systemd, the log adds its own timestamps.
+    if terminal {
+        logs.init();
+    } else {
+        logs.without_time().init();
+    }
     let result = match Cli::parse().command {
         Command::Daemon {
             state_dir,
@@ -54,7 +60,7 @@ fn main() -> ExitCode {
             state_dir,
             port,
             tailscale_socket,
-            pull_every: Duration::from_secs(pull_every.max(1)),
+            pull_every: Duration::from_secs(pull_every),
         }),
     };
     match result {

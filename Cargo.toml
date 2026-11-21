@@ -11,13 +11,13 @@ unsafe_code = "forbid"
 axum = "0.8.9"
 clap = { version = "4.6.9", features = ["derive"] }
 http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["client", "http1"] }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
+hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["rt", "net", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "macros", "io-util"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
 uuid = { version = "1.29.3", features = ["v4", "serde"] }
 
 [dev-dependencies]

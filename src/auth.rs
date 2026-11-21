@@ -159,9 +159,9 @@ pub async fn serve<T: LocalApi>(
 /// How long a caller has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many connections may be waiting to be authorized or being refused
-/// at once. Beyond that, new connections are closed at once, so callers
-/// that aren't the owner's can't use up file descriptors.
+/// How many connections on one listener may be waiting to be authorized or
+/// being refused at once. Beyond that, new connections are closed at once,
+/// so callers that aren't the owner's can't use up file descriptors.
 const MAX_UNAUTHORIZED: usize = 256;
 
 /// How many of those may come from one address. Tailscale authenticates

@@ -125,7 +125,7 @@ impl Record {
 
 /// A set of records.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
+#[serde(try_from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
 pub struct Store {
     records: BTreeMap<RecordKey, Record>,
 }
@@ -206,10 +206,19 @@ struct LenientRecord {
     versions: Vec<Value>,
 }
 
-impl From<Vec<WireRecord>> for Store {
-    fn from(records: Vec<WireRecord>) -> Self {
+/// Refuses a record without versions, which is never written.
+impl TryFrom<Vec<WireRecord>> for Store {
+    type Error = String;
+
+    fn try_from(records: Vec<WireRecord>) -> Result<Self, Self::Error> {
         let mut store = Self::default();
         for record in records {
+            if record.versions.is_empty() {
+                return Err(format!(
+                    "record {}/{} has no versions",
+                    record.kind, record.id
+                ));
+            }
             let key = RecordKey {
                 kind: record.kind,
                 id: record.id,
@@ -218,7 +227,7 @@ impl From<Vec<WireRecord>> for Store {
                 store.insert(key.clone(), version.hlc, version.content);
             }
         }
-        store
+        Ok(store)
     }
 }
 
@@ -393,8 +402,11 @@ mod tests {
         let (store, skipped) = Store::decode_lenient(records);
         assert_eq!(skipped, 3);
         assert_eq!(store.records().count(), 1);
-        // Strict decoding refuses the whole store.
+        // Strict decoding refuses the whole store, including a record
+        // without versions.
         assert!(serde_json::from_value::<Store>(json).is_err());
+        let empty = serde_json::json!([{"kind": "k", "id": "1", "versions": []}]);
+        assert!(serde_json::from_value::<Store>(empty).is_err());
         assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 1);
     }
 

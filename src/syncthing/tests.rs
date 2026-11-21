@@ -176,6 +176,13 @@ fn preparing_refuses_risky_paths() {
     std::os::unix::fs::symlink(&outside, file(&linked, IGNORE_FILE)).unwrap();
     assert_eq!(prepare(&linked, true, &[]), Err(Outcome::OwnIgnoreFile));
     assert!(!outside.exists());
+    // A hard-linked one is replaced, not written through.
+    let hard = path(dir.path().join("hard"));
+    fs::create_dir(hard.as_str()).unwrap();
+    fs::write(&outside, "precious\n").unwrap();
+    fs::hard_link(&outside, file(&hard, IGNORE_FILE)).unwrap();
+    prepare(&hard, true, &["precious".to_owned()]).unwrap();
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "precious\n");
 }
 
 #[test]
@@ -458,7 +465,10 @@ async fn moving_a_replica_starts_afresh_at_the_new_path() {
     )
     .unwrap();
     let report = syncthing.reconcile(&db.config(), &alone()).await;
-    assert_eq!(report.replicas[&ITEM], Outcome::Waiting);
+    assert_eq!(
+        report.replicas[&ITEM],
+        Outcome::Waiting(first.as_str().to_owned())
+    );
     assert!(syncthing.folder(ITEM).await.is_none());
     let report = syncthing.reconcile(&db.config(), &alone()).await;
     assert_eq!(report.replicas[&ITEM], Outcome::Configured);
@@ -567,6 +577,28 @@ async fn unparseable_excludes_are_reported() {
 }
 
 #[tokio::test]
+async fn a_folder_is_paused_before_its_excludes_are_dropped() {
+    let mut pair = Pair::start(Direction::TwoWay, false).await;
+    fs::write(file(&pair.a_path, "private.tmp"), "mine").unwrap();
+    scan(&pair.a).await;
+    // Paused, and the exclude dropped, in one round.
+    pair.db
+        .update_item(Timestamp::now(), ITEM, |item| item.excludes.clear())
+        .unwrap();
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("a"), |replica| {
+            replica.paused = true
+        })
+        .unwrap();
+    let (a_report, _) = pair.reconcile().await;
+    assert_eq!(a_report.replicas[&ITEM], Outcome::Configured);
+    let (ignores, _) = pair.a.driver.client().ignores(ITEM).await.unwrap();
+    assert_eq!(ignores, ignore_lines(&[]));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!file(&pair.b_path, "private.tmp").exists());
+}
+
+#[tokio::test]
 async fn a_resumed_folder_runs_only_with_its_new_excludes() {
     let mut pair = Pair::start(Direction::TwoWay, false).await;
     pair.db
@@ -623,7 +655,10 @@ async fn new_item_at_untracked_ones_path(through_alias: bool) {
     store.merge(tracked_as(OTHER, "a", &at).store(), |_| true);
     let config = Config::new(&store);
     let report = syncthing.reconcile(&config, &alone()).await;
-    assert_eq!(report.replicas[&OTHER], Outcome::Waiting);
+    assert_eq!(
+        report.replicas[&OTHER],
+        Outcome::Waiting(first.as_str().to_owned())
+    );
     assert!(syncthing.folder(ITEM).await.is_none());
 
     tokio::time::sleep(Duration::from_secs(1)).await;

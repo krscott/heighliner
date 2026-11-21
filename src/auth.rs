@@ -8,11 +8,12 @@
 //! passes, including other local users and traffic the device forwards;
 //! Nodes are single-user devices.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -25,7 +26,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::model::NodeId;
 use crate::tailscale::{self, Identity, LocalApi, Owner, Tailnet};
@@ -163,6 +164,10 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// that aren't the owner's can't use up file descriptors.
 const MAX_UNAUTHORIZED: usize = 256;
 
+/// How many of those may come from one address. Tailscale authenticates
+/// source addresses, so one device can't crowd out the owner's devices.
+const MAX_UNAUTHORIZED_PER_ADDRESS: usize = 8;
+
 /// How long a refused connection is kept open for the caller to read the
 /// answer.
 const REFUSE_LINGER: Duration = Duration::from_secs(1);
@@ -173,10 +178,16 @@ async fn serve_with<T: LocalApi>(
     authorizer: Arc<Authorizer<T>>,
     header_timeout: Duration,
 ) -> Infallible {
-    let unauthorized = Arc::new(Semaphore::new(MAX_UNAUTHORIZED));
+    let unauthorized = Arc::new(Unauthorized::default());
     let mut last_warned = None;
+    // Owned here, so that when the server stops, its connections close.
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            Some(_) = connections.join_next() => continue,
+        };
+        let (stream, addr) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
                 // For example, out of file descriptors; try again shortly.
@@ -185,7 +196,7 @@ async fn serve_with<T: LocalApi>(
                 continue;
             }
         };
-        let Ok(permit) = unauthorized.clone().try_acquire_owned() else {
+        let Some(admission) = unauthorized.admit(addr.ip()) else {
             // Logged at most once a minute, since a flood would repeat it.
             if last_warned.is_none_or(|at: Instant| at.elapsed() > Duration::from_secs(60)) {
                 tracing::warn!(%addr, "too many unauthorized connections; closing new ones");
@@ -195,10 +206,10 @@ async fn serve_with<T: LocalApi>(
         };
         let authorizer = authorizer.clone();
         let router = router.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             match authorizer.authorize(addr).await {
                 Ok(_) => {
-                    drop(permit);
+                    drop(admission);
                     let router = router.layer(middleware::from_fn_with_state(
                         (authorizer, addr),
                         reauthorize,
@@ -215,6 +226,51 @@ async fn serve_with<T: LocalApi>(
                 Err(denied) => refuse(stream, &denied).await,
             }
         });
+    }
+}
+
+/// Counts the connections waiting to be authorized or being refused, in
+/// all and per source address, so that neither many callers nor one can
+/// crowd out the owner's devices.
+#[derive(Default)]
+struct Unauthorized {
+    per_address: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// A connection counted in [`Unauthorized`] until it is dropped.
+struct Admission {
+    unauthorized: Arc<Unauthorized>,
+    ip: IpAddr,
+}
+
+impl Unauthorized {
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<Admission> {
+        let mut per_address = self.per_address.lock().unwrap();
+        let total: usize = per_address.values().sum();
+        let count = per_address.entry(ip).or_default();
+        if total >= MAX_UNAUTHORIZED || *count >= MAX_UNAUTHORIZED_PER_ADDRESS {
+            if *count == 0 {
+                per_address.remove(&ip);
+            }
+            return None;
+        }
+        *count += 1;
+        Some(Admission {
+            unauthorized: self.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let mut per_address = self.unauthorized.per_address.lock().unwrap();
+        if let Some(count) = per_address.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                per_address.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -438,6 +494,36 @@ mod tests {
         fake.add_device(tagged);
         let second = sender.send_request(get()).await.unwrap();
         assert_eq!(second.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn unauthorized_connections_are_capped_per_address() {
+        let unauthorized = Arc::new(Unauthorized::default());
+        let stranger: IpAddr = "127.0.0.9".parse().unwrap();
+        let admitted: Vec<_> = (0..MAX_UNAUTHORIZED_PER_ADDRESS)
+            .map(|_| unauthorized.admit(stranger).unwrap())
+            .collect();
+        assert!(unauthorized.admit(stranger).is_none());
+        assert!(unauthorized.admit("127.0.0.2".parse().unwrap()).is_some());
+        drop(admitted);
+        assert!(unauthorized.per_address.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_server_closes_its_connections() {
+        let authorizer = Arc::new(Authorizer::new(fake()).await.unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let serving = tokio::spawn(serve(listener, Router::new(), authorizer));
+        let mut stream = connect_from("127.0.0.2", server).await;
+        // Let the server accept and authorize the connection.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        serving.abort();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("the connection closes with its server")
+            .unwrap();
     }
 
     #[tokio::test]

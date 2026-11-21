@@ -485,9 +485,12 @@ pub async fn run(options: Options) -> Result<(), Error> {
                 Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
             }
         }
-        // Stop the servers and release the state directory before starting
-        // again.
+        // Stop the servers and their connections, save, and release the
+        // state directory before starting again.
         servers.shutdown().await;
+        if let Err(error) = daemon.save() {
+            tracing::warn!(%error, "saving before starting again failed");
+        }
         drop(daemon);
     }
 }

@@ -68,7 +68,8 @@ impl Client {
 /// Whether a Replica's senders can be reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Senders {
-    /// It has none: it is a source, or the only Replica that sends.
+    /// It has none: it is a source, or the only Replica that sends. (A
+    /// mirror with none is an error.)
     None,
     Unreachable,
     Connected,
@@ -121,9 +122,6 @@ impl Driver {
     ) -> Result<ReplicaState, Error> {
         let client = &self.client;
         let item = local.item_id;
-        let status: Value = client
-            .get(&format!("/rest/db/status?folder={item}"))
-            .await?;
         let direction = &local.entry.item.direction;
         let sending = local
             .entry
@@ -143,17 +141,34 @@ impl Driver {
                 break;
             }
         }
+        if senders == Senders::None && local.role == Role::Mirror {
+            return Ok(ReplicaState::Error {
+                message: "can't be synced: it's a mirror, and no other replica of its item sends"
+                    .into(),
+            });
+        }
+        // Read after the senders, so that it includes what Syncthing knows
+        // of a sender that has just connected.
+        let status: Value = client
+            .get(&format!("/rest/db/status?folder={item}"))
+            .await?;
         Ok(state_of(&status, senders))
     }
 
     /// Notifies `changed` whenever Syncthing reports an event after which
-    /// a Replica's state may have changed, and once when Syncthing stops
-    /// answering. Runs until it is dropped.
+    /// a Replica's state may have changed, and when Syncthing stops or
+    /// starts answering again. Runs until it is dropped.
     pub async fn watch(&self, changed: &Notify) {
         let mut since = self.client.latest_event().await.unwrap_or(0);
         let mut failing = false;
         loop {
-            match self.client.events(since, EVENTS_TIMEOUT).await {
+            let events = self.client.events(since, EVENTS_TIMEOUT).await;
+            if events.is_ok() && failing {
+                // Syncthing is back, perhaps with nothing new to report.
+                failing = false;
+                changed.notify_one();
+            }
+            match events {
                 Ok(ids) if ids.is_empty() => {
                     // A restarted Syncthing numbers its events afresh.
                     if let Ok(latest) = self.client.latest_event().await
@@ -165,7 +180,6 @@ impl Driver {
                 }
                 Ok(ids) => {
                     since = ids.into_iter().max().unwrap_or(since);
-                    failing = false;
                     changed.notify_one();
                 }
                 Err(error) => {

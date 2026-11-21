@@ -24,7 +24,7 @@ use crate::auth::{self, Authorizer};
 use crate::config::ConfigDb;
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
-use crate::model::{ItemId, NodeId, ReplicaState};
+use crate::model::{AbsPath, ItemId, NodeId, ReplicaState};
 use crate::protocol::{self, Hello};
 use crate::record::Store;
 use crate::syncthing::{self, Driver, Outcome};
@@ -66,7 +66,15 @@ struct SavedState {
     /// When each of this Node's Replicas was last confirmed current, as of
     /// when it last stopped being current or the daemon last stopped.
     #[serde(default)]
-    last_current: BTreeMap<ItemId, Timestamp>,
+    last_current: BTreeMap<ItemId, Confirmed>,
+}
+
+/// When a Replica was confirmed current, and at which path, since one moved
+/// elsewhere starts afresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Confirmed {
+    path: AbsPath,
+    at: Timestamp,
 }
 
 #[derive(Deserialize)]
@@ -253,11 +261,15 @@ struct Replicas {
     /// run.
     outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
     states: BTreeMap<ItemId, ReplicaState>,
-    /// When `states` were read.
-    read_at: Timestamp,
+    /// How many refreshes have started, and which of them `states` are
+    /// from, so that one overtaken by a later one is dropped.
+    started: u64,
+    applied: u64,
+    /// When each Replica that is current was last read so.
+    current: BTreeMap<ItemId, Confirmed>,
     /// When each Replica was last confirmed current, as of when it last
     /// stopped being current; see [`SavedState::last_current`].
-    last_current: BTreeMap<ItemId, Timestamp>,
+    last_current: BTreeMap<ItemId, Confirmed>,
     /// The state last logged for each Replica, to log changes only.
     logged: BTreeMap<ItemId, ReplicaState>,
 }
@@ -300,7 +312,9 @@ impl<T: LocalApi + Clone> Daemon<T> {
             replicas: Mutex::new(Replicas {
                 outcomes: Ok(BTreeMap::new()),
                 states: BTreeMap::new(),
-                read_at: Timestamp::from_millis(0),
+                started: 0,
+                applied: 0,
+                current: BTreeMap::new(),
                 last_current,
                 logged: BTreeMap::new(),
             }),
@@ -506,7 +520,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
     }
 
     /// Reads this Node's Replicas' states from Syncthing again, and logs
-    /// the ones that changed.
+    /// the ones that changed. Refreshes may overlap; one that finishes after
+    /// a later one is dropped.
     pub async fn refresh(&self) {
         let Some(driver) = &self.driver else {
             return;
@@ -515,7 +530,13 @@ impl<T: LocalApi + Clone> Daemon<T> {
             let db = self.db.lock().unwrap();
             (db.config(), db.node().clone())
         };
-        let outcomes = self.replicas.lock().unwrap().outcomes.clone();
+        let (outcomes, number) = {
+            let mut replicas = self.replicas.lock().unwrap();
+            replicas.started += 1;
+            (replicas.outcomes.clone(), replicas.started)
+        };
+        // Taken before reading, so that a confirmation is never dated later
+        // than it happened.
         let read_at = Timestamp::now();
         let mut states = match &outcomes {
             Ok(outcomes) => driver.states(&config, &me, outcomes).await,
@@ -529,19 +550,43 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 .collect(),
         };
         let mut replicas = self.replicas.lock().unwrap();
+        if number < replicas.applied {
+            return;
+        }
+        replicas.applied = number;
         let Replicas {
             states: before,
-            read_at: before_read_at,
+            current,
             last_current,
             logged,
             ..
         } = &mut *replicas;
+        // An unreadable Replica's Item and path aren't known.
+        let path_of = |item: &ItemId| {
+            config
+                .items
+                .get(item)
+                .and_then(|entry| entry.replicas.get(&me))
+                .map(|replica| replica.path())
+        };
         for (item, state) in &mut states {
-            if before.get(item) == Some(&ReplicaState::Current) && *state != ReplicaState::Current {
-                last_current.insert(*item, *before_read_at);
+            let path = path_of(item);
+            match (&*state, path) {
+                (ReplicaState::Current, Some(path)) => {
+                    let path = path.clone();
+                    current.insert(*item, Confirmed { path, at: read_at });
+                }
+                _ => {
+                    if let Some(confirmed) = current.remove(item) {
+                        last_current.insert(*item, confirmed);
+                    }
+                }
             }
             if let ReplicaState::Behind { last_current: at } = state {
-                *at = last_current.get(item).copied();
+                *at = last_current
+                    .get(item)
+                    .filter(|confirmed| Some(&confirmed.path) == path)
+                    .map(|confirmed| confirmed.at);
             }
             // Syncing comes and goes with each change, so it isn't logged.
             if matches!(state, ReplicaState::Syncing { .. })
@@ -551,12 +596,11 @@ impl<T: LocalApi + Clone> Daemon<T> {
             {
                 continue;
             }
-            // An unreadable Replica's Item and path aren't known.
-            let entry = config.items.get(item);
-            let name = entry.map_or("", |entry| entry.item.name.as_str());
-            let path = entry
-                .and_then(|entry| entry.replicas.get(&me))
-                .map_or("", |replica| replica.path().as_str());
+            let name = config
+                .items
+                .get(item)
+                .map_or("", |entry| entry.item.name.as_str());
+            let path = path.map_or("", AbsPath::as_str);
             if matches!(state, ReplicaState::Error { .. }) {
                 tracing::warn!(%item, %name, %path, "this Node's replica {state}");
             } else {
@@ -564,18 +608,25 @@ impl<T: LocalApi + Clone> Daemon<T> {
             }
             logged.insert(*item, state.clone());
         }
-        // Forget the Replicas that are gone for good.
-        let gone = |item: &ItemId| {
-            config.was_removed(*item, &me)
-                || config
-                    .items
-                    .get(item)
-                    .is_some_and(|entry| !entry.replicas.contains_key(&me))
-        };
-        last_current.retain(|item, _| !gone(item));
+        for (item, confirmed) in std::mem::take(current) {
+            if states.contains_key(&item) {
+                current.insert(item, confirmed);
+            } else {
+                last_current.insert(item, confirmed);
+            }
+        }
+        // Forget the Replicas that are gone, or moved elsewhere; keep the
+        // ones that can't be read.
+        let unusable = config.unusable_on(&me);
+        last_current.retain(|item, confirmed| {
+            unusable.contains(item)
+                || match path_of(item) {
+                    Some(path) => *path == confirmed.path,
+                    None => !config.was_removed(*item, &me) && !config.items.contains_key(item),
+                }
+        });
         logged.retain(|item, _| states.contains_key(item));
         *before = states;
-        *before_read_at = read_at;
     }
 
     /// This Node's Replicas' states, as last read.
@@ -588,17 +639,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
     pub fn save_on_stop(&self) -> Result<(), Error> {
         {
             let mut replicas = self.replicas.lock().unwrap();
-            let Replicas {
-                states,
-                read_at,
-                last_current,
-                ..
-            } = &mut *replicas;
-            for (item, state) in states.iter() {
-                if *state == ReplicaState::Current {
-                    last_current.insert(*item, *read_at);
-                }
-            }
+            let current = replicas.current.clone();
+            replicas.last_current.extend(current);
         }
         self.save()
     }
@@ -624,7 +666,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
 }
 
 /// The state file's contents for `db`, a copy of `owner`'s Fleet.
-fn snapshot(db: &ConfigDb, owner: Owner, last_current: &BTreeMap<ItemId, Timestamp>) -> Vec<u8> {
+fn snapshot(db: &ConfigDb, owner: Owner, last_current: &BTreeMap<ItemId, Confirmed>) -> Vec<u8> {
     let state = SavedState {
         format: STATE_FORMAT,
         owner,
@@ -641,7 +683,7 @@ fn load(
     path: &Path,
     node: NodeId,
     owner: Owner,
-) -> Result<(ConfigDb, BTreeMap<ItemId, Timestamp>), Error> {
+) -> Result<(ConfigDb, BTreeMap<ItemId, Confirmed>), Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -788,11 +830,23 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
             }
             _ = pulls.tick() => {
                 // A round can take a while, for example scanning a mirror
-                // before it starts to send, so stop signals interrupt it.
-                let round = tokio::select! {
-                    round = daemon.pull_round() => round,
-                    _ = terminate.recv() => return Ok(()),
-                    _ = interrupt.recv() => return Ok(()),
+                // before it starts to send, so stop signals interrupt it,
+                // and Syncthing's events still refresh the states meanwhile.
+                let round = {
+                    let daemon = &*daemon;
+                    let round = daemon.pull_round();
+                    tokio::pin!(round);
+                    loop {
+                        tokio::select! {
+                            round = &mut round => break round,
+                            () = async {
+                                changed.notified().await;
+                                daemon.refresh().await;
+                            } => {}
+                            _ = terminate.recv() => return Ok(()),
+                            _ = interrupt.recv() => return Ok(()),
+                        }
+                    }
                 };
                 match round {
                 Err(Error::AddressesChanged) => {

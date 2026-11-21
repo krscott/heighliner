@@ -431,6 +431,26 @@ async fn the_daemon_remembers_when_replicas_were_current() {
         panic!("{:?}", daemon.states()[&ITEM]);
     };
     assert!(before <= at && at <= after);
+
+    // Moved to a new path, it hasn't been current there.
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let me = db.node().clone();
+        db.remove_replica(Timestamp::now(), ITEM, &me).unwrap();
+        db.add_replica(
+            Timestamp::now(),
+            ITEM,
+            &me,
+            Replica::new(syncthing.dir("moved")),
+        )
+        .unwrap();
+    }
+    daemon.pull_round().await.unwrap();
+    daemon.pull_round().await.unwrap();
+    assert_eq!(
+        daemon.states()[&ITEM],
+        ReplicaState::Behind { last_current: None }
+    );
 }
 
 #[tokio::test]

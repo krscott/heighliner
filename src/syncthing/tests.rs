@@ -905,3 +905,30 @@ async fn a_sender_syncthing_doesnt_know_is_unreachable() {
         .await;
     assert_eq!(states[&ITEM], ReplicaState::Behind { last_current: None });
 }
+
+#[tokio::test]
+async fn a_mirror_with_no_sender_is_an_error() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    // Made a mirror on one Node while its sender is removed on another.
+    let base = added(&syncthing.dir("docs"), false);
+    let mut db = ConfigDb::new(node("a"), base.store().clone());
+    db.update_replica(Timestamp::now(), ITEM, &node("a"), |replica| {
+        replica.mirror = true
+    })
+    .unwrap();
+    let mut other = ConfigDb::new(node("x"), base.store().clone());
+    other
+        .remove_replica(Timestamp::now(), ITEM, &node("x"))
+        .unwrap();
+    db.merge(other.store(), Timestamp::now());
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    let states = syncthing
+        .driver
+        .states(&db.config(), &node("a"), &report.replicas)
+        .await;
+    assert!(
+        matches!(&states[&ITEM], ReplicaState::Error { message } if message.contains("mirror")),
+        "{:?}",
+        states[&ITEM]
+    );
+}

@@ -510,11 +510,18 @@ pub struct Options {
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
     let mut daemon = open_when_ready(api, &options.state_dir, options.port).await?;
-    let mut servers = match daemon.relisten().await {
-        Err(Error::IdentityChanged) => return Err(stop_for_new_identity(&daemon)),
-        servers => servers?,
-    };
-    let mut pulls = tokio::time::interval(options.pull_every);
+    let stopped = serve(&mut daemon, options.pull_every).await;
+    // Whatever stopped the daemon, keep what it merged since the last save.
+    if let Err(error) = daemon.save() {
+        tracing::error!(%error, "saving before stopping failed");
+    }
+    stopped
+}
+
+/// Serves and pulls until something stops the daemon.
+async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), Error> {
+    let mut servers = daemon.relisten().await?;
+    let mut pulls = tokio::time::interval(pull_every);
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -524,28 +531,15 @@ pub async fn run(options: Options) -> Result<(), Error> {
                     // Stop the servers and their connections first, so the
                     // port is free on addresses that stay.
                     servers.shutdown().await;
-                    servers = match daemon.relisten().await {
-                        Err(Error::IdentityChanged) => return Err(stop_for_new_identity(&daemon)),
-                        servers => servers?,
-                    };
+                    servers = daemon.relisten().await?;
                 }
-                Err(Error::IdentityChanged) => return Err(stop_for_new_identity(&daemon)),
+                Err(error @ Error::IdentityChanged) => return Err(error),
                 Err(error) => tracing::warn!(%error, "pulling records failed"),
                 Ok(_) => {}
             },
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
         }
     }
-}
-
-/// Saves before the daemon stops because this device's Tailscale identity
-/// changed, and returns the error to stop with.
-fn stop_for_new_identity<T: LocalApi + Clone>(daemon: &Daemon<T>) -> Error {
-    tracing::error!("{}; stopping", Error::IdentityChanged);
-    if let Err(error) = daemon.save() {
-        tracing::error!(%error, "saving before stopping failed");
-    }
-    Error::IdentityChanged
 }
 
 /// Opens the daemon, retrying while tailscaled isn't ready.

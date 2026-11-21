@@ -13,12 +13,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
@@ -825,14 +825,27 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     let mut pulls = tokio::time::interval(pull_every);
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Dropped, and so stopped, with the daemon's other tasks.
-    let mut watcher = JoinSet::new();
+    let mut tasks = JoinSet::new();
     let changed = Arc::new(Notify::new());
+    let (finished, mut finished_items) = mpsc::unbounded_channel();
+    let (jobs, conflict_jobs) = mpsc::unbounded_channel();
+    tasks.spawn(conflicts::worker(conflict_jobs));
     if let Some(driver) = daemon.driver.clone() {
         let changed = changed.clone();
-        watcher.spawn(async move { driver.watch(&changed).await });
+        tasks.spawn(async move { driver.watch(&changed, &finished).await });
     }
+    let mut last_sweep: Option<Instant> = None;
     loop {
         tokio::select! {
+            Some(item) = finished_items.recv() => {
+                let mut items = vec![item];
+                while let Ok(item) = finished_items.try_recv() {
+                    items.push(item);
+                }
+                if let Some(job) = daemon.collect_job(items) {
+                    let _ = jobs.send(job);
+                }
+            }
             _ = changed.notified() => {
                 tokio::select! {
                     () = daemon.refresh() => {}
@@ -881,6 +894,12 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Err(error) => tracing::warn!(%error, "pulling records failed"),
                 Ok(_) => {}
                 }
+                if last_sweep.is_none_or(|at| at.elapsed() >= conflicts::SWEEP_EVERY)
+                    && let Some(job) = daemon.sweep_job()
+                {
+                    let _ = jobs.send(job);
+                    last_sweep = Some(Instant::now());
+                }
             }
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
             _ = terminate.recv() => return Ok(()),
@@ -907,6 +926,10 @@ async fn open_when_ready(
         }
     }
 }
+
+mod conflicts;
+
+pub use conflicts::ActionError;
 
 #[cfg(test)]
 mod tests;

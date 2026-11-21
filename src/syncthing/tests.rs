@@ -111,6 +111,7 @@ async fn reconcile_configures_a_folder_once() {
     assert_eq!(folder["path"], at.as_str());
     assert_eq!(folder["versioning"]["type"], "simple");
     assert_eq!(folder["versioning"]["params"]["cleanoutDays"], "30");
+    assert_eq!(folder["maxConflicts"], -1);
     let (ignores, error) = syncthing.driver.client().ignores(ITEM).await.unwrap();
     assert_eq!(
         (ignores, error),
@@ -858,7 +859,8 @@ async fn syncthing_events_wake_the_watcher() {
     let changed = Arc::new(tokio::sync::Notify::new());
     let watcher = {
         let (driver, changed) = (syncthing.driver.clone(), changed.clone());
-        tokio::spawn(async move { driver.watch(&changed).await })
+        let (finished, _) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move { driver.watch(&changed, &finished).await })
     };
     // Let it catch up with the events so far.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -880,7 +882,8 @@ async fn syncthing_takes_the_event_filter() {
     syncthing
         .reconcile(&tracked("a", &syncthing.dir("docs")).config(), &alone())
         .await;
-    let ids = client.events(0, Duration::from_secs(1)).await.unwrap();
+    let events = client.events(0, Duration::from_secs(1)).await.unwrap();
+    let ids: Vec<u64> = events.iter().map(|event| event.id).collect();
     assert!(!ids.is_empty());
     assert_eq!(
         ids.iter().max().copied(),
@@ -931,4 +934,116 @@ async fn a_mirror_with_no_sender_is_an_error() {
         "{:?}",
         states[&ITEM]
     );
+}
+
+#[tokio::test]
+async fn the_watcher_reports_items_syncthing_finishes() {
+    let pair = Pair::start(Direction::TwoWay, false).await;
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let (finished, mut items) = tokio::sync::mpsc::unbounded_channel();
+    let watcher = {
+        let (driver, changed) = (pair.b.driver.clone(), changed.clone());
+        tokio::spawn(async move { driver.watch(&changed, &finished).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    fs::create_dir(file(&pair.a_path, "sub")).unwrap();
+    fs::write(file(&pair.a_path, "sub/hello.txt"), "hi").unwrap();
+    scan(&pair.a).await;
+    let wanted = Finished {
+        item: ITEM,
+        path: "sub/hello.txt".into(),
+    };
+    let seen = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(item) = items.recv().await {
+            if item == wanted {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(seen.is_ok(), "B's watcher reported the file it received");
+    watcher.abort();
+}
+
+#[tokio::test]
+async fn an_items_retention_window_sets_its_versions_cleanout() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let mut db = tracked("a", &syncthing.dir("docs"));
+    db.update_item(Timestamp::now(), ITEM, |item| {
+        item.retention_days = std::num::NonZeroU32::new(90)
+    })
+    .unwrap();
+    syncthing.reconcile(&db.config(), &alone()).await;
+    let folder = syncthing.folder(ITEM).await.unwrap();
+    assert_eq!(folder["versioning"]["params"]["cleanoutDays"], "90");
+}
+
+/// The conflict copies directly in `dir`.
+fn conflict_copies(dir: &AbsPath) -> Vec<String> {
+    fs::read_dir(dir.as_str())
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.contains(".sync-conflict-"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_data_conflict_stays_on_its_node_and_can_be_swapped() {
+    let mut pair = Pair::start(Direction::TwoWay, false).await;
+    let (a_notes, b_notes) = (
+        file(&pair.a_path, "notes.txt"),
+        file(&pair.b_path, "notes.txt"),
+    );
+    fs::write(&a_notes, "base").unwrap();
+    scan(&pair.a).await;
+    assert!(eventually(|| fs::read_to_string(&b_notes).is_ok_and(|text| text == "base")).await);
+
+    // Both change the file while paused; B's change is older, so it loses.
+    let pause = |db: &mut ConfigDb, paused: bool| {
+        for name in ["a", "b"] {
+            db.update_replica(Timestamp::now(), ITEM, &node(name), |replica| {
+                replica.paused = paused
+            })
+            .unwrap();
+        }
+    };
+    pause(&mut pair.db, true);
+    pair.reconcile().await;
+    fs::write(&b_notes, "from b").unwrap();
+    let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(&b_notes)
+        .unwrap()
+        .set_modified(an_hour_ago)
+        .unwrap();
+    fs::write(&a_notes, "from a").unwrap();
+    pause(&mut pair.db, false);
+    pair.reconcile().await;
+    assert!(eventually(|| fs::read_to_string(&b_notes).is_ok_and(|text| text == "from a")).await);
+    assert!(eventually(|| conflict_copies(&pair.b_path).len() == 1).await);
+    // The copy is ignored, so it stays on B.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(conflict_copies(&pair.a_path).is_empty());
+
+    let b_root = Path::new(pair.b_path.as_str());
+    let collected = conflicts::sweep(b_root).unwrap();
+    assert!(collected.failed.is_empty(), "{:?}", collected.failed);
+    let [conflict] = &collected.found[..] else {
+        panic!("{:?}", collected.found);
+    };
+    assert_eq!(conflict.path, "notes.txt");
+    assert!(conflict_copies(&pair.b_path).is_empty());
+    assert_eq!(conflicts::list(b_root).unwrap(), collected.found);
+
+    // B's change is made the file again, and reaches A.
+    conflicts::swap(b_root, &conflict.version).unwrap();
+    pair.b
+        .driver
+        .client()
+        .scan_path(ITEM, "notes.txt")
+        .await
+        .unwrap();
+    assert!(eventually(|| fs::read_to_string(&a_notes).is_ok_and(|text| text == "from b")).await);
+    assert!(conflicts::list(b_root).unwrap().is_empty());
 }

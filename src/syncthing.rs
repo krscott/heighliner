@@ -43,6 +43,9 @@
 //!   finds no local changes; otherwise it stays receive-only.
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
 //!   used.
+//! - A Data Conflict's losing copy is never deleted early: Syncthing keeps
+//!   every one (`maxConflicts` -1), and heighliner moves it into the
+//!   Displaced Versions, which expire with the Item's Retention Window.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -298,6 +301,15 @@ impl Client {
     /// Scans a folder and waits for the scan to finish.
     async fn scan(&self, folder: &str) -> Result<(), Error> {
         let path = format!("/rest/db/scan?folder={folder}");
+        self.call_within(SCAN_TIMEOUT, Method::POST, &path, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Scans one file or directory of a folder, and waits for the scan.
+    pub(crate) async fn scan_path(&self, folder: ItemId, sub: &str) -> Result<(), Error> {
+        let sub = http::percent_encode(sub);
+        let path = format!("/rest/db/scan?folder={folder}&sub={sub}");
         self.call_within(SCAN_TIMEOUT, Method::POST, &path, None)
             .await?;
         Ok(())
@@ -776,11 +788,19 @@ impl Driver {
         folder["paused"] = json!(local.paused);
         folder["markerName"] = json!(MARKER);
         folder["ignoreDelete"] = json!(false);
+        // Syncthing never deletes a conflict's copy; heighliner moves it
+        // into the Displaced Versions (see `conflicts`).
+        folder["maxConflicts"] = json!(-1);
+        let retention_days = local
+            .entry
+            .item
+            .retention_days
+            .map_or(self.retention_days, |days| u64::from(days.get()));
         folder["versioning"] = json!({
             "type": "simple",
             "params": {
                 "keep": KEEP_VERSIONS.to_string(),
-                "cleanoutDays": self.retention_days.to_string(),
+                "cleanoutDays": retention_days.to_string(),
             },
             "cleanupIntervalS": 3600,
             "fsPath": "",
@@ -861,8 +881,12 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
 }
 
 /// The `.stignore` lines for `excludes`.
+/// Data Conflicts' copies are ignored first, so that no exclude can undo
+/// it.
 fn ignore_lines(excludes: &[String]) -> Vec<String> {
-    std::iter::once(IGNORE_HEADER.to_owned())
+    [IGNORE_HEADER, conflicts::IGNORE_PATTERN]
+        .into_iter()
+        .map(str::to_owned)
         .chain(excludes.iter().cloned())
         .collect()
 }
@@ -1005,7 +1029,11 @@ fn normalized(config: &Value) -> Value {
     config
 }
 
+pub mod conflicts;
+mod events;
 mod state;
+
+pub use events::Finished;
 #[cfg(test)]
 pub(crate) mod test_instance;
 #[cfg(test)]

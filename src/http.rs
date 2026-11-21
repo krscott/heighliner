@@ -35,6 +35,19 @@ where
     Ok((status, body))
 }
 
+/// Percent-encodes everything but unreserved characters, as a query value.
+pub(crate) fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 /// Sends a GET for `path`.
 pub(crate) async fn get<S>(
     stream: S,

@@ -1,61 +1,18 @@
 //! Replica State, read from Syncthing.
 //!
-//! Syncthing's event stream only says when to look again; the states come
-//! from its folder status and connections, so a missed event delays a
-//! state but never makes it wrong.
+//! The states come from Syncthing's folder status and connections; its
+//! event stream (see `events`) only says when to look again, so a missed
+//! event delays a state but never makes it wrong.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
-use hyper::Method;
-use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Notify;
 
 use super::{Client, Driver, Error, Outcome};
 use crate::config::{Config, LocalReplica};
 use crate::model::{ItemId, NodeId, ReplicaState, Role};
 
-/// The events after which a Replica's state may have changed.
-const EVENTS: &str = "StateChanged,FolderSummary,FolderCompletion,FolderErrors,FolderPaused,FolderResumed,DeviceConnected,DeviceDisconnected,DevicePaused,DeviceResumed,ClusterConfigReceived";
-
-/// How long Syncthing holds a request for events open when none happen.
-const EVENTS_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// How long to wait before asking for events again after a failure.
-const EVENTS_RETRY: Duration = Duration::from_secs(5);
-
-#[derive(Deserialize)]
-struct Event {
-    id: u64,
-}
-
 impl Client {
-    /// The IDs of the events after `since`, waiting up to `timeout` for
-    /// one.
-    pub(super) async fn events(&self, since: u64, timeout: Duration) -> Result<Vec<u64>, Error> {
-        let path = format!(
-            "/rest/events?events={EVENTS}&since={since}&timeout={}",
-            timeout.as_secs()
-        );
-        let body = self
-            .call_within(timeout + super::TIMEOUT, Method::GET, &path, None)
-            .await?;
-        let events: Vec<Event> = serde_json::from_slice(&body).map_err(|source| Error::Decode {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(events.into_iter().map(|event| event.id).collect())
-    }
-
-    /// The ID of the latest event, or 0 if there is none yet. Syncthing
-    /// keeps events for a filter only from when it is first asked for them.
-    pub(super) async fn latest_event(&self) -> Result<u64, Error> {
-        let path = format!("/rest/events?events={EVENTS}&since=0&limit=1&timeout=0");
-        let events: Vec<Event> = self.get(&path).await?;
-        Ok(events.iter().map(|event| event.id).max().unwrap_or(0))
-    }
-
     /// Whether `device` is connected and shares `folder`, as far as
     /// Syncthing has heard from it.
     async fn shares_now(&self, folder: ItemId, device: &str) -> Result<bool, Error> {
@@ -153,45 +110,6 @@ impl Driver {
             .get(&format!("/rest/db/status?folder={item}"))
             .await?;
         Ok(state_of(&status, senders))
-    }
-
-    /// Notifies `changed` whenever Syncthing reports an event after which
-    /// a Replica's state may have changed, and when Syncthing stops or
-    /// starts answering again. Runs until it is dropped.
-    pub async fn watch(&self, changed: &Notify) {
-        let mut since = self.client.latest_event().await.unwrap_or(0);
-        let mut failing = false;
-        loop {
-            let events = self.client.events(since, EVENTS_TIMEOUT).await;
-            if events.is_ok() && failing {
-                // Syncthing is back, perhaps with nothing new to report.
-                failing = false;
-                changed.notify_one();
-            }
-            match events {
-                Ok(ids) if ids.is_empty() => {
-                    // A restarted Syncthing numbers its events afresh.
-                    if let Ok(latest) = self.client.latest_event().await
-                        && latest < since
-                    {
-                        since = latest;
-                        changed.notify_one();
-                    }
-                }
-                Ok(ids) => {
-                    since = ids.into_iter().max().unwrap_or(since);
-                    changed.notify_one();
-                }
-                Err(error) => {
-                    if !failing {
-                        tracing::debug!(%error, "can't read Syncthing's events");
-                        failing = true;
-                        changed.notify_one();
-                    }
-                    tokio::time::sleep(EVENTS_RETRY).await;
-                }
-            }
-        }
     }
 }
 

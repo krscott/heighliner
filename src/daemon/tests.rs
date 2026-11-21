@@ -523,3 +523,73 @@ async fn a_replica_added_again_is_checked_afresh() {
         crate::syncthing::Outcome::NotEmpty
     );
 }
+
+#[tokio::test]
+async fn the_daemon_collects_keeps_and_swaps_data_conflicts() {
+    let port = crate::syncthing::test_instance::free_port();
+    let syncthing = crate::syncthing::test_instance::Syncthing::start("127.0.0.1", port).await;
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap()
+        .with_driver(syncthing.driver.clone());
+    let at = syncthing.dir("docs");
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let me = db.node().clone();
+        db.track(
+            Timestamp::now(),
+            ITEM,
+            Item::new("docs", Direction::TwoWay),
+            &me,
+            Replica::new(at.clone()),
+        )
+        .unwrap();
+    }
+    daemon.pull_round().await.unwrap();
+    let root = std::path::Path::new(at.as_str());
+    let write = |path: &str, content: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    };
+    write("sub/a.txt", "won");
+    write("sub/a.sync-conflict-20261121-073910-ABCDEFG.txt", "lost");
+    write("b.txt", "won");
+    write("b.sync-conflict-20261121-073911-ABCDEFG.txt", "lost");
+
+    // Where Syncthing finished an item, its directory is looked in.
+    let finished = crate::syncthing::Finished {
+        item: ITEM,
+        path: "sub/a.txt".into(),
+    };
+    daemon.collect_job(vec![finished]).unwrap().run();
+    async fn found(daemon: &Daemon<Fake>) -> Vec<crate::syncthing::conflicts::DataConflict> {
+        daemon.conflicts().await.remove(&ITEM).unwrap().unwrap()
+    }
+    let listed = found(&daemon).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].path, "sub/a.txt");
+    // A sweep finds the rest.
+    daemon.sweep_conflicts().await;
+    let listed = found(&daemon).await;
+    assert_eq!(listed.len(), 2);
+
+    let kept = daemon
+        .keep_conflict(ITEM, &listed[0].version)
+        .await
+        .unwrap();
+    assert_eq!(kept.path, "b.txt");
+    assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "won");
+    let swapped = daemon
+        .swap_conflict(ITEM, &listed[1].version)
+        .await
+        .unwrap();
+    assert_eq!(swapped.path, "sub/a.txt");
+    assert_eq!(fs::read_to_string(root.join("sub/a.txt")).unwrap(), "lost");
+    assert!(found(&daemon).await.is_empty());
+    assert!(matches!(
+        daemon.keep_conflict(ItemId::from_u128(9), "x").await,
+        Err(ActionError::NoReplica(_))
+    ));
+}

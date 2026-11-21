@@ -3,6 +3,7 @@
 //! The vocabulary follows `GLOSSARY.md`.
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -260,6 +261,9 @@ pub struct Item {
     pub excludes: Vec<ExcludePattern>,
     pub direction: Direction,
     pub paused: bool,
+    /// How many days its Displaced Versions, including Data Conflicts, are
+    /// kept, instead of the Retention Window.
+    pub retention_days: Option<NonZeroU32>,
     /// The latest untrack of this Item that the Node writing these settings
     /// had seen. A newer untrack means the settings were edited without
     /// seeing it.
@@ -274,6 +278,7 @@ impl Item {
             excludes: Vec::new(),
             direction,
             paused: false,
+            retention_days: None,
             seen_untrack: None,
             unknown_fields: UnknownFields::new(),
         }
@@ -303,6 +308,8 @@ struct ItemRecord {
     #[serde(default)]
     paused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_days: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     seen_untrack: Option<Hlc>,
     #[serde(flatten)]
     unknown_fields: UnknownFields,
@@ -330,6 +337,7 @@ impl TryFrom<ItemRecord> for Item {
             excludes: record.excludes,
             direction,
             paused: record.paused,
+            retention_days: record.retention_days,
             seen_untrack: record.seen_untrack,
             unknown_fields: record.unknown_fields,
         })
@@ -348,6 +356,7 @@ impl From<Item> for ItemRecord {
             direction,
             source,
             paused: item.paused,
+            retention_days: item.retention_days,
             seen_untrack: item.seen_untrack,
             unknown_fields: item.unknown_fields,
         }

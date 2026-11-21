@@ -118,12 +118,6 @@ impl ItemEntry {
         Some(self.item.direction.role(node, replica.mirror))
     }
 
-    /// Whether the Replica on `node` is paused, directly or through its Item.
-    pub fn is_paused(&self, node: &NodeId) -> Option<bool> {
-        let replica = self.replicas.get(node)?;
-        Some(self.item.paused || replica.paused)
-    }
-
     fn has_sender(&self) -> bool {
         self.replicas
             .keys()
@@ -158,7 +152,7 @@ impl Config {
                     item_id: *item_id,
                     entry,
                     replica,
-                    role: entry.item.direction.role(node, replica.mirror),
+                    role: entry.role(node)?,
                     paused: entry.item.paused || replica.paused,
                     overlaps,
                 })
@@ -508,15 +502,17 @@ impl ConfigDb {
             .prune(now, window, |key| referenced.contains(key));
     }
 
-    /// Creates an Item with its first Replica.
+    /// Creates an Item with its first Replica, which adopts the files at
+    /// its path: tracking is how existing files become an Item.
     pub fn track(
         &mut self,
         now: Timestamp,
         id: ItemId,
         item: Item,
         node: &NodeId,
-        replica: Replica,
+        mut replica: Replica,
     ) -> Result<(), EditError> {
+        replica.adopt = true;
         if self.store.get(&item_key(id)).is_some() {
             return Err(EditError::ItemExists(id));
         }

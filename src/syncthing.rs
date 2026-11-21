@@ -1,25 +1,33 @@
 //! The Syncthing driver.
 //!
 //! Each Node runs a Syncthing instance that heighliner owns completely
-//! (ADR-0001). The driver reaches it through its REST API on a unix socket,
-//! derives the whole configuration from the Fleet's, and replaces whatever
-//! differs, including manual edits. Syncthing moves the files; heighliner
-//! never does.
+//! (ADR-0001). The driver reaches it through its REST API on a unix socket
+//! and replaces, whenever they differ, its options, devices and folders
+//! with ones derived from the Fleet's configuration, including manual
+//! edits. Folders and devices start from Syncthing's defaults, but every
+//! field the rules below rely on is set explicitly. Syncthing moves the
+//! files; heighliner never does.
 //!
 //! The configuration keeps Syncthing on the tailnet: discovery, relays, NAT
 //! traversal, STUN, crash and usage reporting and upgrades are off, it
-//! listens only on this device's Tailscale addresses, and every other
-//! device is reached at its Tailscale addresses. A device whose addresses
-//! aren't known isn't configured, since Syncthing would fall back to
-//! discovering it.
+//! listens only on this device's Tailscale addresses, and every other Node
+//! is reached at its Tailscale addresses. Only the owner's devices are
+//! configured, and only when their addresses are known, since Syncthing
+//! would otherwise fall back to discovering them.
 //!
 //! Safety rules:
-//! - A Replica is first set up at an empty or missing path, or with its
-//!   `adopt` flag. A path that already holds files is otherwise refused.
+//! - A Replica is first set up at an empty path, or at a missing one whose
+//!   parent exists (so an unmounted disk isn't filled in its place), or
+//!   with its `adopt` flag. A path that already holds files is otherwise
+//!   refused, and so is one with its own `.stignore`. Once set up at a path,
+//!   a Replica isn't refused there again.
 //! - Removing a Replica only removes its folder from Syncthing; the files
 //!   stay (Syncthing removes only its `.stfolder` marker). Heighliner never
-//!   removes the marker of a configured folder, so a missing or unmounted
-//!   path is an error rather than everything having been deleted.
+//!   removes the marker of a configured folder and never recreates a
+//!   configured folder's missing path, so a missing or unmounted path is an
+//!   error rather than everything having been deleted.
+//! - A mirror with local changes isn't made to send: it stays receive-only
+//!   until the changes are dealt with.
 //! - Overlapping Replicas aren't synced.
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
 //!   used.
@@ -34,6 +42,7 @@ use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
+use hyper::header::HeaderValue;
 use hyper::{Method, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -42,17 +51,32 @@ use tokio::net::UnixStream;
 use crate::config::{Config, LocalReplica};
 use crate::http::{self, BoxError};
 use crate::model::{AbsPath, DeviceId, InvalidValue, ItemId, NodeId, Role};
-use crate::tailscale::Tailnet;
+use crate::tailscale::{Device, Tailnet};
 
-/// The port Syncthing listens on unless configured otherwise. Every Node
-/// must use the same one.
-pub const DEFAULT_PORT: u16 = 22000;
+/// The port Syncthing listens on. Every Node uses the same one.
+pub const PORT: u16 = 22000;
 
 /// How long a REST call may take.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long inspecting or preparing a Replica's path may take, for example
+/// on a hung network filesystem.
+const PATH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The file holding an Item's exclude patterns in each of its Replicas.
 const IGNORE_FILE: &str = ".stignore";
+
+/// Syncthing's marker of a folder's root.
+const MARKER: &str = ".stfolder";
+
+/// How many Displaced Versions of one file to keep. The Retention Window
+/// is what clears them out; this only bounds a file replaced very often.
+const KEEP_VERSIONS: u32 = 10_000;
+
+/// The Replicas that have been set up on this Node, with their paths. A
+/// Replica in it isn't refused as not empty at that path again, for
+/// example when its folder comes back after being left out for a while.
+pub type Established = BTreeSet<(ItemId, AbsPath)>;
 
 /// Why a call to Syncthing failed.
 #[derive(Debug)]
@@ -83,13 +107,8 @@ pub enum Error {
         what: &'static str,
     },
     DeviceId(InvalidValue),
-}
-
-impl Error {
-    /// Whether Syncthing may simply not be up yet.
-    pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Connect { .. } | Self::Timeout { .. })
-    }
+    /// The API key can't be sent in a request header.
+    ApiKey,
 }
 
 impl fmt::Display for Error {
@@ -120,6 +139,9 @@ impl fmt::Display for Error {
                 write!(f, "Syncthing's answer to {path} has no {what}")
             }
             Self::DeviceId(error) => write!(f, "Syncthing reported {error}"),
+            Self::ApiKey => {
+                f.write_str("Syncthing's API key holds characters a request can't carry")
+            }
         }
     }
 }
@@ -131,7 +153,9 @@ impl std::error::Error for Error {
             Self::Http { source, .. } => Some(source.as_ref()),
             Self::Decode { source, .. } => Some(source),
             Self::DeviceId(error) => Some(error),
-            Self::Timeout { .. } | Self::Status { .. } | Self::Unexpected { .. } => None,
+            Self::Timeout { .. } | Self::Status { .. } | Self::Unexpected { .. } | Self::ApiKey => {
+                None
+            }
         }
     }
 }
@@ -140,15 +164,17 @@ impl std::error::Error for Error {
 #[derive(Clone, Debug)]
 pub struct Client {
     socket: PathBuf,
-    api_key: String,
+    api_key: HeaderValue,
 }
 
 impl Client {
-    pub fn new(socket: impl Into<PathBuf>, api_key: impl Into<String>) -> Self {
-        Self {
+    pub fn new(socket: impl Into<PathBuf>, api_key: &str) -> Result<Self, Error> {
+        let mut api_key = HeaderValue::from_str(api_key).map_err(|_| Error::ApiKey)?;
+        api_key.set_sensitive(true);
+        Ok(Self {
             socket: socket.into(),
-            api_key: api_key.into(),
-        }
+            api_key,
+        })
     }
 
     /// Sends a request and returns the body of a successful answer.
@@ -172,10 +198,13 @@ impl Client {
             let request = Request::builder()
                 .method(method)
                 .uri(path)
-                .header("X-API-Key", &self.api_key)
+                .header("X-API-Key", self.api_key.clone())
                 .header(hyper::header::CONTENT_TYPE, "application/json")
                 .body(Full::new(body))
-                .expect("the request is well-formed");
+                .map_err(|source| Error::Http {
+                    path: path.to_owned(),
+                    source: source.into(),
+                })?;
             http::send(stream, "localhost", request)
                 .await
                 .map_err(|source| Error::Http {
@@ -199,7 +228,7 @@ impl Client {
         Ok(body)
     }
 
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
+    pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
         let body = self.call(Method::GET, path, None).await?;
         serde_json::from_slice(&body).map_err(|source| Error::Decode {
             path: path.to_owned(),
@@ -218,7 +247,7 @@ impl Client {
         DeviceId::new(id).map_err(Error::DeviceId)
     }
 
-    async fn ignores(&self, folder: ItemId) -> Result<Vec<String>, Error> {
+    pub(crate) async fn ignores(&self, folder: ItemId) -> Result<Vec<String>, Error> {
         let path = format!("/rest/db/ignores?folder={folder}");
         let answer: Value = self.get(&path).await?;
         Ok(match &answer["ignore"] {
@@ -236,6 +265,18 @@ impl Client {
             .await?;
         Ok(())
     }
+
+    /// How many files a receive-only folder has changed locally.
+    async fn local_changes(&self, folder: &str) -> Result<u64, Error> {
+        let path = format!("/rest/db/status?folder={folder}");
+        let status: Value = self.get(&path).await?;
+        status["receiveOnlyTotalItems"]
+            .as_u64()
+            .ok_or(Error::Unexpected {
+                path,
+                what: "receiveOnlyTotalItems",
+            })
+    }
 }
 
 /// What happened to one of this Node's Replicas in a reconcile.
@@ -243,25 +284,49 @@ impl Client {
 pub enum Outcome {
     /// Its folder is configured as it should be.
     Configured,
+    /// It was a mirror and has local changes, so its folder stays
+    /// receive-only instead of starting to send them.
+    LocalChanges,
     /// It overlaps another Replica on this Node, so it isn't synced.
     Overlaps,
     /// Its path already holds files, and the Replica doesn't adopt them.
     NotEmpty,
+    /// Its path has its own `.stignore`, which the Item's excludes would
+    /// replace.
+    OwnIgnoreFile,
+    /// Its path, or its parent for a new Replica, or the marker of a
+    /// configured one, is missing.
+    Missing,
     /// Its path can't be used.
     PathError(String),
+    /// Syncthing failed to apply part of it.
+    Failed(String),
+}
+
+impl Outcome {
+    /// Whether the Replica's folder is configured in Syncthing.
+    pub fn is_configured(&self) -> bool {
+        matches!(self, Self::Configured | Self::LocalChanges)
+    }
 }
 
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Configured => f.write_str("configured"),
-            Self::Overlaps => {
-                f.write_str("overlaps another replica on this Node, so it isn't synced")
-            }
-            Self::NotEmpty => f.write_str(
-                "its path already holds files; add the replica again with adopt to merge them",
+            Self::Configured => f.write_str("is configured"),
+            Self::LocalChanges => f.write_str(
+                "has changes made locally while it was a mirror, so it stays receive-only until they are dealt with",
             ),
-            Self::PathError(error) => write!(f, "its path can't be used: {error}"),
+            Self::Overlaps => f.write_str("overlaps another replica on this Node, so it isn't synced"),
+            Self::NotEmpty => f.write_str(
+                "can't start: its path already holds files; add the replica again with adopt to merge them",
+            ),
+            Self::OwnIgnoreFile => f.write_str(
+                "can't start: its path has its own .stignore; move it aside, or copy its patterns into the item's excludes",
+            ),
+            Self::Missing => f.write_str("can't be synced: its path is missing; is its disk mounted?"),
+            Self::PathError(error) => write!(f, "can't be synced: {error}"),
+            Self::Failed(error) => write!(f, "couldn't be configured: {error}"),
         }
     }
 }
@@ -284,7 +349,12 @@ pub struct Driver {
 }
 
 impl Driver {
-    pub fn new(client: Client, port: u16, retention: Duration) -> Self {
+    pub fn new(client: Client, retention: Duration) -> Self {
+        Self::with_port(client, PORT, retention)
+    }
+
+    /// Uses another port than [`PORT`], for tests.
+    pub(crate) fn with_port(client: Client, port: u16, retention: Duration) -> Self {
         Self {
             client,
             port,
@@ -297,73 +367,132 @@ impl Driver {
     }
 
     /// Makes Syncthing's configuration match `config` for this device, as
-    /// `tailnet` describes it.
-    pub async fn reconcile(&self, config: &Config, tailnet: &Tailnet) -> Result<Report, Error> {
+    /// `tailnet` describes it. `device_id` is Syncthing's, and
+    /// `established` the Replicas already set up here.
+    pub async fn reconcile(
+        &self,
+        config: &Config,
+        tailnet: &Tailnet,
+        device_id: &DeviceId,
+        established: &Established,
+    ) -> Result<Report, Error> {
         let me = &tailnet.me().id;
-        let my_device = self.client.device_id().await?;
         let current: Value = self.client.get("/rest/config").await?;
-        let folder_template: Value = self.client.get("/rest/config/defaults/folder").await?;
-        let device_template: Value = self.client.get("/rest/config/defaults/device").await?;
-
-        let existing: BTreeMap<String, String> = current["folders"]
+        let folder_template = &current["defaults"]["folder"];
+        let device_template = &current["defaults"]["device"];
+        let existing: BTreeMap<&str, &Value> = current["folders"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|folder| {
+            .filter_map(|folder| Some((folder["id"].as_str()?, folder)))
+            .collect();
+        let peers: BTreeMap<&NodeId, (&DeviceId, &Device)> = tailnet
+            .owned_devices()
+            .filter(|device| !device.ips.is_empty())
+            .filter_map(|device| {
                 Some((
-                    folder["id"].as_str()?.to_owned(),
-                    folder["path"].as_str()?.to_owned(),
+                    &device.id,
+                    (&config.nodes.get(&device.id)?.device_id, device),
                 ))
             })
             .collect();
 
         let mut report = Report::default();
         let mut folders = Vec::new();
-        let mut peers: BTreeSet<NodeId> = BTreeSet::new();
+        let mut shared_with: BTreeSet<&NodeId> = BTreeSet::new();
+        let mut moved = BTreeSet::new();
         for local in config.replicas_on(me) {
+            let id = local.item_id.to_string();
+            let path = local.replica.path();
             if local.overlaps {
                 report.replicas.insert(local.item_id, Outcome::Overlaps);
                 continue;
             }
-            let path = local.replica.path();
-            let known =
-                existing.get(&local.item_id.to_string()).map(String::as_str) == Some(path.as_str());
-            if !known && let Err(outcome) = prepare(path, local.replica.adopt, &excludes(&local)) {
-                report.replicas.insert(local.item_id, outcome);
-                continue;
+            let was = existing.get(id.as_str());
+            let in_place = was.is_some_and(|folder| folder["path"] == path.as_str());
+            if !in_place {
+                let ready = if established.contains(&(local.item_id, path.clone())) {
+                    in_blocking(check_exists, path.clone()).await
+                } else {
+                    let (adopt, excludes) = (local.replica.adopt, excludes(&local));
+                    in_blocking(move |path| prepare(&path, adopt, &excludes), path.clone()).await
+                };
+                if let Err(outcome) = ready {
+                    report.replicas.insert(local.item_id, outcome);
+                    continue;
+                }
+                if was.is_some() {
+                    moved.insert(id.clone());
+                }
             }
-            let devices: Vec<NodeId> = local
+            let mut outcome = Outcome::Configured;
+            let mut folder_type = folder_type(local.role);
+            if in_place
+                && was.is_some_and(|folder| folder["type"] == "receiveonly")
+                && folder_type != "receiveonly"
+            {
+                match self.client.local_changes(&id).await {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        folder_type = "receiveonly";
+                        outcome = Outcome::LocalChanges;
+                    }
+                    Err(error) => {
+                        folder_type = "receiveonly";
+                        outcome = Outcome::Failed(error.to_string());
+                    }
+                }
+            }
+            let devices: Vec<&NodeId> = local
                 .entry
                 .replicas
                 .keys()
-                .filter(|node| *node != me && self.reachable(config, tailnet, node).is_some())
-                .cloned()
+                .filter(|node| *node != me && peers.contains_key(node))
                 .collect();
-            peers.extend(devices.iter().cloned());
-            folders.push(self.folder(&folder_template, &local, &my_device, config, &devices));
-            report.replicas.insert(local.item_id, Outcome::Configured);
+            shared_with.extend(devices.iter().copied());
+            folders.push(self.folder(
+                folder_template,
+                &local,
+                folder_type,
+                device_id,
+                &peers,
+                &devices,
+            ));
+            report.replicas.insert(local.item_id, outcome);
         }
 
-        let mut this_device = self_device(&current, &device_template, &my_device);
+        let mut this_device = current["devices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|device| device["deviceID"] == device_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| device_template.clone());
+        this_device["deviceID"] = json!(device_id.as_str());
         this_device["addresses"] = Value::Array(self.addresses(&tailnet.me().ips));
         let mut devices = vec![this_device];
-        for node in &peers {
-            let (device_id, ips) = self
-                .reachable(config, tailnet, node)
-                .expect("filtered above");
-            let name = tailnet
-                .others()
-                .iter()
-                .find(|device| &device.id == node)
-                .map_or_else(|| node.to_string(), |device| device.name.clone());
-            devices.push(self.device(&device_template, device_id, &name, &ips));
+        for node in shared_with {
+            let (peer_id, peer) = peers[node];
+            devices.push(self.device(device_template, peer_id, peer));
         }
 
         let mut desired = current.clone();
         harden(&mut desired["options"], &self.addresses(&tailnet.me().ips));
         desired["devices"] = Value::Array(devices);
         desired["folders"] = Value::Array(folders);
-        if normalized(&desired) != normalized(&current) {
+        if !moved.is_empty() {
+            // Syncthing keeps a folder's state across a change of path, so
+            // drop the folder first to start afresh at the new one.
+            let mut without = current.clone();
+            if let Value::Array(folders) = &mut without["folders"] {
+                folders
+                    .retain(|folder| !folder["id"].as_str().is_some_and(|id| moved.contains(id)));
+            }
+            self.client
+                .call(Method::PUT, "/rest/config", Some(&without))
+                .await?;
+        }
+        if !moved.is_empty() || normalized(&desired) != normalized(&current) {
             self.client
                 .call(Method::PUT, "/rest/config", Some(&desired))
                 .await?;
@@ -371,28 +500,45 @@ impl Driver {
         }
 
         for local in config.replicas_on(me) {
-            if report.replicas.get(&local.item_id) != Some(&Outcome::Configured) {
+            if !report.replicas[&local.item_id].is_configured() {
                 continue;
             }
-            let wanted = excludes(&local);
-            if self.client.ignores(local.item_id).await? != wanted {
-                self.client.set_ignores(local.item_id, &wanted).await?;
-                report.changed = true;
+            match self.sync_ignores(&local).await {
+                Ok(false) => {}
+                Ok(true) => report.changed = true,
+                Err(outcome) => {
+                    report.replicas.insert(local.item_id, outcome);
+                }
             }
         }
         Ok(report)
     }
 
-    /// The device ID and Tailscale addresses of `node`, if both are known.
-    fn reachable<'a>(
-        &self,
-        config: &'a Config,
-        tailnet: &Tailnet,
-        node: &NodeId,
-    ) -> Option<(&'a DeviceId, Vec<IpAddr>)> {
-        let info = config.nodes.get(node)?;
-        let device = tailnet.others().iter().find(|device| &device.id == node)?;
-        (!device.ips.is_empty()).then(|| (&info.device_id, device.ips.clone()))
+    /// Sets a configured Replica's excludes, unless its path or marker is
+    /// missing, since Syncthing would recreate the path. Returns whether
+    /// they changed.
+    async fn sync_ignores(&self, local: &LocalReplica<'_>) -> Result<bool, Outcome> {
+        let wanted = excludes(local);
+        let failed = |error: Error| Outcome::Failed(error.to_string());
+        if self.client.ignores(local.item_id).await.map_err(failed)? == wanted {
+            return Ok(false);
+        }
+        in_blocking(
+            |path| {
+                Path::new(path.as_str())
+                    .join(MARKER)
+                    .exists()
+                    .then_some(())
+                    .ok_or(Outcome::Missing)
+            },
+            local.replica.path().clone(),
+        )
+        .await?;
+        self.client
+            .set_ignores(local.item_id, &wanted)
+            .await
+            .map_err(failed)?;
+        Ok(true)
     }
 
     fn addresses(&self, ips: &[IpAddr]) -> Vec<Value> {
@@ -407,13 +553,15 @@ impl Driver {
             .collect()
     }
 
-    fn device(&self, template: &Value, id: &DeviceId, name: &str, ips: &[IpAddr]) -> Value {
+    fn device(&self, template: &Value, id: &DeviceId, peer: &Device) -> Value {
         let mut device = template.clone();
         device["deviceID"] = json!(id.as_str());
-        device["name"] = json!(name);
-        device["addresses"] = Value::Array(self.addresses(ips));
+        device["name"] = json!(peer.name);
+        device["addresses"] = Value::Array(self.addresses(&peer.ips));
+        device["allowedNetworks"] = json!([]);
         device["introducer"] = json!(false);
         device["autoAcceptFolders"] = json!(false);
+        device["untrusted"] = json!(false);
         device["paused"] = json!(false);
         device
     }
@@ -422,38 +570,45 @@ impl Driver {
         &self,
         template: &Value,
         local: &LocalReplica<'_>,
-        my_device: &DeviceId,
-        config: &Config,
-        peers: &[NodeId],
+        folder_type: &str,
+        device_id: &DeviceId,
+        peers: &BTreeMap<&NodeId, (&DeviceId, &Device)>,
+        shared_with: &[&NodeId],
     ) -> Value {
         // Complete entries, as Syncthing stores them, so that an unchanged
         // folder compares equal.
-        let shared = |id: &DeviceId| json!({ "deviceID": id.as_str(), "introducedBy": "", "encryptionPassword": "" });
-        let mut devices = vec![shared(my_device)];
-        devices.extend(
-            peers
-                .iter()
-                .map(|node| shared(&config.nodes[node].device_id)),
-        );
+        let entry = |id: &DeviceId| json!({ "deviceID": id.as_str(), "introducedBy": "", "encryptionPassword": "" });
+        let mut devices = vec![entry(device_id)];
+        devices.extend(shared_with.iter().map(|node| entry(peers[node].0)));
         let mut folder = template.clone();
         folder["id"] = json!(local.item_id.to_string());
         folder["label"] = json!(local.entry.item.name);
         folder["path"] = json!(local.replica.path().as_str());
-        folder["type"] = json!(match local.role {
-            Role::Source => "sendonly",
-            Role::Mirror => "receiveonly",
-            Role::Peer => "sendreceive",
-        });
+        folder["filesystemType"] = json!("basic");
+        folder["type"] = json!(folder_type);
         folder["devices"] = Value::Array(devices);
         folder["paused"] = json!(local.paused);
+        folder["markerName"] = json!(MARKER);
+        folder["ignoreDelete"] = json!(false);
         folder["versioning"] = json!({
-            "type": "trashcan",
-            "params": { "cleanoutDays": self.retention_days.to_string() },
+            "type": "simple",
+            "params": {
+                "keep": KEEP_VERSIONS.to_string(),
+                "cleanoutDays": self.retention_days.to_string(),
+            },
             "cleanupIntervalS": 3600,
             "fsPath": "",
             "fsType": "basic",
         });
         folder
+    }
+}
+
+fn folder_type(role: Role) -> &'static str {
+    match role {
+        Role::Source => "sendonly",
+        Role::Mirror => "receiveonly",
+        Role::Peer => "sendreceive",
     }
 }
 
@@ -468,38 +623,67 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Gets a new Replica's path ready: creates it if it's missing, refuses it
-/// if it holds files the Replica doesn't adopt, and writes the exclude
-/// patterns before Syncthing first scans it.
+/// Runs `check` on `path` away from the async runtime, so that a hung
+/// filesystem only times out.
+async fn in_blocking(
+    check: impl FnOnce(AbsPath) -> Result<(), Outcome> + Send + 'static,
+    path: AbsPath,
+) -> Result<(), Outcome> {
+    let task = tokio::task::spawn_blocking(move || check(path));
+    match tokio::time::timeout(PATH_TIMEOUT, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(Outcome::PathError(error.to_string())),
+        Err(_) => Err(Outcome::PathError(format!(
+            "its path didn't answer within {}s",
+            PATH_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Checks that an established Replica's path is still there.
+fn check_exists(path: AbsPath) -> Result<(), Outcome> {
+    match fs::metadata(path.as_str()) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Outcome::PathError("its path isn't a directory".into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(Outcome::Missing),
+        Err(error) => Err(Outcome::PathError(error.to_string())),
+    }
+}
+
+/// Gets a new Replica's path ready: creates it if it's missing and its
+/// parent exists, refuses it if it holds files the Replica doesn't adopt
+/// or its own `.stignore`, and writes the exclude patterns before Syncthing
+/// first scans it. Running it again on a path it prepared succeeds.
 fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outcome> {
     let path = Path::new(path.as_str());
     let error = |error: io::Error| Outcome::PathError(error.to_string());
+    let lines: String = excludes.iter().map(|line| format!("{line}\n")).collect();
     match fs::read_dir(path) {
-        Ok(mut entries) => {
-            if !adopt && entries.next().is_some() {
-                return Err(Outcome::NotEmpty);
+        Ok(entries) => {
+            for entry in entries {
+                let name = entry.map_err(error)?.file_name();
+                if name == MARKER || name == IGNORE_FILE {
+                    continue;
+                }
+                if !adopt {
+                    return Err(Outcome::NotEmpty);
+                }
+            }
+            match fs::read_to_string(path.join(IGNORE_FILE)) {
+                Ok(existing) if existing != lines => return Err(Outcome::OwnIgnoreFile),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(error(e)),
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path).map_err(error)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Outcome::Missing),
+            Err(e) => return Err(error(e)),
+        },
         Err(e) => return Err(error(e)),
     }
-    let lines: String = excludes.iter().map(|line| format!("{line}\n")).collect();
     fs::write(path.join(IGNORE_FILE), lines).map_err(error)
-}
-
-/// This device's entry, kept as Syncthing has it, or made from `template`.
-fn self_device(current: &Value, template: &Value, id: &DeviceId) -> Value {
-    current["devices"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|device| device["deviceID"] == id.as_str())
-        .cloned()
-        .unwrap_or_else(|| {
-            let mut device = template.clone();
-            device["deviceID"] = json!(id.as_str());
-            device
-        })
 }
 
 /// Sets the options that keep Syncthing on the tailnet.

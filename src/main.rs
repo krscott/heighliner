@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use heighliner::daemon::{self, DEFAULT_PORT};
-use heighliner::syncthing;
 use heighliner::tailscale::DEFAULT_SOCKET;
 
 /// Tracks directories across a Tailscale fleet and keeps them replicated
@@ -41,9 +40,6 @@ enum Command {
         /// A file holding Syncthing's API key.
         #[arg(long, requires = "syncthing_socket")]
         syncthing_api_key_file: Option<PathBuf>,
-        /// The port Syncthing listens on. Every Node must use the same port.
-        #[arg(long, default_value_t = syncthing::DEFAULT_PORT)]
-        syncthing_port: u16,
     },
 }
 
@@ -69,7 +65,6 @@ fn main() -> ExitCode {
             pull_every,
             syncthing_socket,
             syncthing_api_key_file,
-            syncthing_port,
         } => run_daemon(daemon::Options {
             state_dir,
             port,
@@ -79,7 +74,6 @@ fn main() -> ExitCode {
                 |(socket, api_key_file)| daemon::SyncthingOptions {
                     socket,
                     api_key_file,
-                    port: syncthing_port,
                 },
             ),
         }),

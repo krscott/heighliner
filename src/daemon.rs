@@ -2,7 +2,7 @@
 //! pulls the other Nodes' records on a timer, and keeps its copy of all
 //! records in a state file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -22,16 +22,17 @@ use crate::auth::{self, Authorizer};
 use crate::config::ConfigDb;
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
-use crate::model::NodeId;
+use crate::model::{ItemId, NodeId};
 use crate::protocol::{self, Hello};
 use crate::record::Store;
-use crate::syncthing::{self, Driver, Outcome};
+use crate::syncthing::{self, Driver, Established, Outcome};
 use crate::tailscale::{self, Client, LocalApi, Owner, Tailnet};
 
 /// The port heighliner listens on unless configured otherwise.
 pub const DEFAULT_PORT: u16 = 7130;
 
-/// How long superseded record versions and tombstones are kept.
+/// How long superseded record versions, tombstones and Displaced Versions
+/// are kept.
 pub const RETENTION_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long each of a device's addresses may take to answer hello. Devices
@@ -56,6 +57,10 @@ struct SavedState {
     format: u32,
     /// The user whose Fleet the records belong to.
     owner: Owner,
+    /// The Replicas set up in this Node's Syncthing, which aren't
+    /// replicated.
+    #[serde(default)]
+    established: Established,
     /// The clock's latest reading, so it resumes after it on restart. Its
     /// node is the Node the state belongs to.
     clock: Hlc,
@@ -97,6 +102,11 @@ pub enum Error {
     /// Another daemon uses the state directory.
     StateLocked {
         path: PathBuf,
+    },
+    /// The file with Syncthing's API key can't be read or used.
+    ApiKey {
+        path: PathBuf,
+        reason: String,
     },
     Listen {
         addr: SocketAddr,
@@ -158,6 +168,11 @@ impl fmt::Display for Error {
             Self::StateLocked { path } => {
                 write!(f, "another heighliner daemon is using {}", path.display())
             }
+            Self::ApiKey { path, reason } => write!(
+                f,
+                "can't use Syncthing's API key from {}: {reason}",
+                path.display()
+            ),
             Self::Listen { addr, source } => write!(f, "can't listen on {addr}: {source}"),
             Self::NoAddress => {
                 f.write_str("can't listen on any of this device's Tailscale addresses")
@@ -185,6 +200,7 @@ impl std::error::Error for Error {
             | Self::StateNode { .. }
             | Self::StateOwner { .. }
             | Self::StateLocked { .. }
+            | Self::ApiKey { .. }
             | Self::NoAddress
             | Self::AddressesChanged
             | Self::IdentityChanged => None,
@@ -226,6 +242,10 @@ pub struct Daemon<T> {
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
     driver: Option<Driver>,
+    /// The Replicas set up in this Node's Syncthing; see [`Established`].
+    established: Mutex<Established>,
+    /// The last reconcile's outcome for each Replica, to log changes only.
+    outcomes: Mutex<BTreeMap<ItemId, Outcome>>,
 }
 
 impl<T: LocalApi + Clone> Daemon<T> {
@@ -250,10 +270,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
             Err(fs::TryLockError::Error(source)) => return Err(state_error(&lock_file)(source)),
         }
         let state_file = state_dir.join(STATE_FILE);
-        let db = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
+        let (db, established) = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
         // Count the state as it was opened as saved, so nothing is written
         // until it changes; a daemon that changed nothing writes no file.
-        let saved = Mutex::new(snapshot(&db, tailnet.owner()));
+        let saved = Mutex::new(snapshot(&db, tailnet.owner(), &established));
         Ok(Self {
             api,
             port,
@@ -263,6 +283,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
             db: Arc::new(Mutex::new(db)),
             saved,
             driver: None,
+            established: Mutex::new(established),
+            outcomes: Mutex::default(),
         })
     }
 
@@ -439,19 +461,32 @@ impl<T: LocalApi + Clone> Daemon<T> {
             .db
             .lock()
             .unwrap()
-            .set_device_id(Timestamp::now(), device_id)
+            .set_device_id(Timestamp::now(), device_id.clone())
         {
             tracing::warn!(%error, "can't publish this Node's Syncthing device ID");
         }
         let config = self.db.lock().unwrap().config();
-        match driver.reconcile(&config, tailnet).await {
+        let established = self.established.lock().unwrap().clone();
+        match driver
+            .reconcile(&config, tailnet, &device_id, &established)
+            .await
+        {
             Ok(report) => {
+                let me = &tailnet.me().id;
+                let mut outcomes = self.outcomes.lock().unwrap();
+                let mut established = self.established.lock().unwrap();
                 for (item, outcome) in &report.replicas {
-                    if *outcome != Outcome::Configured {
+                    let replica = &config.items[item].replicas[me];
+                    if outcome.is_configured() {
+                        established.insert((*item, replica.path().clone()));
+                    }
+                    if *outcome != Outcome::Configured && outcomes.get(item) != Some(outcome) {
                         let name = &config.items[item].item.name;
-                        tracing::warn!(%item, %name, "this Node's replica {outcome}");
+                        let path = replica.path();
+                        tracing::warn!(%item, %name, %path, "this Node's replica {outcome}");
                     }
                 }
+                *outcomes = report.replicas.clone();
                 Some(report)
             }
             Err(error) => {
@@ -464,7 +499,11 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Writes the records and clock to the state file, if they changed.
     pub fn save(&self) -> Result<(), Error> {
         let mut saved = self.saved.lock().unwrap();
-        let bytes = snapshot(&self.db.lock().unwrap(), self.tailnet.owner());
+        let bytes = snapshot(
+            &self.db.lock().unwrap(),
+            self.tailnet.owner(),
+            &self.established.lock().unwrap(),
+        );
         if *saved == bytes {
             return Ok(());
         }
@@ -478,10 +517,11 @@ impl<T: LocalApi + Clone> Daemon<T> {
 }
 
 /// The state file's contents for `db`, a copy of `owner`'s Fleet.
-fn snapshot(db: &ConfigDb, owner: Owner) -> Vec<u8> {
+fn snapshot(db: &ConfigDb, owner: Owner, established: &Established) -> Vec<u8> {
     let state = SavedState {
         format: STATE_FORMAT,
         owner,
+        established: established.clone(),
         clock: db.last_reading(),
         records: db.store().clone(),
     };
@@ -490,11 +530,11 @@ fn snapshot(db: &ConfigDb, owner: Owner) -> Vec<u8> {
 
 /// Reads the state file for `node` of `owner`'s Fleet, or starts empty if
 /// there is none.
-fn load(path: &Path, node: NodeId, owner: Owner) -> Result<ConfigDb, Error> {
+fn load(path: &Path, node: NodeId, owner: Owner) -> Result<(ConfigDb, Established), Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ConfigDb::new(node, Store::default()));
+            return Ok((ConfigDb::new(node, Store::default()), Established::new()));
         }
         Err(source) => {
             return Err(Error::State {
@@ -527,7 +567,10 @@ fn load(path: &Path, node: NodeId, owner: Owner) -> Result<ConfigDb, Error> {
             current: node,
         });
     }
-    Ok(ConfigDb::resume(node, saved.records, &saved.clock))
+    Ok((
+        ConfigDb::resume(node, saved.records, &saved.clock),
+        saved.established,
+    ))
 }
 
 /// Replaces `path` with `bytes`, readable only by this user, so that a
@@ -573,8 +616,6 @@ pub struct SyncthingOptions {
     pub socket: PathBuf,
     /// A file holding Syncthing's API key.
     pub api_key_file: PathBuf,
-    /// The port Syncthing listens on, the same on every Node.
-    pub port: u16,
 }
 
 /// Runs the daemon. It waits for tailscaled to be ready, then serves and
@@ -585,13 +626,15 @@ pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
     let mut daemon = open_when_ready(api, &options.state_dir, options.port).await?;
     if let Some(syncthing) = &options.syncthing {
-        let api_key =
-            fs::read_to_string(&syncthing.api_key_file).map_err(|source| Error::State {
-                path: syncthing.api_key_file.clone(),
-                source,
-            })?;
-        let client = syncthing::Client::new(&syncthing.socket, api_key.trim());
-        daemon = daemon.with_driver(Driver::new(client, syncthing.port, RETENTION_WINDOW));
+        let path = &syncthing.api_key_file;
+        let api_key_error = |reason: String| Error::ApiKey {
+            path: path.clone(),
+            reason,
+        };
+        let api_key = fs::read_to_string(path).map_err(|error| api_key_error(error.to_string()))?;
+        let client = syncthing::Client::new(&syncthing.socket, api_key.trim())
+            .map_err(|error| api_key_error(error.to_string()))?;
+        daemon = daemon.with_driver(Driver::new(client, RETENTION_WINDOW));
     }
     let stopped = serve(&mut daemon, options.pull_every).await;
     // Whatever stopped the daemon, keep what it merged since the last save.

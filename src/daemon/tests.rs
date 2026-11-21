@@ -24,6 +24,19 @@ fn tailnet(me: &str, others: &[&str]) -> Fake {
     fake
 }
 
+/// Opens a state directory a dropped daemon used. A test that starts a
+/// process at the same moment forks this one, and the child holds the
+/// directory's lock until it execs, so this retries briefly.
+async fn reopen(api: Fake, dir: &std::path::Path) -> Result<Daemon<Fake>, Error> {
+    for _ in 0..50 {
+        match Daemon::open(api.clone(), dir, 1).await {
+            Err(Error::StateLocked { .. }) => tokio::time::sleep(Duration::from_millis(20)).await,
+            opened => return opened,
+        }
+    }
+    Daemon::open(api, dir, 1).await
+}
+
 fn track(daemon: &Daemon<Fake>, name: &str) {
     let mut db = daemon.db().lock().unwrap();
     let node = db.node().clone();
@@ -105,7 +118,7 @@ async fn state_survives_a_restart() {
     daemon.save().unwrap();
     drop(daemon);
 
-    let reopened = Daemon::open(fake, dir.path(), 1).await.unwrap();
+    let reopened = reopen(fake, dir.path()).await.unwrap();
     let db = reopened.db().lock().unwrap();
     assert!(db.config().items.contains_key(&ITEM));
     assert_eq!(db.last_reading(), reading);
@@ -140,11 +153,11 @@ async fn state_from_another_node_is_refused() {
     before.save().unwrap();
     drop(before);
 
-    let error = Daemon::open(tailnet("127.0.0.9", &[]), dir.path(), 1)
+    let error = reopen(tailnet("127.0.0.9", &[]), dir.path())
         .await
         .err()
         .unwrap();
-    assert!(matches!(error, Error::StateNode { .. }));
+    assert!(matches!(error, Error::StateNode { .. }), "{error:?}");
     assert!(error.to_string().contains("Move the file aside"), "{error}");
 }
 
@@ -215,7 +228,7 @@ async fn state_from_another_owner_is_refused() {
     drop(before);
 
     let other = Fake::new(device("127.0.0.1", UserId::new(2), "127.0.0.1"));
-    let error = Daemon::open(other, dir.path(), 1).await.err().unwrap();
+    let error = reopen(other, dir.path()).await.err().unwrap();
     assert!(matches!(error, Error::StateOwner { .. }));
 }
 

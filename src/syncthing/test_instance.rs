@@ -8,9 +8,13 @@ use std::time::Duration;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use super::{Client, Driver};
+use std::sync::Mutex;
+
+use super::{Client, Driver, Established, Report};
+use crate::config::Config;
 use crate::daemon::RETENTION_WINDOW;
 use crate::model::{AbsPath, ItemId};
+use crate::tailscale::Tailnet;
 
 const API_KEY: &str = "test-api-key";
 
@@ -19,6 +23,8 @@ pub(crate) struct Syncthing {
     pub(crate) home: TempDir,
     child: Child,
     pub(crate) driver: Driver,
+    /// What the daemon would keep for it; see [`Established`].
+    established: Mutex<Established>,
 }
 
 impl Syncthing {
@@ -70,17 +76,24 @@ impl Syncthing {
             .arg(format!("--gui-apikey={API_KEY}"))
             .arg(format!("--log-file={}", home.path().join("log").display()))
             .args(["--no-browser", "--no-upgrade"])
+            // No monitor process, so that killing the child stops Syncthing.
+            .env("STNORESTART", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let driver = Driver::new(Client::new(&socket, API_KEY), port, RETENTION_WINDOW);
+        let driver = Driver::with_port(
+            Client::new(&socket, API_KEY).unwrap(),
+            port,
+            RETENTION_WINDOW,
+        );
         for _ in 0..100 {
             if driver.client().device_id().await.is_ok() {
                 return Self {
                     home,
                     child,
                     driver,
+                    established: Mutex::default(),
                 };
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -89,6 +102,26 @@ impl Syncthing {
         let _ = child.kill();
         let _ = child.wait();
         panic!("Syncthing didn't start");
+    }
+
+    /// Reconciles as the daemon does, keeping track of established
+    /// Replicas.
+    pub(crate) async fn reconcile(&self, config: &Config, tailnet: &Tailnet) -> Report {
+        let device_id = self.driver.client().device_id().await.unwrap();
+        let established = self.established.lock().unwrap().clone();
+        let report = self
+            .driver
+            .reconcile(config, tailnet, &device_id, &established)
+            .await
+            .unwrap();
+        let mut established = self.established.lock().unwrap();
+        for (item, outcome) in &report.replicas {
+            if outcome.is_configured() {
+                let path = config.items[item].replicas[&tailnet.me().id].path().clone();
+                established.insert((*item, path));
+            }
+        }
+        report
     }
 
     pub(crate) async fn config(&self) -> Value {

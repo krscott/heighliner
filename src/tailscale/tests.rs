@@ -52,6 +52,8 @@ fn status_json(backend_state: &str) -> Value {
                 "TailscaleIPs": ["100.64.0.3"],
                 "Online": true,
             },
+            // Known to WireGuard but not yet to the network map.
+            "nodekey:partial": {"ID": "", "UserID": 0, "TailscaleIPs": null},
             "nodekey:friend": {
                 "ID": "nFRIEND",
                 "DNSName": "friend.example.ts.net.",

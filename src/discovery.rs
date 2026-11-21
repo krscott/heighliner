@@ -8,6 +8,13 @@ use tokio::task::JoinSet;
 
 use crate::tailscale::{self, Device, Tailnet};
 
+/// A device that accepted a connection, and the address it accepted it on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub device: Device,
+    pub addr: SocketAddr,
+}
+
 /// Finds the devices owned by this device's owner that accept TCP
 /// connections on `port`, the port heighliner listens on. Each device's
 /// addresses are tried in turn, each for at most `timeout`; devices are
@@ -16,21 +23,21 @@ pub async fn discover(
     tailnet: &Tailnet,
     port: u16,
     timeout: Duration,
-) -> Result<Vec<Device>, tailscale::Error> {
+) -> Result<Vec<Found>, tailscale::Error> {
     let mut probes = JoinSet::new();
     for device in tailnet.owned_devices()?.cloned() {
         probes.spawn(async move {
             for ip in &device.ips {
-                let connect = TcpStream::connect(SocketAddr::new(*ip, port));
-                if let Ok(Ok(_)) = tokio::time::timeout(timeout, connect).await {
-                    return Some(device);
+                let addr = SocketAddr::new(*ip, port);
+                if let Ok(Ok(_)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+                    return Some(Found { device, addr });
                 }
             }
             None
         });
     }
-    let mut found: Vec<Device> = probes.join_all().await.into_iter().flatten().collect();
-    found.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut found: Vec<Found> = probes.join_all().await.into_iter().flatten().collect();
+    found.sort_by(|a, b| a.device.id.cmp(&b.device.id));
     Ok(found)
 }
 
@@ -75,8 +82,12 @@ mod tests {
         let found = discover(&tailnet, port, Duration::from_secs(1))
             .await
             .unwrap();
-        let names: Vec<_> = found.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["listening"]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].device.name, "listening");
+        assert_eq!(
+            found[0].addr,
+            SocketAddr::new("127.0.0.1".parse().unwrap(), port)
+        );
     }
 
     #[tokio::test]

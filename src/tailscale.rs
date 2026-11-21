@@ -327,8 +327,9 @@ struct BackendState {
 struct StatusResponse {
     #[serde(rename = "Self")]
     me: PeerStatus,
-    /// Keyed by node key.
-    peer: Option<BTreeMap<String, PeerStatus>>,
+    /// Keyed by node key. Each is decoded on its own, since tailscaled can
+    /// list a device it knows only partly, without a stable ID.
+    peer: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +367,7 @@ impl StatusResponse {
                 .peer
                 .unwrap_or_default()
                 .into_values()
+                .filter_map(|peer| serde_json::from_value::<PeerStatus>(peer).ok())
                 .map(PeerStatus::into_device)
                 .collect(),
         }

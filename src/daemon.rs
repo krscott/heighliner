@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{self, SignalKind};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
@@ -110,6 +111,8 @@ pub enum Error {
     /// started, so its records belong to another identity.
     IdentityChanged,
     Serve(tokio::task::JoinError),
+    /// The handlers for stop signals couldn't be set up.
+    Signals(io::Error),
 }
 
 impl Error {
@@ -163,6 +166,7 @@ impl fmt::Display for Error {
                 "this device's Tailscale node ID or owner changed since heighliner started, so its records belong to the old identity",
             ),
             Self::Serve(error) => write!(f, "a server failed: {error}"),
+            Self::Signals(error) => write!(f, "can't handle stop signals: {error}"),
         }
     }
 }
@@ -171,7 +175,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Tailscale(error) => Some(error),
-            Self::State { source, .. } | Self::Listen { source, .. } => Some(source),
+            Self::State { source, .. } | Self::Listen { source, .. } | Self::Signals(source) => {
+                Some(source)
+            }
             Self::StateDecode { source, .. } => Some(source),
             Self::Serve(error) => Some(error),
             Self::StateFormat { .. }
@@ -518,8 +524,12 @@ pub async fn run(options: Options) -> Result<(), Error> {
     stopped
 }
 
-/// Serves and pulls until something stops the daemon.
+/// Serves and pulls until something stops the daemon, such as SIGTERM or
+/// SIGINT, which stop it normally.
 async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), Error> {
+    let signal = |kind| unix::signal(kind).map_err(Error::Signals);
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
     let mut servers = daemon.relisten().await?;
     let mut pulls = tokio::time::interval(pull_every);
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -538,6 +548,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Ok(_) => {}
             },
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
+            _ = terminate.recv() => return Ok(()),
+            _ = interrupt.recv() => return Ok(()),
         }
     }
 }

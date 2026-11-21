@@ -19,8 +19,10 @@
 //! - A Replica is first set up at an empty path, or at a missing one whose
 //!   parent exists (so an unmounted disk isn't filled in its place), or
 //!   with its `adopt` flag. A path that already holds files is otherwise
-//!   refused, and so is one with its own `.stignore`. A new folder waits
-//!   until any other folder at an overlapping path has been removed.
+//!   refused, and so is one with its own `.stignore`. A new or moved folder
+//!   waits until any other folder at an overlapping path, including its
+//!   own old one, has been removed, since Syncthing removes a folder's
+//!   marker with it and would carry its state across a change of path.
 //! - A configured folder is removed only when its Replica is removed or
 //!   its Item untracked. While it can't be synced for a while (its path is
 //!   missing, it overlaps another, or its records can't be read or haven't
@@ -323,9 +325,11 @@ pub enum Outcome {
     /// It was a mirror and has local changes, so its folder stays
     /// receive-only instead of starting to send them.
     LocalChanges,
-    /// It overlaps another Replica on this Node, or a folder Syncthing has
-    /// yet to remove, so it isn't synced.
+    /// It overlaps another Replica on this Node, so it isn't synced.
     Overlaps,
+    /// It's new or moved, and waits for Syncthing to remove another folder
+    /// at an overlapping path, or its own old one, first.
+    Waiting,
     /// Its path already holds files, and the Replica doesn't adopt them.
     NotEmpty,
     /// Its path has its own `.stignore`, which the Item's excludes would
@@ -359,8 +363,9 @@ impl fmt::Display for Outcome {
             Self::LocalChanges => f.write_str(
                 "has changes made locally while it was a mirror, so it stays receive-only; make it a mirror again, or undo the changes (Syncthing lists them as locally changed items)",
             ),
-            Self::Overlaps => f.write_str(
-                "overlaps another replica, or a folder Syncthing is still removing, on this Node, so it isn't synced",
+            Self::Overlaps => f.write_str("overlaps another replica on this Node, so it isn't synced"),
+            Self::Waiting => f.write_str(
+                "waits for Syncthing to remove another folder at an overlapping path, or its own at its old path, first",
             ),
             Self::NotEmpty => f.write_str(
                 "can't start: its path already holds files; add the replica again with adopt to merge them",
@@ -456,7 +461,6 @@ impl Driver {
         let aliased = self.aliases(&locals).await;
         let mut folders = Vec::new();
         let mut shared_with: BTreeSet<&NodeId> = BTreeSet::new();
-        let mut moved = BTreeSet::new();
         let mut fresh = Vec::new();
         for local in &locals {
             let id = local.item_id.to_string();
@@ -482,22 +486,24 @@ impl Driver {
                         .map(|changed| report.changed |= changed),
                     Err(outcome) => Err(outcome),
                 },
-                // Syncthing removes a folder's marker when the folder goes,
-                // so a new one waits for any other at its path to go first.
-                None if existing.iter().any(|(other, folder)| {
-                    *other != id
-                        && folder["path"]
-                            .as_str()
-                            .and_then(|other| AbsPath::new(other).ok())
-                            .is_some_and(|other| other.overlaps(path))
-                }) =>
-                {
-                    Err(Outcome::Overlaps)
-                }
+                // Syncthing keeps a folder's state across a change of path,
+                // so a moved folder is removed and set up afresh next round.
+                None if was.is_some() => Err(Outcome::Waiting),
                 None => {
                     let (adopt, excludes) = (local.replica.adopt, excludes(local));
-                    self.in_blocking(move |path| prepare(&path, adopt, &excludes), path.clone())
-                        .await
+                    let others: Vec<PathBuf> = existing
+                        .values()
+                        .filter_map(|folder| folder["path"].as_str())
+                        .map(PathBuf::from)
+                        .collect();
+                    self.in_blocking(
+                        move |path| {
+                            wait_for(&path, &others)?;
+                            prepare(&path, adopt, &excludes)
+                        },
+                        path.clone(),
+                    )
+                    .await
                 }
             };
             if let Err(outcome) = ready {
@@ -508,9 +514,6 @@ impl Driver {
             }
             if in_place.is_none() {
                 fresh.push(local);
-                if was.is_some() {
-                    moved.insert(id.clone());
-                }
             }
             let mut outcome = Outcome::Configured;
             let mut folder_type = folder_type(local.role);
@@ -598,19 +601,7 @@ impl Driver {
         harden(&mut desired["options"], &self.addresses(&tailnet.me().ips));
         desired["devices"] = Value::Array(devices);
         desired["folders"] = Value::Array(folders);
-        if !moved.is_empty() {
-            // Syncthing keeps a folder's state across a change of path, so
-            // drop the folder first to start afresh at the new one.
-            let mut without = current.clone();
-            if let Value::Array(folders) = &mut without["folders"] {
-                folders
-                    .retain(|folder| !folder["id"].as_str().is_some_and(|id| moved.contains(id)));
-            }
-            self.client
-                .call(Method::PUT, "/rest/config", Some(&without))
-                .await?;
-        }
-        if !moved.is_empty() || normalized(&desired) != normalized(&current) {
+        if normalized(&desired) != normalized(&current) {
             self.client
                 .call(Method::PUT, "/rest/config", Some(&desired))
                 .await?;
@@ -811,6 +802,23 @@ fn resolve(path: &Path) -> PathBuf {
             }
             _ => return path.to_owned(),
         }
+    }
+}
+
+/// Refuses a new folder's `path` while another Syncthing folder overlaps
+/// it, as given or once symlinks are resolved: Syncthing removes a folder's
+/// marker when the folder goes, so the new one waits for that first.
+fn wait_for(path: &AbsPath, others: &[PathBuf]) -> Result<(), Outcome> {
+    let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let path = Path::new(path.as_str());
+    let real = resolve(path);
+    if others
+        .iter()
+        .any(|other| overlap(path, other) || overlap(&real, &resolve(other)))
+    {
+        Err(Outcome::Waiting)
+    } else {
+        Ok(())
     }
 }
 

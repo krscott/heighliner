@@ -458,6 +458,9 @@ async fn moving_a_replica_starts_afresh_at_the_new_path() {
     )
     .unwrap();
     let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Waiting);
+    assert!(syncthing.folder(ITEM).await.is_none());
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
     assert_eq!(report.replicas[&ITEM], Outcome::Configured);
     assert_eq!(
         syncthing.folder(ITEM).await.unwrap()["path"],
@@ -592,20 +595,35 @@ async fn a_resumed_folder_runs_only_with_its_new_excludes() {
 
 #[tokio::test]
 async fn a_new_item_at_an_untracked_ones_path_waits_for_its_removal() {
+    new_item_at_untracked_ones_path(false).await;
+}
+
+#[tokio::test]
+async fn a_new_item_at_an_alias_of_an_untracked_ones_path_waits_too() {
+    new_item_at_untracked_ones_path(true).await;
+}
+
+async fn new_item_at_untracked_ones_path(through_alias: bool) {
     let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
-    let at = syncthing.dir("docs");
-    let db = tracked("a", &at);
+    let first = syncthing.dir("docs");
+    let mut db = tracked("a", &first);
     syncthing.reconcile(&db.config(), &alone()).await;
-    assert!(eventually(|| file(&at, MARKER).exists()).await);
+    assert!(eventually(|| file(&first, MARKER).exists()).await);
+    let at = if through_alias {
+        let alias = syncthing.dir("alias");
+        std::os::unix::fs::symlink(first.as_str(), alias.as_str()).unwrap();
+        alias
+    } else {
+        first.clone()
+    };
 
     // Untracked, and tracked again as a new Item, in one round.
-    let mut db = db;
     db.untrack(Timestamp::now(), ITEM).unwrap();
     let mut store = db.store().clone();
     store.merge(tracked_as(OTHER, "a", &at).store(), |_| true);
     let config = Config::new(&store);
     let report = syncthing.reconcile(&config, &alone()).await;
-    assert_eq!(report.replicas[&OTHER], Outcome::Overlaps);
+    assert_eq!(report.replicas[&OTHER], Outcome::Waiting);
     assert!(syncthing.folder(ITEM).await.is_none());
 
     tokio::time::sleep(Duration::from_secs(1)).await;

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::net::TcpListener;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -72,8 +73,9 @@ impl Syncthing {
             .arg(format!("--gui-apikey={API_KEY}"))
             .arg(format!("--log-file={}", home.path().join("log").display()))
             .args(["--no-browser", "--no-upgrade"])
-            // No monitor process, so that killing the child stops Syncthing.
-            .env("STNORESTART", "1")
+            // Syncthing runs a monitor process and a child; a process
+            // group of their own lets Drop stop both.
+            .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -93,8 +95,8 @@ impl Syncthing {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        kill_group(&child);
         let mut child = child;
-        let _ = child.kill();
         let _ = child.wait();
         panic!("Syncthing didn't start");
     }
@@ -128,7 +130,7 @@ impl Syncthing {
 
 impl Drop for Syncthing {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        kill_group(&self.child);
         let _ = self.child.wait();
     }
 }
@@ -142,4 +144,10 @@ pub(crate) fn free_port() -> u16 {
             return port;
         }
     }
+}
+
+/// Stops Syncthing's monitor and child, which share `child`'s process group.
+fn kill_group(child: &Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
 }

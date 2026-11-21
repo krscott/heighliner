@@ -487,6 +487,16 @@ async fn an_unavailable_path_pauses_its_folder() {
     assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
     assert!(!Path::new(at.as_str()).exists());
 
+    // An empty directory where the disk was mounted stays missing too, round
+    // after round.
+    fs::create_dir(at.as_str()).unwrap();
+    for _ in 0..3 {
+        let report = syncthing.reconcile(&db.config(), &alone()).await;
+        assert_eq!(report.replicas[&ITEM], Outcome::Missing);
+        assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+    }
+    fs::remove_dir(at.as_str()).unwrap();
+
     // When it comes back, the folder runs again.
     fs::rename(syncthing.dir("away").as_str(), at.as_str()).unwrap();
     let report = syncthing.reconcile(&db.config(), &alone()).await;
@@ -523,4 +533,37 @@ async fn unparseable_excludes_are_reported() {
         "{:?}",
         report.replicas[&ITEM]
     );
+}
+
+#[tokio::test]
+async fn unknown_items_keep_their_folders_paused() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    let db = added(&at, false);
+    syncthing.reconcile(&db.config(), &alone()).await;
+    fs::write(file(&at, "synced"), "data").unwrap();
+
+    // A first round before any records have arrived.
+    let report = syncthing.reconcile(&Config::default(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Unknown);
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+
+    // Once they arrive, it runs again rather than being refused.
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Configured);
+}
+
+#[tokio::test]
+async fn a_new_replica_through_a_symlink_overlaps_at_once() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    fs::create_dir(at.as_str()).unwrap();
+    let link = syncthing.dir("link");
+    std::os::unix::fs::symlink(at.as_str(), link.as_str()).unwrap();
+    let mut store = tracked("a", &at).store().clone();
+    // A new Replica inside the other, reached through the symlink.
+    store.merge(tracked_as(OTHER, "a", &path(file(&link, "inner"))).store(), |_| true);
+    let report = syncthing.reconcile(&Config::new(&store), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Overlaps);
+    assert_eq!(report.replicas[&OTHER], Outcome::Overlaps);
 }

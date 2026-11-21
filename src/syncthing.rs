@@ -22,9 +22,10 @@
 //!   refused, and so is one with its own `.stignore`.
 //! - A configured folder is removed only when its Replica is removed or
 //!   its Item untracked. While it can't be synced for a while (its path is
-//!   missing, it overlaps another, or its records can't be read), it is
-//!   paused instead, keeping its marker and index.
-//! - Replicas whose paths overlap once symlinks are resolved aren't synced.
+//!   missing, it overlaps another, or its records can't be read or haven't
+//!   arrived yet), it is paused instead, keeping its marker and index.
+//! - Overlapping Replicas aren't synced, including ones whose paths
+//!   overlap once symlinks are resolved.
 //! - Removing a Replica only removes its folder from Syncthing; the files
 //!   stay (Syncthing removes only its `.stfolder` marker). Heighliner never
 //!   removes the marker of a configured folder and never recreates a
@@ -32,7 +33,6 @@
 //!   error rather than everything having been deleted.
 //! - A mirror is made to send only while it runs and right after a scan
 //!   finds no local changes; otherwise it stays receive-only.
-//! - Overlapping Replicas aren't synced.
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
 //!   used.
 
@@ -63,6 +63,9 @@ pub const PORT: u16 = 22000;
 
 /// How long a REST call may take.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a scan, which a REST call waits for, may take.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// How long inspecting or preparing a Replica's path may take, for example
 /// on a hung network filesystem.
@@ -120,11 +123,7 @@ impl fmt::Display for Error {
                 socket.display()
             ),
             Self::Http { path, source } => write!(f, "Syncthing request {path} failed: {source}"),
-            Self::Timeout { path } => write!(
-                f,
-                "Syncthing didn't answer {path} within {}s",
-                TIMEOUT.as_secs()
-            ),
+            Self::Timeout { path } => write!(f, "Syncthing didn't answer {path} in time"),
             Self::Status { path, status, body } => {
                 write!(
                     f,
@@ -184,6 +183,16 @@ impl Client {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Bytes, Error> {
+        self.call_within(TIMEOUT, method, path, body).await
+    }
+
+    async fn call_within(
+        &self,
+        timeout: Duration,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Bytes, Error> {
         let request = async {
             let stream =
                 UnixStream::connect(&self.socket)
@@ -213,7 +222,7 @@ impl Client {
                 })
         };
         let (status, body) =
-            tokio::time::timeout(TIMEOUT, request)
+            tokio::time::timeout(timeout, request)
                 .await
                 .map_err(|_| Error::Timeout {
                     path: path.to_owned(),
@@ -274,12 +283,9 @@ impl Client {
 
     /// Scans a folder and waits for the scan to finish.
     async fn scan(&self, folder: &str) -> Result<(), Error> {
-        self.call(
-            Method::POST,
-            &format!("/rest/db/scan?folder={folder}"),
-            None,
-        )
-        .await?;
+        let path = format!("/rest/db/scan?folder={folder}");
+        self.call_within(SCAN_TIMEOUT, Method::POST, &path, None)
+            .await?;
         Ok(())
     }
 
@@ -319,6 +325,9 @@ pub enum Outcome {
     PathError(String),
     /// It or its Item was written by a newer heighliner and can't be read.
     Unreadable,
+    /// Syncthing has a folder for it, but this Node doesn't know its Item,
+    /// for example before it has pulled the other Nodes' records.
+    Unknown,
     /// Syncthing failed to apply part of it.
     Failed(String),
 }
@@ -350,6 +359,9 @@ impl fmt::Display for Outcome {
             Self::PathError(error) => write!(f, "can't be synced: {error}"),
             Self::Unreadable => f.write_str(
                 "can't be synced: its records were written by a newer heighliner; upgrade this Node",
+            ),
+            Self::Unknown => f.write_str(
+                "is paused: this Node doesn't know its item, for example before it has pulled the other Nodes' records",
             ),
             Self::Failed(error) => write!(f, "couldn't be configured: {error}"),
         }
@@ -443,11 +455,8 @@ impl Driver {
             let was_paused = in_place.is_some_and(|folder| folder["paused"] == true);
             let ready = match in_place {
                 Some(_) => {
-                    self.in_blocking(
-                        move |path| check_initialized(&path, was_paused),
-                        path.clone(),
-                    )
-                    .await
+                    self.in_blocking(|path| check_initialized(&path), path.clone())
+                        .await
                 }
                 None => {
                     let (adopt, excludes) = (local.replica.adopt, excludes(local));
@@ -511,6 +520,20 @@ impl Driver {
                     .map(|folder| paused(folder)),
             );
             report.replicas.insert(item, Outcome::Unreadable);
+        }
+        // Folders of Items this Node doesn't know are kept, paused, until
+        // their records show them removed.
+        for (id, folder) in &existing {
+            let Ok(item) = id.parse::<ItemId>() else {
+                continue;
+            };
+            if item.to_string() == *id
+                && !report.replicas.contains_key(&item)
+                && !config.was_removed(item, me)
+            {
+                folders.push(paused(folder));
+                report.replicas.insert(item, Outcome::Unknown);
+            }
         }
 
         let mut this_device = current["devices"]
@@ -615,7 +638,7 @@ impl Driver {
             let _ = self
                 .in_blocking(
                     move |path| {
-                        *found.lock().unwrap() = fs::canonicalize(path.as_str()).ok();
+                        *found.lock().unwrap() = Some(resolve(Path::new(path.as_str())));
                         Ok(())
                     },
                     local.replica.path().clone(),
@@ -729,6 +752,26 @@ impl Driver {
     }
 }
 
+/// `path` with symlinks resolved, as far as it exists: a path that doesn't
+/// exist yet is resolved through its deepest ancestor that does.
+fn resolve(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(mut real) = fs::canonicalize(existing) {
+            real.extend(missing.iter().rev());
+            return real;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
 /// A configured folder, paused.
 fn paused(folder: &Value) -> Value {
     let mut folder = folder.clone();
@@ -755,11 +798,10 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Checks that a configured folder's path and marker are there. A folder
-/// that was paused may not have started yet, so its marker isn't needed.
-fn check_initialized(path: &AbsPath, was_paused: bool) -> Result<(), Outcome> {
+/// Checks that a configured folder's path and marker are there.
+fn check_initialized(path: &AbsPath) -> Result<(), Outcome> {
     check_exists(path)?;
-    if was_paused || Path::new(path.as_str()).join(MARKER).exists() {
+    if Path::new(path.as_str()).join(MARKER).exists() {
         Ok(())
     } else {
         Err(Outcome::Missing)
@@ -807,6 +849,14 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Outcome::Missing),
             Err(e) => return Err(error(e)),
         },
+        Err(e) => return Err(error(e)),
+    }
+    // Create the marker now, rather than when Syncthing first runs the
+    // folder, so that a configured folder always has one while its disk is
+    // there.
+    match fs::create_dir(path.join(MARKER)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(error(e)),
     }
     fs::write(path.join(IGNORE_FILE), lines).map_err(error)

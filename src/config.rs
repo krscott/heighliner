@@ -126,6 +126,12 @@ impl ItemEntry {
 }
 
 impl Config {
+    /// Whether the Replica of `item` on `node` was removed, or the Item
+    /// untracked, as far as the records still show.
+    pub fn was_removed(&self, item: ItemId, node: &NodeId) -> bool {
+        self.untracked.contains(&item) || self.removed.contains(&(item, node.clone()))
+    }
+
     /// The Items with a Replica on `node` that exists but can't be used,
     /// because it or its Item can't be read.
     pub fn unusable_on(&self, node: &NodeId) -> BTreeSet<ItemId> {
@@ -235,6 +241,9 @@ pub struct Config {
     /// What each Node has published about itself.
     pub nodes: BTreeMap<NodeId, NodeInfo>,
     pub problems: Vec<Problem>,
+    /// Replicas whose record is a tombstone, and Items untracked.
+    removed: BTreeSet<(ItemId, NodeId)>,
+    untracked: BTreeSet<ItemId>,
 }
 
 /// The readable settings in an Item record.
@@ -273,6 +282,7 @@ impl Config {
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
                         None => {
+                            config.untracked.insert(id);
                             let last_live = record
                                 .versions()
                                 .rev()
@@ -296,7 +306,9 @@ impl Config {
                             replicas.entry(item).or_default().insert(node, replica);
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
-                        None => {}
+                        None => {
+                            config.removed.insert((item, node));
+                        }
                     }
                 }
                 NODE_KIND => {

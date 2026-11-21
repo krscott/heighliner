@@ -65,30 +65,45 @@ pub struct Device {
     pub ips: Vec<IpAddr>,
 }
 
-/// This device and the others on its tailnet.
+/// This device, which is owned by a user, and the others on its tailnet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tailnet {
-    pub me: Device,
-    pub others: Vec<Device>,
+    me: Device,
+    owner: Owner,
+    others: Vec<Device>,
 }
 
 impl Tailnet {
-    /// The user who owns this device, unless it is tagged.
-    pub fn owner(&self) -> Result<Owner, Error> {
-        if self.me.tagged {
+    /// Fails if this device is tagged, since it then has no owner.
+    pub fn new(me: Device, others: Vec<Device>) -> Result<Self, Error> {
+        if me.tagged {
             return Err(Error::Tagged);
         }
-        Ok(Owner(self.me.user))
+        Ok(Self {
+            owner: Owner(me.user),
+            me,
+            others,
+        })
+    }
+
+    pub fn me(&self) -> &Device {
+        &self.me
+    }
+
+    pub fn owner(&self) -> Owner {
+        self.owner
+    }
+
+    pub fn others(&self) -> &[Device] {
+        &self.others
     }
 
     /// The other devices the owner owns, which are the ones that can be
     /// Nodes.
-    pub fn owned_devices(&self) -> Result<impl Iterator<Item = &Device>, Error> {
-        let owner = self.owner()?;
-        Ok(self
-            .others
+    pub fn owned_devices(&self) -> impl Iterator<Item = &Device> {
+        self.others
             .iter()
-            .filter(move |device| owner.owns(device.user, device.tagged)))
+            .filter(|device| self.owner.owns(device.user, device.tagged))
     }
 }
 
@@ -105,6 +120,7 @@ pub struct Identity {
 /// The parts of the local API heighliner uses. [`Client`] talks to
 /// `tailscaled`; tests use a fake.
 pub trait LocalApi: Send + Sync + 'static {
+    /// Fails with [`Error::Tagged`] if this device is tagged.
     fn status(&self) -> impl Future<Output = Result<Tailnet, Error>> + Send;
 
     /// Identifies the device a TCP connection from `addr` comes from, or
@@ -277,7 +293,7 @@ impl LocalApi for Client {
             });
         }
         let status: StatusResponse = decode(PATH, status, &body)?;
-        Ok(status.into_tailnet())
+        status.into_tailnet()
     }
 
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {
@@ -360,17 +376,26 @@ impl PeerStatus {
 }
 
 impl StatusResponse {
-    fn into_tailnet(self) -> Tailnet {
-        Tailnet {
-            me: self.me.into_device(),
-            others: self
-                .peer
-                .unwrap_or_default()
-                .into_values()
-                .filter_map(|peer| serde_json::from_value::<PeerStatus>(peer).ok())
-                .map(PeerStatus::into_device)
-                .collect(),
-        }
+    fn into_tailnet(self) -> Result<Tailnet, Error> {
+        let others = self
+            .peer
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(node_key, peer)| {
+                // Known only from WireGuard, not yet from the network map.
+                if peer.get("ID").and_then(serde_json::Value::as_str) == Some("") {
+                    return None;
+                }
+                match serde_json::from_value::<PeerStatus>(peer) {
+                    Ok(peer) => Some(peer.into_device()),
+                    Err(error) => {
+                        tracing::warn!(%node_key, %error, "skipping a tailnet device tailscaled describes unexpectedly");
+                        None
+                    }
+                }
+            })
+            .collect();
+        Tailnet::new(self.me.into_device(), others)
     }
 }
 

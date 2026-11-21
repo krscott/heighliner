@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
-use crate::tailscale::{self, Device, Tailnet};
+use crate::tailscale::{Device, Tailnet};
 
 /// A device that accepted a connection, and the address it accepted it on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,13 +19,9 @@ pub struct Found {
 /// connections on `port`, the port heighliner listens on. Each device's
 /// addresses are tried in turn, each for at most `timeout`; devices are
 /// probed concurrently.
-pub async fn discover(
-    tailnet: &Tailnet,
-    port: u16,
-    timeout: Duration,
-) -> Result<Vec<Found>, tailscale::Error> {
+pub async fn discover(tailnet: &Tailnet, port: u16, timeout: Duration) -> Vec<Found> {
     let mut probes = JoinSet::new();
-    for device in tailnet.owned_devices()?.cloned() {
+    for device in tailnet.owned_devices().cloned() {
         probes.spawn(async move {
             for ip in &device.ips {
                 let addr = SocketAddr::new(*ip, port);
@@ -38,7 +34,7 @@ pub async fn discover(
     }
     let mut found: Vec<Found> = probes.join_all().await.into_iter().flatten().collect();
     found.sort_by(|a, b| a.device.id.cmp(&b.device.id));
-    Ok(found)
+    found
 }
 
 #[cfg(test)]
@@ -67,9 +63,9 @@ mod tests {
         listening.ips.push("127.0.0.1".parse().unwrap());
         let mut tagged = device("tagged", OWNER, "127.0.0.1");
         tagged.tagged = true;
-        let tailnet = Tailnet {
-            me: device("me", OWNER, "100.64.0.1"),
-            others: vec![
+        let tailnet = Tailnet::new(
+            device("me", OWNER, "100.64.0.1"),
+            vec![
                 listening,
                 // Owned, but nothing listens.
                 device("idle", OWNER, "127.0.0.3"),
@@ -77,11 +73,10 @@ mod tests {
                 device("friend", OTHER, "127.0.0.1"),
                 tagged,
             ],
-        };
+        )
+        .unwrap();
 
-        let found = discover(&tailnet, port, Duration::from_secs(1))
-            .await
-            .unwrap();
+        let found = discover(&tailnet, port, Duration::from_secs(1)).await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].device.name, "listening");
         assert_eq!(
@@ -90,14 +85,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_tagged_device_finds_nothing() {
-        let mut me = device("me", OWNER, "100.64.0.1");
-        me.tagged = true;
-        let tailnet = Tailnet { me, others: vec![] };
-        assert!(matches!(
-            discover(&tailnet, 1, Duration::from_secs(1)).await,
-            Err(tailscale::Error::Tagged)
-        ));
-    }
 }

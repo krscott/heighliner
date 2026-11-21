@@ -82,21 +82,25 @@ fn whois_json() -> Value {
 #[test]
 fn status_is_read() {
     let status: StatusResponse = serde_json::from_value(status_json("Running")).unwrap();
-    let tailnet = status.into_tailnet();
-    assert_eq!(tailnet.me.id.as_str(), "nSELF");
-    assert_eq!(tailnet.me.name, "desktop");
-    assert_eq!(tailnet.me.user, OWNER);
-    assert!(!tailnet.me.tagged);
-    assert_eq!(tailnet.me.ips.len(), 2);
-    assert_eq!(tailnet.others.len(), 3);
-    let owned: Vec<_> = tailnet
-        .owned_devices()
-        .unwrap()
-        .map(|d| d.name.as_str())
-        .collect();
+    let tailnet = status.into_tailnet().unwrap();
+    assert_eq!(tailnet.me().id.as_str(), "nSELF");
+    assert_eq!(tailnet.me().name, "desktop");
+    assert_eq!(tailnet.me().user, OWNER);
+    assert_eq!(tailnet.me().ips.len(), 2);
+    // The partial entry is skipped.
+    assert_eq!(tailnet.others().len(), 3);
+    let owned: Vec<_> = tailnet.owned_devices().map(|d| d.name.as_str()).collect();
     assert_eq!(owned, ["laptop"]);
-    let server = tailnet.others.iter().find(|d| d.name == "server").unwrap();
+    let server = tailnet.others().iter().find(|d| d.name == "server").unwrap();
     assert!(server.tagged);
+}
+
+#[test]
+fn a_tagged_device_has_no_tailnet() {
+    let mut json = status_json("Running");
+    json["Self"]["Tags"] = json!(["tag:server"]);
+    let status: StatusResponse = serde_json::from_value(json).unwrap();
+    assert!(matches!(status.into_tailnet(), Err(Error::Tagged)));
 }
 
 #[test]
@@ -196,7 +200,7 @@ async fn client_talks_to_tailscaled() {
     let client = serve_fake_tailscaled(dir.path(), status_json("Running")).await;
 
     let tailnet = client.status().await.unwrap();
-    assert_eq!(tailnet.me.name, "desktop");
+    assert_eq!(tailnet.me().name, "desktop");
 
     let laptop = client
         .whois("100.64.0.2:41641".parse().unwrap())

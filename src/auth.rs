@@ -28,8 +28,8 @@ const RECHECK_EVERY: Duration = Duration::from_secs(30);
 /// Checks callers against the user who owns this Node.
 ///
 /// The owner is read when the Authorizer is created and checked again
-/// every [`RECHECK_EVERY`]. If this device's login or tags have changed by
-/// then, every request is refused until heighliner restarts.
+/// every [`RECHECK_EVERY`]. While this device's login or tags differ from
+/// when it was created, every request is refused.
 pub struct Authorizer<T> {
     api: T,
     me: NodeId,
@@ -80,7 +80,7 @@ impl IntoResponse for Denied {
                 tracing::warn!("{self}");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "can't identify the caller right now; try again",
+                    "can't identify the caller right now; see heighliner's log",
                 )
                     .into_response()
             }
@@ -101,8 +101,8 @@ impl<T: LocalApi> Authorizer<T> {
     async fn with_recheck(api: T, recheck_every: Duration) -> Result<Self, tailscale::Error> {
         let tailnet = api.status().await?;
         Ok(Self {
-            owner: tailnet.owner()?,
-            me: tailnet.me.id,
+            owner: tailnet.owner(),
+            me: tailnet.me().id.clone(),
             api,
             recheck_every,
             checked_at: Mutex::new(Instant::now()),
@@ -125,8 +125,12 @@ impl<T: LocalApi> Authorizer<T> {
         if self.checked_at.lock().unwrap().elapsed() < self.recheck_every {
             return Ok(());
         }
-        let tailnet = self.api.status().await.map_err(Denied::Lookup)?;
-        if tailnet.me.id != self.me || tailnet.owner().ok() != Some(self.owner) {
+        let tailnet = match self.api.status().await {
+            Ok(tailnet) => tailnet,
+            Err(tailscale::Error::Tagged) => return Err(Denied::OwnerChanged),
+            Err(error) => return Err(Denied::Lookup(error)),
+        };
+        if tailnet.me().id != self.me || tailnet.owner() != self.owner {
             return Err(Denied::OwnerChanged);
         }
         *self.checked_at.lock().unwrap() = Instant::now();
@@ -262,7 +266,7 @@ mod tests {
         let server = start(fake()).await;
         let (status, body) = get_from("127.0.0.5", server, "/").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body, "can't identify the caller right now; try again");
+        assert_eq!(body, "can't identify the caller right now; see heighliner's log");
     }
 
     #[tokio::test]

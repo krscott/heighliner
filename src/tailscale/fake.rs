@@ -5,6 +5,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use super::{Device, Error, Identity, LocalApi, Tailnet, UserId};
+
+/// What status reports.
+struct Devices {
+    me: Device,
+    others: Vec<Device>,
+}
 use crate::model::NodeId;
 
 /// An untagged device named `name`, with node ID `n-<name>`, at `ip`.
@@ -22,7 +28,7 @@ pub(crate) fn device(name: &str, user: UserId, ip: &str) -> Device {
 /// fake over.
 #[derive(Clone)]
 pub(crate) struct Fake {
-    tailnet: Arc<Mutex<Tailnet>>,
+    devices: Arc<Mutex<Devices>>,
     identities: BTreeMap<IpAddr, Identity>,
     failing_whois: BTreeSet<IpAddr>,
 }
@@ -30,7 +36,7 @@ pub(crate) struct Fake {
 impl Fake {
     pub(crate) fn new(me: Device) -> Self {
         let mut fake = Self {
-            tailnet: Arc::new(Mutex::new(Tailnet {
+            devices: Arc::new(Mutex::new(Devices {
                 me: me.clone(),
                 others: Vec::new(),
             })),
@@ -44,12 +50,12 @@ impl Fake {
     /// Adds another device, which WhoIs then identifies.
     pub(crate) fn add_device(&mut self, device: Device) {
         self.add_identities(&device);
-        self.tailnet.lock().unwrap().others.push(device);
+        self.devices.lock().unwrap().others.push(device);
     }
 
     /// Changes what status reports about this device.
     pub(crate) fn set_me(&self, me: Device) {
-        self.tailnet.lock().unwrap().me = me;
+        self.devices.lock().unwrap().me = me;
     }
 
     pub(crate) fn fail_whois_for(&mut self, ip: IpAddr) {
@@ -73,7 +79,8 @@ impl Fake {
 
 impl LocalApi for Fake {
     async fn status(&self) -> Result<Tailnet, Error> {
-        Ok(self.tailnet.lock().unwrap().clone())
+        let devices = self.devices.lock().unwrap();
+        Tailnet::new(devices.me.clone(), devices.others.clone())
     }
 
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {

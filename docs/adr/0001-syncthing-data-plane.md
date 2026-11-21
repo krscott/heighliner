@@ -13,8 +13,8 @@ traffic on the tailnet in two layers:
 
 - **Configuration**: global and local discovery, relays, NAT traversal, STUN
   and crash reporting are disabled, usage reporting is declined, Syncthing
-  listens only on the Node's Tailscale address, and peers are configured with
-  static Tailscale addresses. The binary is built with upgrades disabled.
+  listens only on the Node's Tailscale address, and other Nodes are configured
+  with static Tailscale addresses. The binary is built with upgrades disabled.
 - **Enforcement**: Syncthing runs as a systemd system service whose IP egress
   is limited to the tailnet ranges and localhost (`IPAddressDeny=any` plus
   `IPAddressAllow=`). The kernel enforces this whatever Syncthing attempts, so
@@ -31,5 +31,5 @@ working while its Nodes stay up. Nodes that restart during the outage cannot
 reach each other until a DERP relay or the coordination server is reachable
 again, because each restart creates a new disco key that only those services
 can distribute. Syncthing does not fall back to LAN addresses. If that ever
-becomes necessary, the narrowest fix is to add LAN peer addresses and widen
-the egress allowlist to the trusted home subnets for Syncthing only.
+becomes necessary, the narrowest fix is to add other Nodes' LAN addresses and
+widen the egress allowlist to the trusted home subnets for Syncthing only.

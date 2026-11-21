@@ -36,8 +36,8 @@ How a Replica takes part in its Item: a **source** only sends changes, a
 _Avoid_: Mode, direction
 
 **Direction**:
-Whether an Item is **one-way** (exactly one source and one or more mirrors) or
-**two-way** (one or more peers and any number of mirrors).
+Whether an Item is **one-way** (one source; every other Replica is a mirror)
+or **two-way** (one or more peers and any number of mirrors).
 _Avoid_: Sync mode, sync type
 
 ## Replication state

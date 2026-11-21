@@ -308,6 +308,14 @@ impl Client {
         Ok(())
     }
 
+    /// Pauses or resumes a folder.
+    async fn set_folder_paused(&self, folder: ItemId, paused: bool) -> Result<(), Error> {
+        let path = format!("/rest/config/folders/{folder}");
+        self.call(Method::PATCH, &path, Some(&json!({ "paused": paused })))
+            .await?;
+        Ok(())
+    }
+
     /// Whether a folder sends its local changes now: it is send-receive
     /// and running.
     pub(crate) async fn folder_sends(&self, folder: ItemId) -> Result<bool, Error> {
@@ -504,7 +512,10 @@ impl Driver {
                     .in_blocking(|path| check_initialized(&path), path.clone())
                     .await
                 {
-                    Ok(()) if !local.paused => self.sync_ignores(local, &mut report.changed).await,
+                    Ok(()) if !local.paused => {
+                        self.sync_ignores(local, !was_paused, &mut report.changed)
+                            .await
+                    }
                     other => other,
                 },
                 // Syncthing keeps a folder's state across a change of path,
@@ -574,14 +585,19 @@ impl Driver {
                 .filter(|node| *node != me && peers.contains_key(node))
                 .collect();
             shared_with.extend(devices.iter().copied());
-            folders.push(self.folder(
+            let mut folder = self.folder(
                 folder_template,
                 local,
                 folder_type,
                 device_id,
                 &peers,
                 &devices,
-            ));
+            );
+            if in_place.is_none() {
+                // Until Syncthing has loaded its excludes without an error.
+                folder["paused"] = json!(true);
+            }
+            folders.push(folder);
             report.replicas.insert(local.item_id, outcome);
         }
         for item in config.unusable_on(me) {
@@ -633,10 +649,21 @@ impl Driver {
             report.changed = true;
         }
 
-        // A new folder starts with the `.stignore` prepared for it, so this
-        // only checks that Syncthing can use it.
+        // A new folder starts paused with the `.stignore` prepared for it,
+        // so this checks that Syncthing can use it, then lets it run.
         for local in ignores_after {
-            if let Err(outcome) = self.sync_ignores(local, &mut report.changed).await {
+            let fresh = existing
+                .get(local.item_id.to_string().as_str())
+                .is_none_or(|folder| folder["path"] != local.replica.path().as_str());
+            let mut synced = self.sync_ignores(local, false, &mut report.changed).await;
+            if synced.is_ok() && fresh && !local.paused {
+                synced = self
+                    .client
+                    .set_folder_paused(local.item_id, false)
+                    .await
+                    .map_err(|error| Outcome::Failed(error.to_string()));
+            }
+            if let Err(outcome) = synced {
                 report.replicas.insert(local.item_id, outcome);
             }
         }
@@ -644,11 +671,16 @@ impl Driver {
     }
 
     /// Sets a configured Replica's excludes, unless its marker is missing,
+    /// pausing its folder meanwhile if it is `running`: while Syncthing
+    /// can't parse a folder's ignore patterns, it ignores nothing, so new
+    /// ones must not reach a folder that is scanning or pulling until they
+    /// are known to parse. If they don't, the folder stays paused.
     /// since Syncthing would recreate its path. Sets `changed` if they
     /// changed.
     async fn sync_ignores(
         &self,
         local: &LocalReplica<'_>,
+        running: bool,
         changed: &mut bool,
     ) -> Result<(), Outcome> {
         let wanted = ignore_lines(&excludes(local));
@@ -671,13 +703,28 @@ impl Driver {
             local.replica.path().clone(),
         )
         .await?;
+        if running {
+            self.client
+                .set_folder_paused(local.item_id, true)
+                .await
+                .map_err(failed)?;
+        }
         self.client
             .set_ignores(local.item_id, &wanted)
             .await
             .map_err(failed)?;
         *changed = true;
         let (_, error) = self.client.ignores(local.item_id).await.map_err(failed)?;
-        error.map_or(Ok(()), |error| Err(unparsed(error)))
+        if let Some(error) = error {
+            return Err(unparsed(error));
+        }
+        if running {
+            self.client
+                .set_folder_paused(local.item_id, false)
+                .await
+                .map_err(failed)?;
+        }
+        Ok(())
     }
 
     /// How many local changes a folder has, scanning it first so that none

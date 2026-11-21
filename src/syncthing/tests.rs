@@ -592,30 +592,48 @@ async fn symlinked_aliases_count_as_overlapping() {
 }
 
 #[tokio::test]
-async fn excludes_heighliner_accepts_are_ones_syncthing_parses() {
+async fn excludes_syncthing_cant_parse_pause_the_folder() {
     let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
-    let db = tracked("a", &syncthing.dir("docs"));
+    let mut db = tracked("a", &syncthing.dir("docs"));
     syncthing.reconcile(&db.config(), &alone()).await;
-    let client = syncthing.driver.client();
-    let parses = |pattern: &str| {
-        let lines = vec![pattern.to_owned()];
-        async move {
-            client.set_ignores(ITEM, &lines).await.unwrap();
-            client.ignores(ITEM).await.unwrap().1.is_none()
-        }
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], false);
+    let unparseable = |db: &mut ConfigDb| {
+        db.update_item(Timestamp::now(), ITEM, |item| {
+            item.excludes = vec![ExcludePattern::new("[").unwrap()]
+        })
+        .unwrap();
     };
-    for pattern in [
-        "*.tmp", "[#]", "a]b", "x}y", "{a,b}", "{a", "[!x]", "[a-z]", "\\*", "a\\",
-    ] {
-        assert!(ExcludePattern::new(pattern).is_ok(), "{pattern}");
-        assert!(parses(pattern).await, "Syncthing parses {pattern}");
-    }
-    // Refused, as Syncthing would ignore nothing while it can't parse
-    // them.
-    for pattern in ["[", "a[b", "[]", "[!]"] {
-        assert!(ExcludePattern::new(pattern).is_err(), "{pattern}");
-        assert!(!parses(pattern).await, "Syncthing refuses {pattern}");
-    }
+    let failed =
+        |outcome: &Outcome| matches!(outcome, Outcome::Failed(error) if error.contains("excludes"));
+    unparseable(&mut db);
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(
+        failed(&report.replicas[&ITEM]),
+        "{:?}",
+        report.replicas[&ITEM]
+    );
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+    // It runs again once they parse.
+    db.update_item(Timestamp::now(), ITEM, |item| item.excludes.clear())
+        .unwrap();
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Configured);
+    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], false);
+
+    // A new folder starts paused, and stays so with them.
+    let mut other = tracked_as(OTHER, "a", &syncthing.dir("other"));
+    other
+        .update_item(Timestamp::now(), OTHER, |item| {
+            item.excludes = vec![ExcludePattern::new("[").unwrap()]
+        })
+        .unwrap();
+    let report = syncthing.reconcile(&other.config(), &alone()).await;
+    assert!(
+        failed(&report.replicas[&OTHER]),
+        "{:?}",
+        report.replicas[&OTHER]
+    );
+    assert_eq!(syncthing.folder(OTHER).await.unwrap()["paused"], true);
 }
 
 #[tokio::test]

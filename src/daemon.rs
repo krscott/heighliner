@@ -25,6 +25,7 @@ use crate::hlc::{Hlc, Timestamp};
 use crate::model::NodeId;
 use crate::protocol::{self, Hello};
 use crate::record::Store;
+use crate::syncthing::{self, Driver, Outcome};
 use crate::tailscale::{self, Client, LocalApi, Owner, Tailnet};
 
 /// The port heighliner listens on unless configured otherwise.
@@ -206,6 +207,9 @@ pub struct Round {
     pub incompatible: Vec<(NodeId, Hello)>,
     /// The Nodes that answered but whose records couldn't be pulled.
     pub failed: Vec<NodeId>,
+    /// What configuring Syncthing did, if the daemon drives Syncthing and
+    /// could reach it.
+    pub syncthing: Option<syncthing::Report>,
 }
 
 /// One Node's daemon.
@@ -221,6 +225,7 @@ pub struct Daemon<T> {
     /// What was last written to the state file, to skip unchanged writes.
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
+    driver: Option<Driver>,
 }
 
 impl<T: LocalApi + Clone> Daemon<T> {
@@ -257,7 +262,14 @@ impl<T: LocalApi + Clone> Daemon<T> {
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
             saved,
+            driver: None,
         })
+    }
+
+    /// Makes the daemon configure Syncthing through `driver` each round.
+    pub fn with_driver(mut self, driver: Driver) -> Self {
+        self.driver = Some(driver);
+        self
     }
 
     pub fn db(&self) -> &Arc<Mutex<ConfigDb>> {
@@ -397,6 +409,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
             }
         }
+        round.syncthing = self.drive(&tailnet).await;
         self.db
             .lock()
             .unwrap()
@@ -409,6 +422,43 @@ impl<T: LocalApi + Clone> Daemon<T> {
         );
         self.save()?;
         Ok(round)
+    }
+
+    /// Publishes Syncthing's device ID and configures Syncthing to match the
+    /// configuration, as this device's status `tailnet` describes it.
+    async fn drive(&self, tailnet: &Tailnet) -> Option<syncthing::Report> {
+        let driver = self.driver.as_ref()?;
+        let device_id = match driver.client().device_id().await {
+            Ok(device_id) => device_id,
+            Err(error) => {
+                tracing::warn!(%error, "can't reach Syncthing");
+                return None;
+            }
+        };
+        if let Err(error) = self
+            .db
+            .lock()
+            .unwrap()
+            .set_device_id(Timestamp::now(), device_id)
+        {
+            tracing::warn!(%error, "can't publish this Node's Syncthing device ID");
+        }
+        let config = self.db.lock().unwrap().config();
+        match driver.reconcile(&config, tailnet).await {
+            Ok(report) => {
+                for (item, outcome) in &report.replicas {
+                    if *outcome != Outcome::Configured {
+                        let name = &config.items[item].item.name;
+                        tracing::warn!(%item, %name, "this Node's replica {outcome}");
+                    }
+                }
+                Some(report)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "configuring Syncthing failed");
+                None
+            }
+        }
     }
 
     /// Writes the records and clock to the state file, if they changed.
@@ -512,6 +562,19 @@ pub struct Options {
     pub port: u16,
     pub tailscale_socket: PathBuf,
     pub pull_every: Duration,
+    /// How to reach Syncthing, if the daemon is to drive it.
+    pub syncthing: Option<SyncthingOptions>,
+}
+
+/// How the daemon reaches the Syncthing instance it drives.
+#[derive(Clone, Debug)]
+pub struct SyncthingOptions {
+    /// Syncthing's GUI and REST API socket.
+    pub socket: PathBuf,
+    /// A file holding Syncthing's API key.
+    pub api_key_file: PathBuf,
+    /// The port Syncthing listens on, the same on every Node.
+    pub port: u16,
 }
 
 /// Runs the daemon. It waits for tailscaled to be ready, then serves and
@@ -521,6 +584,15 @@ pub struct Options {
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
     let mut daemon = open_when_ready(api, &options.state_dir, options.port).await?;
+    if let Some(syncthing) = &options.syncthing {
+        let api_key =
+            fs::read_to_string(&syncthing.api_key_file).map_err(|source| Error::State {
+                path: syncthing.api_key_file.clone(),
+                source,
+            })?;
+        let client = syncthing::Client::new(&syncthing.socket, api_key.trim());
+        daemon = daemon.with_driver(Driver::new(client, syncthing.port, RETENTION_WINDOW));
+    }
     let stopped = serve(&mut daemon, options.pull_every).await;
     // Whatever stopped the daemon, keep what it merged since the last save.
     if let Err(error) = daemon.save() {

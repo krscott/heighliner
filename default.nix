@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  syncthing,
 }:
 
 let
@@ -30,6 +31,9 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  # The Syncthing driver's tests run real Syncthing instances.
+  nativeCheckInputs = [ syncthing ];
 
   meta.mainProgram = "heighliner";
 }

@@ -359,6 +359,10 @@ pub struct Replica {
     pub mirror: bool,
     #[serde(default)]
     pub paused: bool,
+    /// Whether the Replica may start at a path that already holds files,
+    /// merging them with the Item's. Otherwise a non-empty path is refused.
+    #[serde(default)]
+    pub adopt: bool,
     #[serde(flatten)]
     unknown_fields: UnknownFields,
 }
@@ -369,6 +373,7 @@ impl Replica {
             path,
             mirror: false,
             paused: false,
+            adopt: false,
             unknown_fields: UnknownFields::new(),
         }
     }
@@ -627,7 +632,8 @@ mod tests {
 
     #[test]
     fn replica_round_trip_keeps_unknown_fields() {
-        let stored = json!({"path": "/srv/a", "mirror": true, "paused": false, "future": 1});
+        let stored =
+            json!({"path": "/srv/a", "mirror": true, "paused": false, "adopt": false, "future": 1});
         let replica: Replica = serde_json::from_value(stored.clone()).unwrap();
         assert!(replica.mirror);
         assert_eq!(serde_json::to_value(&replica).unwrap(), stored);

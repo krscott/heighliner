@@ -301,3 +301,38 @@ async fn an_unchanged_daemon_writes_no_state() {
     daemon.save().unwrap();
     assert!(dir.path().join(STATE_FILE).exists());
 }
+
+#[tokio::test]
+async fn the_daemon_drives_syncthing() {
+    let port = crate::syncthing::test_instance::free_port();
+    let syncthing = crate::syncthing::test_instance::Syncthing::start("127.0.0.1", port).await;
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap()
+        .with_driver(syncthing.driver.clone());
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let node = db.node().clone();
+        db.track(
+            Timestamp::now(),
+            ITEM,
+            Item::new("docs", Direction::TwoWay),
+            &node,
+            Replica::new(syncthing.dir("docs")),
+        )
+        .unwrap();
+    }
+
+    let round = daemon.pull_round().await.unwrap();
+    let report = round.syncthing.unwrap();
+    assert_eq!(
+        report.replicas[&ITEM],
+        crate::syncthing::Outcome::Configured
+    );
+    assert!(syncthing.folder(ITEM).await.is_some());
+    // The Node published its Syncthing device ID.
+    let device_id = syncthing.driver.client().device_id().await.unwrap();
+    let db = daemon.db().lock().unwrap();
+    assert_eq!(db.config().nodes[db.node()].device_id, device_id);
+}

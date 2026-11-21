@@ -10,4 +10,5 @@ mod http;
 pub mod model;
 pub mod protocol;
 pub mod record;
+pub mod syncthing;
 pub mod tailscale;

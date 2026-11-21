@@ -131,6 +131,42 @@ impl ItemEntry {
     }
 }
 
+/// One of a Node's Replicas, with what its Syncthing should do with it.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalReplica<'a> {
+    pub item_id: ItemId,
+    pub entry: &'a ItemEntry,
+    pub replica: &'a Replica,
+    pub role: Role,
+    /// Paused directly or through its Item.
+    pub paused: bool,
+    /// Overlaps another Replica on the Node, so it must not be synced.
+    pub overlaps: bool,
+}
+
+impl Config {
+    /// The Replicas on `node`, in Item order.
+    pub fn replicas_on(&self, node: &NodeId) -> Vec<LocalReplica<'_>> {
+        self.items
+            .iter()
+            .filter_map(|(item_id, entry)| {
+                let replica = entry.replicas.get(node)?;
+                let overlaps = self.problems.iter().any(|problem| {
+                    matches!(problem, Problem::Overlap { node: on, items } if on == node && items.contains(item_id))
+                });
+                Some(LocalReplica {
+                    item_id: *item_id,
+                    entry,
+                    replica,
+                    role: entry.item.direction.role(node, replica.mirror),
+                    paused: entry.item.paused || replica.paused,
+                    overlaps,
+                })
+            })
+            .collect()
+    }
+}
+
 /// Something in a configuration that needs the user's attention.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {

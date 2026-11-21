@@ -1005,6 +1005,7 @@ fn normalized(config: &Value) -> Value {
     config
 }
 
+mod state;
 #[cfg(test)]
 pub(crate) mod test_instance;
 #[cfg(test)]

@@ -2,7 +2,7 @@ use axum::Router;
 use axum::routing::get;
 
 use super::*;
-use crate::model::{AbsPath, Direction, Item, ItemId, Replica};
+use crate::model::{AbsPath, Direction, Item, ItemId, Replica, ReplicaState};
 use crate::tailscale::UserId;
 use crate::tailscale::fake::{Fake, device};
 
@@ -346,8 +346,91 @@ async fn the_daemon_drives_syncthing() {
     assert!(syncthing.folder(ITEM).await.is_some());
     // The Node published its Syncthing device ID.
     let device_id = syncthing.driver.client().device_id().await.unwrap();
-    let db = daemon.db().lock().unwrap();
-    assert_eq!(db.config().nodes[db.node()].device_id, device_id);
+    {
+        let db = daemon.db().lock().unwrap();
+        assert_eq!(db.config().nodes[db.node()].device_id, device_id);
+    }
+    // With no other Replicas to receive from, it's current.
+    assert_eq!(daemon.states()[&ITEM], ReplicaState::Current);
+}
+
+#[tokio::test]
+async fn the_daemon_remembers_when_replicas_were_current() {
+    let port = crate::syncthing::test_instance::free_port();
+    let syncthing = crate::syncthing::test_instance::Syncthing::start("127.0.0.1", port).await;
+    let dir = tempfile::tempdir().unwrap();
+    let api = tailnet("127.0.0.1", &[]);
+    let open = || async {
+        reopen(api.clone(), dir.path())
+            .await
+            .unwrap()
+            .with_driver(syncthing.driver.clone())
+    };
+    let elsewhere = NodeId::new("n-elsewhere").unwrap();
+    let sender = || Replica::new(AbsPath::new("/srv/docs").unwrap());
+    let daemon = open().await;
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let me = db.node().clone();
+        db.track(
+            Timestamp::now(),
+            ITEM,
+            Item::new("docs", Direction::TwoWay),
+            &me,
+            Replica::new(syncthing.dir("docs")),
+        )
+        .unwrap();
+    }
+    let before = Timestamp::now();
+    daemon.pull_round().await.unwrap();
+    let after = Timestamp::now();
+    assert_eq!(daemon.states()[&ITEM], ReplicaState::Current);
+    // Stopped while current.
+    daemon.save_on_stop().unwrap();
+    drop(daemon);
+
+    // Running again, it gains a sender that it can't reach.
+    let daemon = open().await;
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .add_replica(Timestamp::now(), ITEM, &elsewhere, sender())
+        .unwrap();
+    daemon.pull_round().await.unwrap();
+    let ReplicaState::Behind {
+        last_current: Some(at),
+    } = daemon.states()[&ITEM]
+    else {
+        panic!("{:?}", daemon.states()[&ITEM]);
+    };
+    assert!(before <= at && at <= after);
+
+    // Current again, then behind again: confirmed at its last read.
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .remove_replica(Timestamp::now(), ITEM, &elsewhere)
+        .unwrap();
+    let before = Timestamp::now();
+    daemon.pull_round().await.unwrap();
+    let after = Timestamp::now();
+    assert_eq!(daemon.states()[&ITEM], ReplicaState::Current);
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .add_replica(Timestamp::now(), ITEM, &elsewhere, sender())
+        .unwrap();
+    daemon.pull_round().await.unwrap();
+    let ReplicaState::Behind {
+        last_current: Some(at),
+    } = daemon.states()[&ITEM]
+    else {
+        panic!("{:?}", daemon.states()[&ITEM]);
+    };
+    assert!(before <= at && at <= after);
 }
 
 #[tokio::test]

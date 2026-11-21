@@ -13,14 +13,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Empty};
+use hyper::StatusCode;
 use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 
+use crate::http::{self, BoxError};
 use crate::model::NodeId;
 
 /// Where `tailscaled` listens on Linux.
@@ -30,7 +29,7 @@ pub const DEFAULT_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A Tailscale user ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserId(i64);
 
@@ -44,7 +43,8 @@ impl UserId {
 /// The user who owns this device. Only their untagged devices can be Nodes
 /// (ADR-0003): tagging a device moves its ownership to Tailscale's shared
 /// tagged-devices user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Owner(UserId);
 
 impl Owner {
@@ -144,7 +144,7 @@ pub enum Error {
     },
     Http {
         path: String,
-        source: hyper::Error,
+        source: BoxError,
     },
     Timeout {
         path: String,
@@ -209,7 +209,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connect { source, .. } => Some(source),
-            Self::Http { source, .. } => Some(source),
+            Self::Http { source, .. } => Some(source.as_ref()),
             Self::Decode { source, .. } => Some(source),
             Self::Timeout { .. }
             | Self::Status { .. }
@@ -242,24 +242,13 @@ impl Client {
                         socket: self.socket.clone(),
                         source,
                     })?;
-            let http = |source| Error::Http {
-                path: path.to_owned(),
-                source,
-            };
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                    .await
-                    .map_err(http)?;
-            tokio::spawn(connection);
-            let request = Request::get(path)
-                // tailscaled refuses local API requests with any other host.
-                .header(hyper::header::HOST, "local-tailscaled.sock")
-                .body(Empty::<Bytes>::new())
-                .expect("the request is well-formed");
-            let response = sender.send_request(request).await.map_err(http)?;
-            let status = response.status();
-            let body = response.into_body().collect().await.map_err(http)?;
-            Ok((status, body.to_bytes()))
+            // tailscaled refuses local API requests with any other host.
+            http::get(stream, "local-tailscaled.sock", path)
+                .await
+                .map_err(|source| Error::Http {
+                    path: path.to_owned(),
+                    source,
+                })
         };
         tokio::time::timeout(TIMEOUT, request)
             .await

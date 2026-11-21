@@ -125,7 +125,7 @@ impl Record {
 
 /// A set of records.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
+#[serde(try_from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
 pub struct Store {
     records: BTreeMap<RecordKey, Record>,
 }
@@ -197,10 +197,28 @@ struct WireVersion {
     content: Content,
 }
 
-impl From<Vec<WireRecord>> for Store {
-    fn from(records: Vec<WireRecord>) -> Self {
+/// A record as read: each version is decoded on its own, so one bad
+/// version doesn't cost the rest.
+#[derive(Deserialize)]
+struct LenientRecord {
+    kind: String,
+    id: String,
+    versions: Vec<Value>,
+}
+
+/// Refuses a record without versions, which is never written.
+impl TryFrom<Vec<WireRecord>> for Store {
+    type Error = String;
+
+    fn try_from(records: Vec<WireRecord>) -> Result<Self, Self::Error> {
         let mut store = Self::default();
         for record in records {
+            if record.versions.is_empty() {
+                return Err(format!(
+                    "record {}/{} has no versions",
+                    record.kind, record.id
+                ));
+            }
             let key = RecordKey {
                 kind: record.kind,
                 id: record.id,
@@ -209,7 +227,35 @@ impl From<Vec<WireRecord>> for Store {
                 store.insert(key.clone(), version.hlc, version.content);
             }
         }
-        store
+        Ok(store)
+    }
+}
+
+impl Store {
+    /// Decodes a serialized store one record and version at a time, and
+    /// returns how many it skipped because they couldn't be read. Used for
+    /// stores from other Nodes, so that one bad record doesn't cost the
+    /// rest; a Node's own state is decoded strictly.
+    pub fn decode_lenient(records: Vec<Value>) -> (Self, usize) {
+        let mut store = Self::default();
+        let mut skipped = 0;
+        for record in records {
+            let Ok(record) = serde_json::from_value::<LenientRecord>(record) else {
+                skipped += 1;
+                continue;
+            };
+            let key = RecordKey {
+                kind: record.kind,
+                id: record.id,
+            };
+            for version in record.versions {
+                match serde_json::from_value::<WireVersion>(version) {
+                    Ok(version) => store.insert(key.clone(), version.hlc, version.content),
+                    Err(_) => skipped += 1,
+                }
+            }
+        }
+        (store, skipped)
     }
 }
 
@@ -336,6 +382,32 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].1, &live(1));
         assert!(store.get(&key("k", "2")).is_none());
+    }
+
+    #[test]
+    fn unreadable_versions_are_skipped() {
+        let json = serde_json::json!([
+            {"kind": "k", "id": "1", "versions": [
+                {"hlc": {"wall": 1, "counter": 0, "node": "a"}, "content": {"state": "deleted"}},
+                {"hlc": {"wall": 2, "counter": 0, "node": "a b"}, "content": {"state": "deleted"}},
+            ]},
+            {"kind": "k"},
+            {"kind": "k", "id": "2", "versions": [
+                {"hlc": {"wall": 1, "counter": 0, "node": "a"}, "content": {"state": "archived"}},
+            ]},
+        ]);
+        let serde_json::Value::Array(records) = json.clone() else {
+            unreachable!()
+        };
+        let (store, skipped) = Store::decode_lenient(records);
+        assert_eq!(skipped, 3);
+        assert_eq!(store.records().count(), 1);
+        // Strict decoding refuses the whole store, including a record
+        // without versions.
+        assert!(serde_json::from_value::<Store>(json).is_err());
+        let empty = serde_json::json!([{"kind": "k", "id": "1", "versions": []}]);
+        assert!(serde_json::from_value::<Store>(empty).is_err());
+        assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 1);
     }
 
     #[test]

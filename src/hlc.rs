@@ -79,6 +79,13 @@ impl Clock {
             }
         };
         self.last = (wall, counter);
+        self.last()
+    }
+
+    /// The latest reading taken or observed, to persist so that a reopened
+    /// clock resumes after it.
+    pub fn last(&self) -> Hlc {
+        let (wall, counter) = self.last;
         Hlc {
             wall,
             counter,

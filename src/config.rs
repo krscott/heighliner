@@ -17,11 +17,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::hlc::{Clock, Hlc, Timestamp};
-use crate::model::{AbsPath, Item, ItemId, NodeId, Replica, Role};
+use crate::model::{AbsPath, DeviceId, Item, ItemId, NodeId, NodeInfo, Replica, Role};
 use crate::record::{Content, Record, RecordKey, Store};
 
 pub const ITEM_KIND: &str = "item";
 pub const REPLICA_KIND: &str = "replica";
+pub const NODE_KIND: &str = "node";
 
 /// The record schema version this version of heighliner reads and writes.
 ///
@@ -39,6 +40,13 @@ fn item_key(item: ItemId) -> RecordKey {
     RecordKey {
         kind: ITEM_KIND.to_owned(),
         id: item.to_string(),
+    }
+}
+
+fn node_key(node: &NodeId) -> RecordKey {
+    RecordKey {
+        kind: NODE_KIND.to_owned(),
+        id: node.to_string(),
     }
 }
 
@@ -173,6 +181,8 @@ impl fmt::Display for Problem {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub items: BTreeMap<ItemId, ItemEntry>,
+    /// What each Node has published about itself.
+    pub nodes: BTreeMap<NodeId, NodeInfo>,
     pub problems: Vec<Problem>,
 }
 
@@ -233,6 +243,22 @@ impl Config {
                     match parse_fields::<Replica>(record.latest().1) {
                         Some(Ok(replica)) => {
                             replicas.entry(item).or_default().insert(node, replica);
+                        }
+                        Some(Err(e)) => config.problems.push(unreadable(e)),
+                        None => {}
+                    }
+                }
+                NODE_KIND => {
+                    let node = match NodeId::new(key.id.clone()) {
+                        Ok(node) => node,
+                        Err(e) => {
+                            config.problems.push(unreadable(e.to_string()));
+                            continue;
+                        }
+                    };
+                    match parse_fields::<NodeInfo>(record.latest().1) {
+                        Some(Ok(info)) => {
+                            config.nodes.insert(node, info);
                         }
                         Some(Err(e)) => config.problems.push(unreadable(e)),
                         None => {}
@@ -385,6 +411,18 @@ impl ConfigDb {
 
     pub fn node(&self) -> &NodeId {
         self.clock.node()
+    }
+
+    /// The clock's latest reading. Persist it with the store and pass it
+    /// to [`ConfigDb::observe`] when reopening, so the clock resumes after
+    /// it even if pruning removed the versions that carried it.
+    pub fn last_reading(&self) -> Hlc {
+        self.clock.last()
+    }
+
+    /// Makes later local edits supersede `hlc`.
+    pub fn observe(&mut self, hlc: &Hlc) {
+        self.clock.observe(hlc);
     }
 
     pub fn store(&self) -> &Store {
@@ -552,6 +590,16 @@ impl ConfigDb {
             return Err(EditError::LastReplica { item: id });
         }
         self.edit(|db| db.delete(now, key))
+    }
+
+    /// Publishes this Node's Syncthing device ID.
+    pub fn set_device_id(&mut self, now: Timestamp, device_id: DeviceId) -> Result<(), EditError> {
+        let key = node_key(self.node());
+        let mut info = NodeInfo::new(device_id);
+        if let Some(original) = self.config().nodes.remove(self.node()) {
+            info.keep_unknown_fields(original);
+        }
+        self.edit(|db| db.write(now, key, &info))
     }
 
     fn item(&self, id: ItemId) -> Result<ItemEntry, EditError> {

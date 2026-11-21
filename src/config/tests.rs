@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::*;
 use crate::hlc::Hlc;
-use crate::model::{Direction, ExcludePattern};
+use crate::model::{DeviceId, Direction, ExcludePattern};
 
 const ITEM: ItemId = ItemId::from_u128(1);
 const OTHER: ItemId = ItemId::from_u128(2);
@@ -332,6 +332,41 @@ fn merge_leaves_out_versions_from_far_ahead() {
     assert_eq!(a.config(), Config::default());
     assert_eq!(a.merge(ahead.store(), t(1)), 0);
     assert!(a.config().items.contains_key(&ITEM));
+}
+
+#[test]
+fn reopening_resumes_after_the_saved_clock_reading() {
+    let mut a = db("a");
+    a.track(t(1_000), ITEM, two_way("x"), &node("a"), replica("/x"))
+        .unwrap();
+    a.untrack(t(1_001), ITEM).unwrap();
+    let reading = a.last_reading();
+    // Pruning drops every version, so only the saved reading remains.
+    a.prune(t(1_001).saturating_add(DAY * 31), DAY * 30);
+    assert_eq!(a.store(), &Store::default());
+
+    let mut reopened = ConfigDb::new(node("a"), a.store().clone());
+    reopened.observe(&reading);
+    reopened
+        .track(t(5), OTHER, two_way("y"), &node("a"), replica("/y"))
+        .unwrap();
+    let (hlc, _) = reopened.store().get(&item_key(OTHER)).unwrap().latest();
+    assert!(*hlc > reading);
+}
+
+#[test]
+fn nodes_publish_their_device_ids() {
+    let id = |s: &str| DeviceId::new(s).unwrap();
+    let first = id("MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD");
+    let second = id("AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-2222222");
+    let (mut a, mut b) = (db("a"), db("b"));
+    a.set_device_id(t(1), first.clone()).unwrap();
+    b.set_device_id(t(1), second).unwrap();
+    sync(&mut a, &mut b, t(2));
+    let config = b.config();
+    assert_eq!(config.nodes.len(), 2);
+    assert_eq!(config.nodes[&node("a")].device_id, first);
+    assert_eq!(config.problems, []);
 }
 
 #[test]

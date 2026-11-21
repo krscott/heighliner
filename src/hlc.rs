@@ -86,6 +86,17 @@ impl Clock {
         }
     }
 
+    /// The latest reading taken or observed, to persist so that a reopened
+    /// clock resumes after it.
+    pub fn last(&self) -> Hlc {
+        let (wall, counter) = self.last;
+        Hlc {
+            wall,
+            counter,
+            node: self.node.clone(),
+        }
+    }
+
     /// Records a reading seen elsewhere, so the next tick is later than it.
     pub fn observe(&mut self, seen: &Hlc) {
         self.last = self.last.max((seen.wall, seen.counter));

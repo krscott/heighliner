@@ -385,6 +385,81 @@ impl Replica {
     }
 }
 
+/// A Syncthing device ID, in Syncthing's canonical form: eight groups of
+/// seven base32 characters, separated by `-`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct DeviceId(String);
+
+impl DeviceId {
+    pub fn new(id: impl Into<String>) -> Result<Self, InvalidValue> {
+        let id = id.into().to_ascii_uppercase();
+        let groups: Vec<&str> = id.split('-').collect();
+        let valid = groups.len() == 8
+            && groups.iter().all(|group| {
+                group.len() == 7
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+            });
+        if !valid {
+            return Err(InvalidValue {
+                what: "Syncthing device ID",
+                value: id,
+                reason: "must be eight dash-separated groups of seven base32 characters",
+            });
+        }
+        Ok(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for DeviceId {
+    type Error = InvalidValue;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        Self::new(id)
+    }
+}
+
+impl From<DeviceId> for String {
+    fn from(id: DeviceId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What a Node publishes about itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    /// The device ID of the Node's Syncthing instance.
+    pub device_id: DeviceId,
+    #[serde(flatten)]
+    unknown_fields: UnknownFields,
+}
+
+impl NodeInfo {
+    pub fn new(device_id: DeviceId) -> Self {
+        Self {
+            device_id,
+            unknown_fields: UnknownFields::new(),
+        }
+    }
+
+    /// Carries over the fields of `original` that this version doesn't know.
+    pub(crate) fn keep_unknown_fields(&mut self, original: Self) {
+        self.unknown_fields = original.unknown_fields;
+    }
+}
+
 /// What a Replica knows about its own freshness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicaState {
@@ -443,6 +518,22 @@ mod tests {
             "!(?i)(?d)x",
         ] {
             assert!(ExcludePattern::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn device_id_validation() {
+        let id = "MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD";
+        assert_eq!(DeviceId::new(id).unwrap().as_str(), id);
+        assert_eq!(DeviceId::new(id.to_lowercase()).unwrap().as_str(), id);
+        for bad in [
+            "",
+            "MFZWI3D",
+            &id[..id.len() - 1],
+            &id.replace('-', ""),
+            &id.replace('M', "1"),
+        ] {
+            assert!(DeviceId::new(bad).is_err(), "{bad:?}");
         }
     }
 

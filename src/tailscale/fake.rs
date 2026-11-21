@@ -5,13 +5,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use super::{Device, Error, Identity, LocalApi, Tailnet, UserId};
+use crate::model::NodeId;
 
 /// What status reports.
 struct Devices {
     me: Device,
     others: Vec<Device>,
 }
-use crate::model::NodeId;
 
 /// An untagged device named `name`, with node ID `n-<name>`, at `ip`.
 pub(crate) fn device(name: &str, user: UserId, ip: &str) -> Device {

@@ -25,6 +25,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::model::NodeId;
 use crate::tailscale::{self, Identity, LocalApi, Owner, Tailnet};
@@ -116,13 +117,14 @@ impl<T: LocalApi> Authorizer<T> {
 
     /// Identifies the caller at `addr`, if it may make requests.
     pub async fn authorize(&self, addr: SocketAddr) -> Result<Identity, Denied> {
+        let identity = match self.api.whois(addr).await {
+            Ok(Some(identity)) if self.owner.owns(identity.user, identity.tagged) => identity,
+            Ok(Some(identity)) => return Err(Denied::NotOwned(identity)),
+            Ok(None) => return Err(Denied::NotOnTailnet(addr)),
+            Err(error) => return Err(Denied::Lookup(error)),
+        };
         self.check_owner().await?;
-        match self.api.whois(addr).await {
-            Ok(Some(identity)) if self.owner.owns(identity.user, identity.tagged) => Ok(identity),
-            Ok(Some(identity)) => Err(Denied::NotOwned(identity)),
-            Ok(None) => Err(Denied::NotOnTailnet(addr)),
-            Err(error) => Err(Denied::Lookup(error)),
-        }
+        Ok(identity)
     }
 
     /// Checks that this device is still the one, with the same owner, that
@@ -155,6 +157,15 @@ pub async fn serve<T: LocalApi>(
 /// How long a caller has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many connections may be waiting to be authorized or being refused
+/// at once. Beyond that, new connections are closed at once, so callers
+/// that aren't the owner's can't use up file descriptors.
+const MAX_UNAUTHORIZED: usize = 256;
+
+/// How long a refused connection is kept open for the caller to read the
+/// answer.
+const REFUSE_LINGER: Duration = Duration::from_secs(1);
+
 async fn serve_with<T: LocalApi>(
     listener: TcpListener,
     router: Router,
@@ -165,6 +176,7 @@ async fn serve_with<T: LocalApi>(
         authorizer.clone(),
         still_owned,
     ));
+    let unauthorized = Arc::new(Semaphore::new(MAX_UNAUTHORIZED));
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -175,11 +187,16 @@ async fn serve_with<T: LocalApi>(
                 continue;
             }
         };
+        let Ok(permit) = unauthorized.clone().try_acquire_owned() else {
+            tracing::debug!(%addr, "too many unauthorized connections; closing");
+            continue;
+        };
         let authorizer = authorizer.clone();
         let router = router.clone();
         tokio::spawn(async move {
             match authorizer.authorize(addr).await {
                 Ok(identity) => {
+                    drop(permit);
                     let service = TowerToHyperService::new(router.layer(Extension(identity)));
                     let connection = http1::Builder::new()
                         .timer(TokioTimer::new())
@@ -189,14 +206,14 @@ async fn serve_with<T: LocalApi>(
                         tracing::debug!(%addr, %error, "connection ended");
                     }
                 }
-                Err(denied) => refuse(stream, &denied, header_timeout).await,
+                Err(denied) => refuse(stream, &denied).await,
             }
         });
     }
 }
 
 /// Sends `denied`'s answer without reading the request, then closes.
-async fn refuse(mut stream: TcpStream, denied: &Denied, timeout: Duration) {
+async fn refuse(mut stream: TcpStream, denied: &Denied) {
     let (status, body) = denied.answer();
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -211,7 +228,7 @@ async fn refuse(mut stream: TcpStream, denied: &Denied, timeout: Duration) {
         while stream.read(&mut discard).await? > 0 {}
         io::Result::Ok(())
     };
-    let _ = tokio::time::timeout(timeout, send).await;
+    let _ = tokio::time::timeout(REFUSE_LINGER, send).await;
 }
 
 async fn still_owned<T: LocalApi>(

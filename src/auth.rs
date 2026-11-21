@@ -4,13 +4,14 @@
 //! Tailscale's WhoIs identifies the device behind a connection, so this
 //! needs no keys of its own. It relies on the caller's address being its
 //! real tailnet address, so servers listen only on this Node's Tailscale
-//! addresses.
+//! addresses. Anything that sends from an owned device's tailnet address
+//! passes, including other local users and traffic the device forwards;
+//! Nodes are single-user devices.
 
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
@@ -22,20 +23,15 @@ use tokio::net::TcpListener;
 use crate::model::NodeId;
 use crate::tailscale::{self, Identity, LocalApi, Owner};
 
-/// How often an Authorizer checks that this device still has its owner.
-const RECHECK_EVERY: Duration = Duration::from_secs(30);
-
 /// Checks callers against the user who owns this Node.
 ///
-/// The owner is read when the Authorizer is created and checked again
-/// every [`RECHECK_EVERY`]. While this device's login or tags differ from
-/// when it was created, every request is refused.
+/// The owner is read when the Authorizer is created. Each request also
+/// checks that this device still has that owner, so while its login or
+/// tags differ, every request is refused.
 pub struct Authorizer<T> {
     api: T,
     me: NodeId,
     owner: Owner,
-    recheck_every: Duration,
-    checked_at: Mutex<Instant>,
 }
 
 /// Why a caller was refused.
@@ -95,17 +91,11 @@ impl IntoResponse for Denied {
 impl<T: LocalApi> Authorizer<T> {
     /// Reads this Node's owner from `api`. Fails if this device is tagged.
     pub async fn new(api: T) -> Result<Self, tailscale::Error> {
-        Self::with_recheck(api, RECHECK_EVERY).await
-    }
-
-    async fn with_recheck(api: T, recheck_every: Duration) -> Result<Self, tailscale::Error> {
         let tailnet = api.status().await?;
         Ok(Self {
             owner: tailnet.owner(),
             me: tailnet.me().id.clone(),
             api,
-            recheck_every,
-            checked_at: Mutex::new(Instant::now()),
         })
     }
 
@@ -120,20 +110,13 @@ impl<T: LocalApi> Authorizer<T> {
         }
     }
 
-    /// Checks that this device still has its owner, if it's time to.
+    /// Checks that this device is still the one, with the same owner, that
+    /// the Authorizer was created for.
     async fn check_owner(&self) -> Result<(), Denied> {
-        if self.checked_at.lock().unwrap().elapsed() < self.recheck_every {
-            return Ok(());
-        }
-        let tailnet = match self.api.status().await {
-            Ok(tailnet) => tailnet,
-            Err(tailscale::Error::Tagged) => return Err(Denied::OwnerChanged),
-            Err(error) => return Err(Denied::Lookup(error)),
-        };
-        if tailnet.me().id != self.me || tailnet.owner() != self.owner {
+        let me = self.api.this_device().await.map_err(Denied::Lookup)?;
+        if me.id != self.me || !self.owner.owns(me.user, me.tagged) {
             return Err(Denied::OwnerChanged);
         }
-        *self.checked_at.lock().unwrap() = Instant::now();
         Ok(())
     }
 }
@@ -266,15 +249,16 @@ mod tests {
         let server = start(fake()).await;
         let (status, body) = get_from("127.0.0.5", server, "/").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body, "can't identify the caller right now; see heighliner's log");
+        assert_eq!(
+            body,
+            "can't identify the caller right now; see heighliner's log"
+        );
     }
 
     #[tokio::test]
     async fn tagging_this_device_while_running_refuses_requests() {
         let fake = fake();
-        let authorizer = Authorizer::with_recheck(fake.clone(), Duration::ZERO)
-            .await
-            .unwrap();
+        let authorizer = Authorizer::new(fake.clone()).await.unwrap();
         let laptop = "127.0.0.2:1".parse().unwrap();
         assert!(authorizer.authorize(laptop).await.is_ok());
 

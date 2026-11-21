@@ -123,6 +123,10 @@ pub trait LocalApi: Send + Sync + 'static {
     /// Fails with [`Error::Tagged`] if this device is tagged.
     fn status(&self) -> impl Future<Output = Result<Tailnet, Error>> + Send;
 
+    /// This device alone, which is cheaper to ask for than the whole
+    /// tailnet.
+    fn this_device(&self) -> impl Future<Output = Result<Device, Error>> + Send;
+
     /// Identifies the device a TCP connection from `addr` comes from, or
     /// `None` if `addr` isn't on the tailnet.
     fn whois(
@@ -280,20 +284,22 @@ fn decode<T: DeserializeOwned>(path: &str, status: StatusCode, body: &[u8]) -> R
     })
 }
 
+impl Client {
+    async fn get_status(&self, path: &str) -> Result<StatusResponse, Error> {
+        let (status, body) = self.get(path).await?;
+        decode(path, status, &body)
+    }
+}
+
 impl LocalApi for Client {
     async fn status(&self) -> Result<Tailnet, Error> {
         const PATH: &str = "/localapi/v0/status";
-        let (status, body) = self.get(PATH).await?;
-        // Without a network map, the rest of the answer holds zero values,
-        // so look at the state first.
-        let BackendState { backend_state } = decode(PATH, status, &body)?;
-        if backend_state != "Running" {
-            return Err(Error::NotConnected {
-                state: backend_state,
-            });
-        }
-        let status: StatusResponse = decode(PATH, status, &body)?;
-        status.into_tailnet()
+        self.get_status(PATH).await?.into_tailnet(PATH)
+    }
+
+    async fn this_device(&self) -> Result<Device, Error> {
+        const PATH: &str = "/localapi/v0/status?peers=false";
+        self.get_status(PATH).await?.take_me(PATH)
     }
 
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {
@@ -334,15 +340,12 @@ fn is_tagged(tags: Option<Vec<String>>) -> bool {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct BackendState {
-    backend_state: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct StatusResponse {
-    #[serde(rename = "Self")]
-    me: PeerStatus,
+    backend_state: String,
+    /// Decoded only when connected: without a network map, tailscaled
+    /// fills it with zero values.
+    #[serde(rename = "Self", default)]
+    me: serde_json::Value,
     /// Keyed by node key. Each is decoded on its own, since tailscaled can
     /// list a device it knows only partly, without a stable ID.
     peer: Option<BTreeMap<String, serde_json::Value>>,
@@ -376,7 +379,23 @@ impl PeerStatus {
 }
 
 impl StatusResponse {
-    fn into_tailnet(self) -> Result<Tailnet, Error> {
+    /// This device, if tailscaled is connected.
+    fn take_me(&mut self, path: &str) -> Result<Device, Error> {
+        if self.backend_state != "Running" {
+            return Err(Error::NotConnected {
+                state: self.backend_state.clone(),
+            });
+        }
+        let me: PeerStatus =
+            serde_json::from_value(self.me.take()).map_err(|source| Error::Decode {
+                path: path.to_owned(),
+                source,
+            })?;
+        Ok(me.into_device())
+    }
+
+    fn into_tailnet(mut self, path: &str) -> Result<Tailnet, Error> {
+        let me = self.take_me(path)?;
         let others = self
             .peer
             .unwrap_or_default()
@@ -395,7 +414,7 @@ impl StatusResponse {
                 }
             })
             .collect();
-        Tailnet::new(self.me.into_device(), others)
+        Tailnet::new(me, others)
     }
 }
 

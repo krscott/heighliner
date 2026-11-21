@@ -82,7 +82,7 @@ fn whois_json() -> Value {
 #[test]
 fn status_is_read() {
     let status: StatusResponse = serde_json::from_value(status_json("Running")).unwrap();
-    let tailnet = status.into_tailnet().unwrap();
+    let tailnet = status.into_tailnet("/status").unwrap();
     assert_eq!(tailnet.me().id.as_str(), "nSELF");
     assert_eq!(tailnet.me().name, "desktop");
     assert_eq!(tailnet.me().user, OWNER);
@@ -91,7 +91,11 @@ fn status_is_read() {
     assert_eq!(tailnet.others().len(), 3);
     let owned: Vec<_> = tailnet.owned_devices().map(|d| d.name.as_str()).collect();
     assert_eq!(owned, ["laptop"]);
-    let server = tailnet.others().iter().find(|d| d.name == "server").unwrap();
+    let server = tailnet
+        .others()
+        .iter()
+        .find(|d| d.name == "server")
+        .unwrap();
     assert!(server.tagged);
 }
 
@@ -100,7 +104,7 @@ fn a_tagged_device_has_no_tailnet() {
     let mut json = status_json("Running");
     json["Self"]["Tags"] = json!(["tag:server"]);
     let status: StatusResponse = serde_json::from_value(json).unwrap();
-    assert!(matches!(status.into_tailnet(), Err(Error::Tagged)));
+    assert!(matches!(status.into_tailnet("/status"), Err(Error::Tagged)));
 }
 
 #[test]
@@ -201,6 +205,7 @@ async fn client_talks_to_tailscaled() {
 
     let tailnet = client.status().await.unwrap();
     assert_eq!(tailnet.me().name, "desktop");
+    assert_eq!(client.this_device().await.unwrap(), *tailnet.me());
 
     let laptop = client
         .whois("100.64.0.2:41641".parse().unwrap())
@@ -251,5 +256,9 @@ async fn status_before_login_says_what_to_do() {
     let client = serve_fake_tailscaled(dir.path(), json).await;
     let error = client.status().await.unwrap_err();
     assert!(matches!(&error, Error::NotConnected { state } if state == "NeedsLogin"));
+    assert!(matches!(
+        client.this_device().await,
+        Err(Error::NotConnected { .. })
+    ));
     assert!(error.to_string().contains("tailscale up"), "{error}");
 }

@@ -83,6 +83,10 @@ impl LocalApi for Fake {
         Tailnet::new(devices.me.clone(), devices.others.clone())
     }
 
+    async fn this_device(&self) -> Result<Device, Error> {
+        Ok(self.devices.lock().unwrap().me.clone())
+    }
+
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {
         if self.failing_whois.contains(&addr.ip()) {
             return Err(Error::Timeout {

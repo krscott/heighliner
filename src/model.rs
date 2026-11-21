@@ -197,6 +197,9 @@ impl ExcludePattern {
             "must not start with # (write [#] for a literal #)"
         } else if pattern.contains("(?d)") {
             "must not use the (?d) flag"
+        } else if !ranges_closed(&pattern) {
+            // Syncthing ignores nothing while its patterns don't parse.
+            "must close every [ with a ] after at least one character"
         } else {
             return Ok(Self(pattern));
         };
@@ -210,6 +213,36 @@ impl ExcludePattern {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Whether every `[` in a glob starts a range closed by a `]` after at
+/// least one character, as Syncthing needs to parse it.
+fn ranges_closed(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' => {
+                let mut first = true;
+                loop {
+                    match chars.next() {
+                        None => return false,
+                        Some(']') if !first => break,
+                        Some('!' | '^') if first => {}
+                        Some('\\') => {
+                            chars.next();
+                            first = false;
+                        }
+                        Some(_) => first = false,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 impl TryFrom<String> for ExcludePattern {
@@ -581,7 +614,15 @@ mod tests {
 
     #[test]
     fn exclude_pattern_validation() {
-        for ok in ["*.tmp", "!keep", "(?i)cache", "// comment", "a#b"] {
+        for ok in [
+            "*.tmp",
+            "!keep",
+            "(?i)cache",
+            "// comment",
+            "a#b",
+            "[#]",
+            "{a,b}",
+        ] {
             assert!(ExcludePattern::new(ok).is_ok(), "{ok}");
         }
         assert_eq!(ExcludePattern::new("  *.tmp \t").unwrap().as_str(), "*.tmp");
@@ -594,6 +635,9 @@ mod tests {
             "#escape=\\",
             "(?d)*",
             "!(?i)(?d)x",
+            "[",
+            "a[b",
+            "[]",
         ] {
             assert!(ExcludePattern::new(bad).is_err(), "{bad:?}");
         }

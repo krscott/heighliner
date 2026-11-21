@@ -223,6 +223,18 @@ impl Queue {
                 self.give_back(waiting);
                 continue;
             }
+            // Directories of Replicas not configured yet wait for them.
+            let mut waiting = waiting;
+            let mut later = Waiting::default();
+            if !waiting.sweep {
+                let ready: BTreeSet<ItemId> = roots.iter().map(|root| root.item).collect();
+                let (now, not_yet) = mem::take(&mut waiting.dirs)
+                    .into_iter()
+                    .partition(|(item, _)| ready.contains(item));
+                waiting.dirs = now;
+                later.dirs = not_yet;
+            }
+            self.give_back(later);
             // Each move is one rename, so work cut short by the daemon
             // stopping leaves no file half moved.
             let _ = tokio::task::spawn_blocking(move || waiting.run(roots)).await;

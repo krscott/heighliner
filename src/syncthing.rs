@@ -944,6 +944,10 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
     let ignore_file = path.join(IGNORE_FILE);
     match fs::read_dir(path) {
         Ok(entries) => {
+            // A .heighliner that isn't heighliner's holds the user's files,
+            // which every folder ignores, so the path is refused even
+            // with adopt.
+            conflicts::has_store(path).map_err(|error| Outcome::PathError(error.to_string()))?;
             for entry in entries {
                 let name = entry.map_err(error)?.file_name();
                 if name == MARKER

@@ -26,12 +26,13 @@
 //! blocks; paths are relative to a Replica's root and use `/`, and
 //! symlinks are never followed.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -51,8 +52,11 @@ pub const STORE_PATTERN: &str = "/.heighliner";
 const CONFLICTS: &str = "conflicts";
 
 /// A file in [`STORE`], written when heighliner sets a Replica up; its
-/// modification time says when.
+/// modification time says when, and its content that the store is
+/// heighliner's.
 const SET_UP: &str = "set-up";
+
+const SET_UP_CONTENT: &str = "heighliner keeps this replica's data conflicts here\n";
 
 const CONFLICT: &str = ".sync-conflict-";
 const MARKER: &str = ".stfolder";
@@ -65,13 +69,21 @@ const RESOLVED: &str = "kept-";
 /// How far a conflict copy's name's local time can be from UTC.
 const MAX_UTC_OFFSET: Duration = Duration::from_secs(14 * 60 * 60);
 
-/// Held for each operation, so that two never act on one conflict.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+/// A lock for each Replica's root, held for each operation on it, so that
+/// two never act on one conflict, while a hung disk holds up only its own.
+static LOCKS: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
 
-fn one_at_a_time() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME
+/// Runs `operation` on the Replica at `root` once no other is running on
+/// it.
+fn one_at_a_time<R>(root: &Path, operation: impl FnOnce() -> R) -> R {
+    let lock = LOCKS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(root.to_owned())
+        .or_default()
+        .clone();
+    let _held: MutexGuard<'_, ()> = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    operation()
 }
 
 /// A conflict between two changes to one file, kept on this Node.
@@ -101,6 +113,8 @@ pub enum Error {
     NotFound(String),
     /// The file a step would create already exists.
     Exists(PathBuf),
+    /// The Replica has a [`STORE`] that heighliner didn't make.
+    Foreign,
     Io {
         path: PathBuf,
         source: io::Error,
@@ -114,6 +128,10 @@ impl fmt::Display for Error {
             Self::Unsafe(path) => write!(f, "{path} isn't a plain path within the replica"),
             Self::NotFound(version) => write!(f, "there's no data conflict {version}"),
             Self::Exists(path) => write!(f, "{} already exists", path.display()),
+            Self::Foreign => write!(
+                f,
+                "its {STORE} wasn't made by heighliner; move it aside so heighliner can keep data conflicts there"
+            ),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
@@ -212,14 +230,15 @@ fn leaf_time(name: &str, prefix: &str) -> Option<u64> {
 }
 
 /// The unresolved conflict's file in a conflict's directory, and when it
-/// was moved there.
+/// was moved there. One a swap was cut short with is unresolved again:
+/// whichever side it holds, the other is the file's content.
 fn unresolved(dir: &Path) -> Result<Option<(PathBuf, u64)>, Error> {
     for entry in fs::read_dir(dir).map_err(io_error(dir))? {
         let entry = entry.map_err(io_error(dir))?;
         if let Some(seconds) = entry
             .file_name()
             .to_str()
-            .and_then(|name| leaf_time(name, UNRESOLVED))
+            .and_then(|name| leaf_time(name, UNRESOLVED).or_else(|| leaf_time(name, SWAPPING)))
             && entry.file_type().map_err(io_error(dir))?.is_file()
         {
             return Ok(Some((entry.path(), seconds)));
@@ -271,6 +290,9 @@ fn directory(root: &Path, parts: &[&str], create: bool) -> Result<Option<PathBuf
 
 /// The directory `parts` in the conflicts' store.
 fn stored(root: &Path, parts: &[&str], create: bool) -> Result<Option<PathBuf>, Error> {
+    if !has_store(root)? && !create {
+        return Ok(None);
+    }
     let mut all = vec![STORE, CONFLICTS];
     all.extend_from_slice(parts);
     directory(root, &all, create)
@@ -284,13 +306,38 @@ fn check_mounted(root: &Path) -> Result<(), Error> {
     }
 }
 
+/// Whether the Replica at `root` has a [`STORE`], and refuses one
+/// heighliner didn't make, which holds the user's files.
+pub fn has_store(root: &Path) -> Result<bool, Error> {
+    let store = root.join(STORE);
+    match fs::symlink_metadata(&store) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(Error::Foreign),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io_error(&store)(source)),
+    }
+    let set_up = store.join(SET_UP);
+    match fs::symlink_metadata(&set_up) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == SET_UP_CONTENT.len() as u64 => {}
+        Ok(_) => return Err(Error::Foreign),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Error::Foreign),
+        Err(source) => return Err(io_error(&set_up)(source)),
+    }
+    let content = fs::read(&set_up).map_err(io_error(&set_up))?;
+    if content == SET_UP_CONTENT.as_bytes() {
+        Ok(true)
+    } else {
+        Err(Error::Foreign)
+    }
+}
+
 /// Records that heighliner sets up the Replica at `root` now.
 pub fn mark_set_up(root: &Path) -> Result<(), Error> {
-    let _one = one_at_a_time();
-    mark(root)
+    one_at_a_time(root, || mark(root))
 }
 
 fn mark(root: &Path) -> Result<(), Error> {
+    has_store(root)?;
     let store = directory(root, &[STORE], true)?.expect("created");
     let path = store.join(SET_UP);
     match fs::remove_file(&path) {
@@ -299,26 +346,20 @@ fn mark(root: &Path) -> Result<(), Error> {
         Err(source) => return Err(io_error(&path)(source)),
     }
     fs::File::create_new(&path)
-        .map(drop)
+        .and_then(|mut file| io::Write::write_all(&mut file, SET_UP_CONTENT.as_bytes()))
         .map_err(io_error(&path))
 }
 
 /// When heighliner set up the Replica at `root`. A Replica set up before
 /// this was recorded counts as set up now.
 fn set_up_at(root: &Path) -> Result<SystemTime, Error> {
-    let path = root.join(STORE).join(SET_UP);
-    let metadata = match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            mark(root)?;
-            fs::symlink_metadata(&path)
-        }
-        found => found,
-    };
-    match metadata {
-        Ok(metadata) if metadata.is_file() => metadata.modified().map_err(io_error(&path)),
-        Ok(_) => Err(Error::Unsafe(format!("{STORE}/{SET_UP}"))),
-        Err(source) => Err(io_error(&path)(source)),
+    if !has_store(root)? {
+        mark(root)?;
     }
+    let path = root.join(STORE).join(SET_UP);
+    fs::symlink_metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(io_error(&path))
 }
 
 /// Whether a conflict copy was made after `since`: Syncthing's rename to
@@ -358,7 +399,12 @@ fn move_new(from: &Path, to: &Path) -> Result<(), Error> {
         // A filesystem without it, such as NFS: a hard link also refuses
         // to replace a file.
         Err(rustix::io::Errno::INVAL) => match fs::hard_link(from, to) {
-            Ok(()) => fs::remove_file(from).map_err(io_error(from)),
+            // Moved once linked; an extra link left behind holds the same
+            // file, so it can't lose anything.
+            Ok(()) => {
+                let _ = fs::remove_file(from);
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 Err(Error::Exists(to.to_owned()))
             }
@@ -380,14 +426,15 @@ pub struct Collected {
 /// Moves the conflict copies directly in the directory `dir` of the Replica
 /// at `root` into the store.
 pub fn collect(root: &Path, dir: &str) -> Result<Collected, Error> {
-    let _one = one_at_a_time();
-    check_mounted(root)?;
-    let since = set_up_at(root)?;
-    let mut collected = Collected::default();
-    if let Err(error) = collect_into(root, since, dir, &mut collected) {
-        collected.failed.push(error);
-    }
-    Ok(collected)
+    one_at_a_time(root, || {
+        check_mounted(root)?;
+        let since = set_up_at(root)?;
+        let mut collected = Collected::default();
+        if let Err(error) = collect_into(root, since, dir, &mut collected) {
+            collected.failed.push(error);
+        }
+        Ok(collected)
+    })
 }
 
 /// Whether a directory at the root is internal, holding no conflict
@@ -455,32 +502,33 @@ fn join(parts: &[&str], name: &str) -> String {
 
 /// Moves every conflict copy in the Replica at `root` into the store.
 pub fn sweep(root: &Path) -> Result<Collected, Error> {
-    let _one = one_at_a_time();
-    check_mounted(root)?;
-    let since = set_up_at(root)?;
-    let mut collected = Collected::default();
-    let mut dirs = vec![String::new()];
-    while let Some(dir) = dirs.pop() {
-        let mut visit = || -> Result<(), Error> {
-            collect_into(root, since, &dir, &mut collected)?;
-            let path = root.join(&dir);
-            for entry in fs::read_dir(&path).map_err(io_error(&path))? {
-                let entry = entry.map_err(io_error(&path))?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                let skipped = dir.is_empty() && internal(&name);
-                if !skipped && entry.file_type().map_err(io_error(&path))?.is_dir() {
-                    dirs.push(join(&components(&dir)?, &name));
+    one_at_a_time(root, || {
+        check_mounted(root)?;
+        let since = set_up_at(root)?;
+        let mut collected = Collected::default();
+        let mut dirs = vec![String::new()];
+        while let Some(dir) = dirs.pop() {
+            let mut visit = || -> Result<(), Error> {
+                collect_into(root, since, &dir, &mut collected)?;
+                let path = root.join(&dir);
+                for entry in fs::read_dir(&path).map_err(io_error(&path))? {
+                    let entry = entry.map_err(io_error(&path))?;
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    let skipped = dir.is_empty() && internal(&name);
+                    if !skipped && entry.file_type().map_err(io_error(&path))?.is_dir() {
+                        dirs.push(join(&components(&dir)?, &name));
+                    }
                 }
+                Ok(())
+            };
+            if let Err(error) = visit() {
+                collected.failed.push(error);
             }
-            Ok(())
-        };
-        if let Err(error) = visit() {
-            collected.failed.push(error);
         }
-    }
-    Ok(collected)
+        Ok(collected)
+    })
 }
 
 /// Visits each conflict's directory in the store of the Replica at `root`,
@@ -528,51 +576,53 @@ fn data_conflict(parts: &[&str], conflict: &ConflictName<'_>, moved: u64) -> Dat
 
 /// The Data Conflicts kept in the Replica at `root`.
 pub fn list(root: &Path) -> Result<Vec<DataConflict>, Error> {
-    let _one = one_at_a_time();
-    check_mounted(root)?;
-    let mut conflicts = Vec::new();
-    each_conflict(root, |dir, parts, conflict| {
-        if let Some((_, moved)) = unresolved(dir)? {
-            conflicts.push(data_conflict(parts, conflict, moved));
-        }
-        Ok(())
-    })?;
-    conflicts.sort_by(|a, b| (&a.path, &a.at).cmp(&(&b.path, &b.at)));
-    Ok(conflicts)
+    one_at_a_time(root, || {
+        check_mounted(root)?;
+        let mut conflicts = Vec::new();
+        each_conflict(root, |dir, parts, conflict| {
+            if let Some((_, moved)) = unresolved(dir)? {
+                conflicts.push(data_conflict(parts, conflict, moved));
+            }
+            Ok(())
+        })?;
+        conflicts.sort_by(|a, b| (&a.path, &a.at).cmp(&(&b.path, &b.at)));
+        Ok(conflicts)
+    })
 }
 
 /// Removes the sides of conflicts, resolved or not, that have been in the
 /// Replica at `root`'s store for longer than `retention` at `now`, and
 /// returns how many.
 pub fn expire(root: &Path, retention: Duration, now: Timestamp) -> Result<usize, Error> {
-    let _one = one_at_a_time();
-    check_mounted(root)?;
-    let now = now.as_millis() / 1000;
-    let mut removed = 0;
-    each_conflict(root, |dir, _, _| {
-        for entry in fs::read_dir(dir).map_err(io_error(dir))? {
-            let entry = entry.map_err(io_error(dir))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(moved) = [UNRESOLVED, SWAPPING, RESOLVED]
-                .into_iter()
-                .find_map(|prefix| leaf_time(&name, prefix))
-            else {
-                continue;
-            };
-            if entry.file_type().map_err(io_error(dir))?.is_file()
-                && now.saturating_sub(moved) > retention.as_secs()
-            {
-                fs::remove_file(entry.path()).map_err(io_error(&entry.path()))?;
-                removed += 1;
+    one_at_a_time(root, || {
+        check_mounted(root)?;
+        let now = now.as_millis() / 1000;
+        let mut removed = 0;
+        each_conflict(root, |dir, _, _| {
+            for entry in fs::read_dir(dir).map_err(io_error(dir))? {
+                let entry = entry.map_err(io_error(dir))?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(moved) = [UNRESOLVED, SWAPPING, RESOLVED]
+                    .into_iter()
+                    .find_map(|prefix| leaf_time(&name, prefix))
+                else {
+                    continue;
+                };
+                if entry.file_type().map_err(io_error(dir))?.is_file()
+                    && now.saturating_sub(moved) > retention.as_secs()
+                {
+                    fs::remove_file(entry.path()).map_err(io_error(&entry.path()))?;
+                    removed += 1;
+                }
             }
-        }
-        // Gone once empty; one still holding something stays.
-        let _ = fs::remove_dir(dir);
-        Ok(())
-    })?;
-    Ok(removed)
+            // Gone once empty; one still holding something stays.
+            let _ = fs::remove_dir(dir);
+            Ok(())
+        })?;
+        Ok(removed)
+    })
 }
 
 /// The Data Conflict `version` in the Replica at `root`, and its losing
@@ -595,10 +645,11 @@ fn sibling(loser: &Path, prefix: &str) -> PathBuf {
 
 /// Keeps the winning change of the Data Conflict `version`.
 pub fn keep(root: &Path, version: &str) -> Result<DataConflict, Error> {
-    let _one = one_at_a_time();
-    let (conflict, loser) = find(root, version)?;
-    move_new(&loser, &sibling(&loser, RESOLVED))?;
-    Ok(conflict)
+    one_at_a_time(root, || {
+        let (conflict, loser) = find(root, version)?;
+        move_new(&loser, &sibling(&loser, RESOLVED))?;
+        Ok(conflict)
+    })
 }
 
 /// Makes the losing change of the Data Conflict `version` the file's
@@ -607,39 +658,63 @@ pub fn keep(root: &Path, version: &str) -> Result<DataConflict, Error> {
 /// meanwhile is what gets kept rather than lost. Once it returns, the
 /// file has changed.
 pub fn swap(root: &Path, version: &str) -> Result<DataConflict, Error> {
-    let _one = one_at_a_time();
-    let (conflict, loser) = find(root, version)?;
-    let parts = components(&conflict.path)?;
-    let (name, dirs) = parts.split_last().expect("a file's path has a name");
-    let live_dir =
-        directory(root, dirs, false)?.ok_or_else(|| Error::Unsafe(conflict.path.clone()))?;
-    let live = live_dir.join(name);
-    let live_exists = is_file(&live, &conflict.path)?;
-    // Newer than the change it replaces, and changed enough for Syncthing
-    // to look at its content again. Setting it needs only ownership.
-    fs::File::open(&loser)
-        .and_then(|file| file.set_modified(SystemTime::now()))
-        .map_err(io_error(&loser))?;
-    // Timed afresh, so that whichever content it holds when a swap is cut
-    // short gets a whole Retention Window.
-    let swapping = sibling(&loser, SWAPPING);
-    move_new(&loser, &swapping)?;
-    let installed = if live_exists {
-        renameat_with(CWD, &swapping, CWD, &live, RenameFlags::EXCHANGE)
-            .map_err(|errno| io_error(&live)(errno.into()))
-    } else {
-        move_new(&swapping, &live)
-    };
-    if let Err(error) = installed {
-        let _ = move_new(&swapping, &loser);
-        return Err(error);
-    }
-    if live_exists {
-        // `swapping` now holds what was the file's content. Left as it is
-        // if this fails, it still expires as a kept side does.
-        let _ = move_new(&swapping, &sibling(&loser, RESOLVED));
-    }
-    Ok(conflict)
+    one_at_a_time(root, || {
+        let (conflict, loser) = find(root, version)?;
+        let parts = components(&conflict.path)?;
+        let (name, dirs) = parts.split_last().expect("a file's path has a name");
+        let live_dir =
+            directory(root, dirs, false)?.ok_or_else(|| Error::Unsafe(conflict.path.clone()))?;
+        let live = live_dir.join(name);
+        let live_exists = is_file(&live, &conflict.path)?;
+        // Newer than the change it replaces, and changed enough for Syncthing
+        // to look at its content again. Setting it needs only ownership.
+        fs::File::open(&loser)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+            .map_err(io_error(&loser))?;
+        // Timed afresh, so that whichever content it holds when a swap is cut
+        // short gets a whole Retention Window.
+        // Already so if an earlier swap was cut short.
+        let resumed = loser
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(SWAPPING));
+        let swapping = if resumed {
+            loser.clone()
+        } else {
+            let swapping = sibling(&loser, SWAPPING);
+            move_new(&loser, &swapping)?;
+            swapping
+        };
+        let undo = || {
+            if !resumed {
+                let _ = move_new(&swapping, &loser);
+            }
+        };
+        let installed = if live_exists {
+            renameat_with(CWD, &swapping, CWD, &live, RenameFlags::EXCHANGE)
+                .map_err(|errno| io_error(&live)(errno.into()))
+        } else {
+            move_new(&swapping, &live)
+        };
+        if let Err(error) = installed {
+            undo();
+            return Err(error);
+        }
+        // Syncthing may have put something other than a file there meanwhile,
+        // which stays where it was.
+        if live_exists && !fs::symlink_metadata(&swapping).is_ok_and(|metadata| metadata.is_file())
+        {
+            let _ = renameat_with(CWD, &swapping, CWD, &live, RenameFlags::EXCHANGE);
+            undo();
+            return Err(Error::Unsafe(conflict.path.clone()));
+        }
+        if live_exists {
+            // `swapping` now holds what was the file's content. Left as it is
+            // if this fails, it still expires as a kept side does.
+            let _ = move_new(&swapping, &sibling(&loser, RESOLVED));
+        }
+        Ok(conflict)
+    })
 }
 
 #[cfg(test)]
@@ -952,6 +1027,48 @@ mod tests {
         assert_eq!(read(root, &copy), "again");
         assert_eq!(list(root).unwrap()[0].version, version);
         assert_eq!(read(root, "notes.txt"), "won");
+    }
+
+    #[test]
+    fn a_store_heighliner_didnt_make_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(MARKER)).unwrap();
+        write(root, ".heighliner/set-up", "the user's");
+        write(
+            root,
+            ".heighliner/conflicts/x.sync-conflict-20240101-120000-ABCDEFG/kept-1",
+            "theirs",
+        );
+        assert!(matches!(mark_set_up(root), Err(Error::Foreign)));
+        assert!(matches!(sweep(root), Err(Error::Foreign)));
+        assert!(matches!(
+            expire(root, Duration::ZERO, Timestamp::now()),
+            Err(Error::Foreign)
+        ));
+        assert_eq!(read(root, ".heighliner/set-up"), "the user's");
+        assert!(
+            root.join(".heighliner/conflicts/x.sync-conflict-20240101-120000-ABCDEFG/kept-1")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_swap_cut_short_is_still_a_conflict() {
+        let root = replica();
+        let root = root.path();
+        write(root, &copy(), "lost");
+        write(root, "notes.txt", "won");
+        let conflict = collect(root, "").unwrap().found.remove(0);
+        let loser = only_leaf(root, &conflict.version, UNRESOLVED);
+        // As left by a daemon stopped before the exchange.
+        let (dir, leaf) = loser.rsplit_once('/').unwrap();
+        let swapping = format!("{dir}/{}", leaf.replace(UNRESOLVED, SWAPPING));
+        fs::rename(root.join(&loser), root.join(&swapping)).unwrap();
+        assert_eq!(list(root).unwrap().len(), 1);
+        swap(root, &conflict.version).unwrap();
+        assert_eq!(read(root, "notes.txt"), "lost");
+        assert!(list(root).unwrap().is_empty());
     }
 
     #[test]

@@ -592,21 +592,30 @@ async fn symlinked_aliases_count_as_overlapping() {
 }
 
 #[tokio::test]
-async fn unparseable_excludes_are_reported() {
+async fn excludes_heighliner_accepts_are_ones_syncthing_parses() {
     let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
-    let mut db = tracked("a", &syncthing.dir("docs"));
+    let db = tracked("a", &syncthing.dir("docs"));
     syncthing.reconcile(&db.config(), &alone()).await;
-    db.update_item(Timestamp::now(), ITEM, |item| {
-        item.excludes = vec![ExcludePattern::new("[").unwrap()]
-    })
-    .unwrap();
-    let report = syncthing.reconcile(&db.config(), &alone()).await;
-    assert!(
-        matches!(&report.replicas[&ITEM], Outcome::Failed(error) if error.contains("excludes")),
-        "{:?}",
-        report.replicas[&ITEM]
-    );
-    assert_eq!(syncthing.folder(ITEM).await.unwrap()["paused"], true);
+    let client = syncthing.driver.client();
+    let parses = |pattern: &str| {
+        let lines = vec![pattern.to_owned()];
+        async move {
+            client.set_ignores(ITEM, &lines).await.unwrap();
+            client.ignores(ITEM).await.unwrap().1.is_none()
+        }
+    };
+    for pattern in [
+        "*.tmp", "[#]", "a]b", "x}y", "{a,b}", "{a", "[!x]", "[a-z]", "\\*", "a\\",
+    ] {
+        assert!(ExcludePattern::new(pattern).is_ok(), "{pattern}");
+        assert!(parses(pattern).await, "Syncthing parses {pattern}");
+    }
+    // Refused, as Syncthing would ignore nothing while it can't parse
+    // them.
+    for pattern in ["[", "a[b", "[]", "[!]"] {
+        assert!(ExcludePattern::new(pattern).is_err(), "{pattern}");
+        assert!(!parses(pattern).await, "Syncthing refuses {pattern}");
+    }
 }
 
 #[tokio::test]
@@ -1101,4 +1110,20 @@ async fn a_replica_removed_and_added_again_starts_cleanly() {
         .unwrap();
     let report = syncthing.reconcile(&db.config(), &alone()).await;
     assert_eq!(report.replicas[&ITEM], Outcome::Configured);
+}
+
+#[test]
+fn a_path_with_someone_elses_heighliner_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = path(dir.path().join("adopted"));
+    fs::create_dir_all(Path::new(at.as_str()).join(".heighliner")).unwrap();
+    fs::write(file(&at, ".heighliner/notes"), "the user's").unwrap();
+    assert!(matches!(
+        prepare(&at, true, &[]),
+        Err(Outcome::PathError(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(file(&at, ".heighliner/notes")).unwrap(),
+        "the user's"
+    );
 }

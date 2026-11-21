@@ -657,11 +657,7 @@ impl Driver {
                 .is_none_or(|folder| folder["path"] != local.replica.path().as_str());
             let mut synced = self.sync_ignores(local, false, &mut report.changed).await;
             if synced.is_ok() && fresh && !local.paused {
-                synced = self
-                    .client
-                    .set_folder_paused(local.item_id, false)
-                    .await
-                    .map_err(|error| Outcome::Failed(error.to_string()));
+                synced = self.resume(local).await;
             }
             if let Err(outcome) = synced {
                 report.replicas.insert(local.item_id, outcome);
@@ -692,23 +688,14 @@ impl Driver {
         if lines == wanted {
             return error.map_or(Ok(()), |error| Err(unparsed(error)));
         }
-        self.in_blocking(
-            |path| {
-                Path::new(path.as_str())
-                    .join(MARKER)
-                    .exists()
-                    .then_some(())
-                    .ok_or(Outcome::Missing)
-            },
-            local.replica.path().clone(),
-        )
-        .await?;
         if running {
             self.client
                 .set_folder_paused(local.item_id, true)
                 .await
                 .map_err(failed)?;
         }
+        // Once paused, in case its disk went meanwhile.
+        self.marker_present(local).await?;
         self.client
             .set_ignores(local.item_id, &wanted)
             .await
@@ -719,12 +706,35 @@ impl Driver {
             return Err(unparsed(error));
         }
         if running {
-            self.client
-                .set_folder_paused(local.item_id, false)
-                .await
-                .map_err(failed)?;
+            self.resume(local).await?;
         }
         Ok(())
+    }
+
+    /// Checks that a Replica's marker is there, since Syncthing would
+    /// recreate its path or run on whatever is mounted there instead.
+    async fn marker_present(&self, local: &LocalReplica<'_>) -> Result<(), Outcome> {
+        self.in_blocking(
+            |path| {
+                Path::new(path.as_str())
+                    .join(MARKER)
+                    .exists()
+                    .then_some(())
+                    .ok_or(Outcome::Missing)
+            },
+            local.replica.path().clone(),
+        )
+        .await
+    }
+
+    /// Lets a folder paused while its excludes were checked run, unless
+    /// its marker went meanwhile.
+    async fn resume(&self, local: &LocalReplica<'_>) -> Result<(), Outcome> {
+        self.marker_present(local).await?;
+        self.client
+            .set_folder_paused(local.item_id, false)
+            .await
+            .map_err(|error| Outcome::Failed(error.to_string()))
     }
 
     /// How many local changes a folder has, scanning it first so that none

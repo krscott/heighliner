@@ -323,18 +323,13 @@ pub fn has_store(root: &Path) -> Result<bool, Error> {
     match fs::symlink_metadata(&set_up) {
         Ok(metadata) if metadata.is_file() && metadata.len() == SET_UP_CONTENT.len() as u64 => {}
         Ok(_) => return Err(Error::Foreign),
-        // As left if heighliner stopped while making it.
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                && fs::read_dir(&store).is_ok_and(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .all(|entry| entry.file_name() == SET_UP_STAGED)
-                }) =>
-        {
-            return Ok(false);
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return if half_made(&store)? {
+                Ok(false)
+            } else {
+                Err(Error::Foreign)
+            };
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Error::Foreign),
         Err(source) => return Err(io_error(&set_up)(source)),
     }
     let content = fs::read(&set_up).map_err(io_error(&set_up))?;
@@ -343,6 +338,24 @@ pub fn has_store(root: &Path) -> Result<bool, Error> {
     } else {
         Err(Error::Foreign)
     }
+}
+
+/// Whether `store`, without its `set-up`, is as left if heighliner stopped
+/// while making it: empty, or holding only the start of a staged `set-up`.
+fn half_made(store: &Path) -> Result<bool, Error> {
+    for entry in fs::read_dir(store).map_err(io_error(store))? {
+        let entry = entry.map_err(io_error(store))?;
+        let staged = entry.path();
+        let ours = entry.file_name() == SET_UP_STAGED
+            && entry.file_type().map_err(io_error(&staged))?.is_file()
+            && SET_UP_CONTENT
+                .as_bytes()
+                .starts_with(&fs::read(&staged).map_err(io_error(&staged))?);
+        if !ours {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Records that heighliner sets up the Replica at `root` now.
@@ -1083,7 +1096,11 @@ mod tests {
         mark_set_up(root).unwrap();
         assert!(has_store(root).unwrap());
         fs::remove_file(root.join(STORE).join(SET_UP)).unwrap();
-        write(root, &format!("{STORE}/{SET_UP_STAGED}"), "half");
+        write(
+            root,
+            &format!("{STORE}/{SET_UP_STAGED}"),
+            &SET_UP_CONTENT[..10],
+        );
         mark_set_up(root).unwrap();
         assert!(has_store(root).unwrap());
         // Setting up again only moves its time.
@@ -1092,6 +1109,19 @@ mod tests {
         assert_eq!(
             fs::metadata(root.join(STORE).join(SET_UP)).unwrap().ino(),
             before
+        );
+    }
+
+    #[test]
+    fn a_staged_set_up_that_isnt_heighliners_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(MARKER)).unwrap();
+        write(root, &format!("{STORE}/{SET_UP_STAGED}"), "the user's");
+        assert!(matches!(mark_set_up(root), Err(Error::Foreign)));
+        assert_eq!(
+            read(root, &format!("{STORE}/{SET_UP_STAGED}")),
+            "the user's"
         );
     }
 

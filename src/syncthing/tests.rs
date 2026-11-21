@@ -562,8 +562,47 @@ async fn a_new_replica_through_a_symlink_overlaps_at_once() {
     std::os::unix::fs::symlink(at.as_str(), link.as_str()).unwrap();
     let mut store = tracked("a", &at).store().clone();
     // A new Replica inside the other, reached through the symlink.
-    store.merge(tracked_as(OTHER, "a", &path(file(&link, "inner"))).store(), |_| true);
+    store.merge(
+        tracked_as(OTHER, "a", &path(file(&link, "inner"))).store(),
+        |_| true,
+    );
     let report = syncthing.reconcile(&Config::new(&store), &alone()).await;
     assert_eq!(report.replicas[&ITEM], Outcome::Overlaps);
     assert_eq!(report.replicas[&OTHER], Outcome::Overlaps);
+}
+
+#[tokio::test]
+async fn a_mirror_is_scanned_with_its_new_excludes_before_promotion() {
+    let mut pair = Pair::start(Direction::TwoWay, true).await;
+    // An excluded file made locally on the mirror.
+    fs::write(file(&pair.b_path, "local.tmp"), "mine").unwrap();
+    // The exclude goes, and the mirror is made a peer, in one round.
+    pair.db
+        .update_item(Timestamp::now(), ITEM, |item| item.excludes.clear())
+        .unwrap();
+    pair.db
+        .update_replica(Timestamp::now(), ITEM, &node("b"), |replica| {
+            replica.mirror = false
+        })
+        .unwrap();
+    let (_, b_report) = pair.reconcile().await;
+    assert_eq!(b_report.replicas[&ITEM], Outcome::LocalChanges);
+    assert_eq!(pair.b.folder(ITEM).await.unwrap()["type"], "receiveonly");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!file(&pair.a_path, "local.tmp").exists());
+}
+
+#[tokio::test]
+async fn an_alias_of_overlapping_replicas_overlaps_too() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    fs::create_dir(at.as_str()).unwrap();
+    let alias = syncthing.dir("alias");
+    std::os::unix::fs::symlink(at.as_str(), alias.as_str()).unwrap();
+    let third = ItemId::from_u128(0x123);
+    let mut store = tracked("a", &at).store().clone();
+    store.merge(tracked_as(OTHER, "a", &path(file(&at, "nested"))).store(), |_| true);
+    store.merge(tracked_as(third, "a", &alias).store(), |_| true);
+    let report = syncthing.reconcile(&Config::new(&store), &alone()).await;
+    assert_eq!(report.replicas[&third], Outcome::Overlaps);
 }

@@ -174,7 +174,8 @@ impl fmt::Display for AbsPath {
     }
 }
 
-/// One line of an Item's exclude patterns, in Syncthing's `.stignore` syntax.
+/// One line of an Item's exclude patterns, in Syncthing's `.stignore` syntax,
+/// without the surrounding whitespace Syncthing ignores.
 ///
 /// Directives (`#include`, `#escape`) and the `(?d)` flag are refused: the
 /// flag lets Syncthing delete excluded files.
@@ -185,9 +186,13 @@ pub struct ExcludePattern(String);
 impl ExcludePattern {
     pub fn new(pattern: impl Into<String>) -> Result<Self, InvalidValue> {
         let pattern = pattern.into();
-        let reason = if pattern.trim().is_empty() || pattern.contains(['\n', '\r']) {
+        let pattern = match pattern.trim() {
+            trimmed if trimmed.len() == pattern.len() => pattern,
+            trimmed => trimmed.to_owned(),
+        };
+        let reason = if pattern.is_empty() || pattern.contains(['\n', '\r']) {
             "must be one non-blank line"
-        } else if pattern.trim_start().starts_with('#') {
+        } else if pattern.starts_with('#') {
             "must not start with # (write [#] for a literal #)"
         } else if pattern.contains("(?d)") {
             "must not use the (?d) flag"
@@ -546,6 +551,7 @@ mod tests {
         for ok in ["*.tmp", "!keep", "(?i)cache", "// comment", "a#b"] {
             assert!(ExcludePattern::new(ok).is_ok(), "{ok}");
         }
+        assert_eq!(ExcludePattern::new("  *.tmp \t").unwrap().as_str(), "*.tmp");
         for bad in [
             "",
             " ",

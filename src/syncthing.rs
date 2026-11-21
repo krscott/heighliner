@@ -483,15 +483,21 @@ impl Driver {
                 if was_paused || local.paused {
                     folder_type = "receiveonly";
                 } else {
-                    match self.local_changes_now(&id).await {
+                    // The scan must use the Item's current excludes, or it
+                    // would miss local changes to files they now include.
+                    let scanned = match self.sync_ignores(local).await {
+                        Ok(_) => self.local_changes_now(&id).await.map_err(|error| Outcome::Failed(error.to_string())),
+                        Err(outcome) => Err(outcome),
+                    };
+                    match scanned {
                         Ok(0) => {}
                         Ok(_) => {
                             folder_type = "receiveonly";
                             outcome = Outcome::LocalChanges;
                         }
-                        Err(error) => {
+                        Err(failed) => {
                             folder_type = "receiveonly";
-                            outcome = Outcome::Failed(error.to_string());
+                            outcome = failed;
                         }
                     }
                 }
@@ -632,7 +638,7 @@ impl Driver {
     /// resolved on this machine.
     async fn aliases(&self, locals: &[LocalReplica<'_>]) -> BTreeSet<ItemId> {
         let mut resolved = Vec::new();
-        for local in locals.iter().filter(|local| !local.overlaps) {
+        for local in locals {
             let real = Arc::new(Mutex::new(None));
             let found = real.clone();
             let _ = self

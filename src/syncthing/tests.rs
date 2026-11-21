@@ -860,7 +860,13 @@ async fn syncthing_events_wake_the_watcher() {
     let watcher = {
         let (driver, changed) = (syncthing.driver.clone(), changed.clone());
         let (finished, _) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move { driver.watch(&changed, &finished).await })
+        tokio::spawn(async move {
+            driver
+                .watch(&changed, |seen| {
+                    let _ = finished.send(seen);
+                })
+                .await
+        })
     };
     // Let it catch up with the events so far.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -943,7 +949,13 @@ async fn the_watcher_reports_items_syncthing_finishes() {
     let (finished, mut items) = tokio::sync::mpsc::unbounded_channel();
     let watcher = {
         let (driver, changed) = (pair.b.driver.clone(), changed.clone());
-        tokio::spawn(async move { driver.watch(&changed, &finished).await })
+        tokio::spawn(async move {
+            driver
+                .watch(&changed, |seen| {
+                    let _ = finished.send(seen);
+                })
+                .await
+        })
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
     fs::create_dir(file(&pair.a_path, "sub")).unwrap();
@@ -1061,4 +1073,32 @@ fn an_adopted_paths_conflict_copies_are_left_alone() {
     let swept = conflicts::sweep(Path::new(at.as_str())).unwrap();
     assert!(swept.found.is_empty() && swept.failed.is_empty());
     assert!(file(&at, copy).exists());
+}
+
+#[tokio::test]
+async fn a_replica_removed_and_added_again_starts_cleanly() {
+    let syncthing = Syncthing::start("127.0.0.1", free_port()).await;
+    let at = syncthing.dir("docs");
+    let mut db = added(&at, false);
+    syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(eventually(|| file(&at, MARKER).exists()).await);
+
+    db.remove_replica(Timestamp::now(), ITEM, &node("a"))
+        .unwrap();
+    syncthing.reconcile(&db.config(), &alone()).await;
+    assert!(syncthing.folder(ITEM).await.is_none());
+    // Syncthing removed its marker whole, leaving nothing of its own.
+    let names: Vec<String> = fs::read_dir(at.as_str())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        names.iter().all(|name| !name.starts_with(".stfolder")),
+        "{names:?}"
+    );
+
+    db.add_replica(Timestamp::now(), ITEM, &node("a"), Replica::new(at.clone()))
+        .unwrap();
+    let report = syncthing.reconcile(&db.config(), &alone()).await;
+    assert_eq!(report.replicas[&ITEM], Outcome::Configured);
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use hyper::Method;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 
 use super::{Client, Driver, Error};
 use crate::model::ItemId;
@@ -86,14 +86,11 @@ impl Client {
 impl Driver {
     /// Notifies `changed` whenever Syncthing reports an event after which
     /// a Replica's state may have changed, and when Syncthing stops or
-    /// starts answering again. Sends `seen` each item Syncthing finishes
+    /// starts answering again. Gives `seen` each item Syncthing finishes
     /// syncing, and [`Seen::Missed`] when events may have been missed.
     /// Runs until it is dropped.
-    pub async fn watch(&self, changed: &Notify, seen: &mpsc::UnboundedSender<Seen>) {
-        // Only a dropped daemon stops listening.
-        let send = |what| {
-            let _ = seen.send(what);
-        };
+    pub async fn watch(&self, changed: &Notify, seen: impl Fn(Seen)) {
+        let send = &seen;
         let mut since = self.client.latest_event().await.unwrap_or(0);
         let mut failing = false;
         loop {

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
@@ -253,7 +253,7 @@ pub struct Daemon<T> {
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
     driver: Option<Driver>,
-    replicas: Mutex<Replicas>,
+    replicas: Arc<Mutex<Replicas>>,
 }
 
 /// A reconcile: the configuration it applied, and its outcome for each
@@ -317,7 +317,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             db: Arc::new(Mutex::new(db)),
             saved,
             driver: None,
-            replicas: Mutex::new(Replicas {
+            replicas: Arc::new(Mutex::new(Replicas {
                 reconciled: None,
                 states: BTreeMap::new(),
                 started: 0,
@@ -325,7 +325,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 current: BTreeMap::new(),
                 last_current,
                 logged: BTreeMap::new(),
-            }),
+            })),
         })
     }
 
@@ -827,28 +827,19 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     // Dropped, and so stopped, with the daemon's other tasks.
     let mut tasks = JoinSet::new();
     let changed = Arc::new(Notify::new());
-    let (seen, mut seen_by_watcher) = mpsc::unbounded_channel();
     let queue = Arc::new(conflicts::Queue::default());
     {
-        let queue = queue.clone();
-        tasks.spawn(async move { queue.work().await });
+        let (queue, replicas) = (queue.clone(), daemon.replicas.clone());
+        let me = daemon.db.lock().unwrap().node().clone();
+        tasks.spawn(async move { queue.work(replicas, me).await });
     }
     if let Some(driver) = daemon.driver.clone() {
-        let changed = changed.clone();
-        tasks.spawn(async move { driver.watch(&changed, &seen).await });
+        let (changed, queue) = (changed.clone(), queue.clone());
+        tasks.spawn(async move { driver.watch(&changed, |seen| queue.add(seen)).await });
     }
-    // Taken from the watcher as it comes, so that it can't pile up.
-    let look = |daemon: &Daemon<Client>, first, rest: &mut mpsc::UnboundedReceiver<_>| {
-        let mut items = vec![first];
-        while let Ok(item) = rest.try_recv() {
-            items.push(item);
-        }
-        daemon.look_for_conflicts(&queue, items);
-    };
     let mut last_sweep: Option<Instant> = None;
     loop {
         tokio::select! {
-            Some(first) = seen_by_watcher.recv() => look(daemon, first, &mut seen_by_watcher),
             _ = changed.notified() => {
                 tokio::select! {
                     () = daemon.refresh() => {}
@@ -868,7 +859,6 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                     let round = loop {
                         tokio::select! {
                             round = &mut round => break round,
-                            Some(first) = seen_by_watcher.recv() => look(daemon, first, &mut seen_by_watcher),
                             () = async {
                                 changed.notified().await;
                                 refreshing.set(true);
@@ -898,10 +888,11 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Err(error) => tracing::warn!(%error, "pulling records failed"),
                 Ok(_) => {}
                 }
-                if last_sweep.is_none_or(|at| at.elapsed() >= conflicts::SWEEP_EVERY)
-                    && daemon.queue_sweep(&queue)
-                {
+                if last_sweep.is_none_or(|at| at.elapsed() >= conflicts::SWEEP_EVERY) {
+                    queue.sweep();
                     last_sweep = Some(Instant::now());
+                } else {
+                    queue.retry();
                 }
             }
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),

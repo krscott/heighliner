@@ -44,10 +44,10 @@
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
 //!   used.
 //! - A Data Conflict's losing copy is never deleted early: Syncthing keeps
-//!   every one (`maxConflicts` -1), and heighliner moves it into the
-//!   Displaced Versions, where it expires a Retention Window after the
-//!   move. Conflict copies already in a path when it was set up are the
-//!   user's files, and stay.
+//!   every one (`maxConflicts` -1), and heighliner moves it into its own
+//!   ignored directory in the Replica, `.heighliner`, where it expires a
+//!   Retention Window after the move. Conflict copies already in a path
+//!   when it was set up are the user's files, and stay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -306,6 +306,13 @@ impl Client {
         self.call_within(SCAN_TIMEOUT, Method::POST, &path, None)
             .await?;
         Ok(())
+    }
+
+    /// Whether a folder sends its local changes now: it is send-receive
+    /// and running.
+    pub(crate) async fn folder_sends(&self, folder: ItemId) -> Result<bool, Error> {
+        let folder: Value = self.get(&format!("/rest/config/folders/{folder}")).await?;
+        Ok(folder["type"] == "sendreceive" && folder["paused"] == false)
     }
 
     /// Scans one file or directory of a folder, and waits for the scan.
@@ -793,6 +800,9 @@ impl Driver {
         // Syncthing never deletes a conflict's copy; heighliner moves it
         // into the Displaced Versions (see `conflicts`).
         folder["maxConflicts"] = json!(-1);
+        // Any change of modification time makes Syncthing look at a file's
+        // content, as a swapped conflict needs.
+        folder["modTimeWindowS"] = json!(0);
         let retention_days = local
             .entry
             .item
@@ -883,14 +893,18 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
 }
 
 /// The `.stignore` lines for `excludes`.
-/// Data Conflicts' copies are ignored first, so that no exclude can undo
-/// it.
+/// Data Conflicts' copies and heighliner's own directory are ignored
+/// first, so that no exclude can undo it.
 fn ignore_lines(excludes: &[String]) -> Vec<String> {
-    [IGNORE_HEADER, conflicts::IGNORE_PATTERN]
-        .into_iter()
-        .map(str::to_owned)
-        .chain(excludes.iter().cloned())
-        .collect()
+    [
+        IGNORE_HEADER,
+        conflicts::IGNORE_PATTERN,
+        conflicts::STORE_PATTERN,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(excludes.iter().cloned())
+    .collect()
 }
 
 /// `lines` as a file.
@@ -932,7 +946,11 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
         Ok(entries) => {
             for entry in entries {
                 let name = entry.map_err(error)?.file_name();
-                if name == MARKER || name == IGNORE_FILE || name == STAGED_IGNORE_FILE {
+                if name == MARKER
+                    || name == IGNORE_FILE
+                    || name == STAGED_IGNORE_FILE
+                    || name == conflicts::STORE
+                {
                     continue;
                 }
                 if !adopt {
@@ -976,7 +994,7 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
         Err(e) => return Err(error(e)),
     }
     // Conflict copies already here are the user's, not ones to move.
-    conflicts::mark_set_up(path).map_err(error)?;
+    conflicts::mark_set_up(path).map_err(|error| Outcome::PathError(error.to_string()))?;
     // Written beside it and renamed over it, so that neither a symlink nor
     // a hard link to a file elsewhere is written through.
     let staged = path.join(STAGED_IGNORE_FILE);

@@ -3,6 +3,7 @@
 //! records in a state file. When it drives Syncthing, it configures it each
 //! round and follows its Replicas' states.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fmt;
@@ -21,7 +22,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
-use crate::config::ConfigDb;
+use crate::config::{Config, ConfigDb};
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
 use crate::model::{AbsPath, ItemId, NodeId, ReplicaState};
@@ -255,11 +256,18 @@ pub struct Daemon<T> {
     replicas: Mutex<Replicas>,
 }
 
+/// A reconcile: the configuration it applied, and its outcome for each
+/// Replica or why it couldn't run. States are read against it, so that they
+/// describe what Syncthing was told.
+struct Reconciled {
+    config: Config,
+    outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
+}
+
 /// This Node's Replicas, as last seen in Syncthing.
 struct Replicas {
-    /// The last reconcile's outcome for each Replica, or why it couldn't
-    /// run.
-    outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
+    /// The last reconcile, if one has run.
+    reconciled: Option<Arc<Reconciled>>,
     states: BTreeMap<ItemId, ReplicaState>,
     /// How many refreshes have started, and which of them `states` are
     /// from, so that one overtaken by a later one is dropped.
@@ -310,7 +318,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             saved,
             driver: None,
             replicas: Mutex::new(Replicas {
-                outcomes: Ok(BTreeMap::new()),
+                reconciled: None,
                 states: BTreeMap::new(),
                 started: 0,
                 applied: 0,
@@ -487,16 +495,17 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// configuration, as this device's status `tailnet` describes it.
     async fn drive(&self, tailnet: &Tailnet) -> Option<syncthing::Report> {
         let driver = self.driver.as_ref()?;
-        let failed = |reason: String| {
-            self.replicas.lock().unwrap().outcomes = Err(reason);
-            None
+        let record = |config: Config, outcomes| {
+            let reconciled = Reconciled { config, outcomes };
+            self.replicas.lock().unwrap().reconciled = Some(Arc::new(reconciled));
         };
         let device_id = match driver.client().device_id().await {
             Ok(device_id) => device_id,
             Err(error) => {
-                return failed(format!(
-                    "can't be synced: Syncthing can't be reached: {error}"
-                ));
+                let config = self.db.lock().unwrap().config();
+                let reason = format!("can't be synced: Syncthing can't be reached: {error}");
+                record(config, Err(reason));
+                return None;
             }
         };
         if let Err(error) = self
@@ -510,12 +519,14 @@ impl<T: LocalApi + Clone> Daemon<T> {
         let config = self.db.lock().unwrap().config();
         match driver.reconcile(&config, tailnet, &device_id).await {
             Ok(report) => {
-                self.replicas.lock().unwrap().outcomes = Ok(report.replicas.clone());
+                record(config, Ok(report.replicas.clone()));
                 Some(report)
             }
-            Err(error) => failed(format!(
-                "can't be synced: configuring Syncthing failed: {error}"
-            )),
+            Err(error) => {
+                let reason = format!("can't be synced: configuring Syncthing failed: {error}");
+                record(config, Err(reason));
+                None
+            }
         }
     }
 
@@ -526,20 +537,21 @@ impl<T: LocalApi + Clone> Daemon<T> {
         let Some(driver) = &self.driver else {
             return;
         };
-        let (config, me) = {
-            let db = self.db.lock().unwrap();
-            (db.config(), db.node().clone())
-        };
-        let (outcomes, number) = {
+        let me = self.db.lock().unwrap().node().clone();
+        let (reconciled, number) = {
             let mut replicas = self.replicas.lock().unwrap();
+            let Some(reconciled) = replicas.reconciled.clone() else {
+                return;
+            };
             replicas.started += 1;
-            (replicas.outcomes.clone(), replicas.started)
+            (reconciled, replicas.started)
         };
+        let config = &reconciled.config;
         // Taken before reading, so that a confirmation is never dated later
         // than it happened.
         let read_at = Timestamp::now();
-        let mut states = match &outcomes {
-            Ok(outcomes) => driver.states(&config, &me, outcomes).await,
+        let mut states = match &reconciled.outcomes {
+            Ok(outcomes) => driver.states(config, &me, outcomes).await,
             Err(reason) => config
                 .replicas_on(&me)
                 .into_iter()
@@ -836,17 +848,26 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                     let daemon = &*daemon;
                     let round = daemon.pull_round();
                     tokio::pin!(round);
-                    loop {
+                    let refreshing = Cell::new(false);
+                    let round = loop {
                         tokio::select! {
                             round = &mut round => break round,
                             () = async {
                                 changed.notified().await;
+                                refreshing.set(true);
                                 daemon.refresh().await;
+                                refreshing.set(false);
                             } => {}
                             _ = terminate.recv() => return Ok(()),
                             _ = interrupt.recv() => return Ok(()),
                         }
+                    };
+                    // The round's own refresh may have read a Replica before
+                    // the change that started the one it cut short.
+                    if refreshing.get() {
+                        changed.notify_one();
                     }
+                    round
                 };
                 match round {
                 Err(Error::AddressesChanged) => {

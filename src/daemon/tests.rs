@@ -432,10 +432,23 @@ async fn the_daemon_remembers_when_replicas_were_current() {
     };
     assert!(before <= at && at <= after);
 
-    // Moved to a new path, it hasn't been current there.
+    // Moved to a new path, it hasn't been current there, even when its
+    // state is read before Syncthing is told of the move.
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .remove_replica(Timestamp::now(), ITEM, &elsewhere)
+        .unwrap();
+    daemon.pull_round().await.unwrap();
+    assert_eq!(daemon.states()[&ITEM], ReplicaState::Current);
     {
         let mut db = daemon.db().lock().unwrap();
         let me = db.node().clone();
+        // Another Replica stands in while this one moves, so that it can be
+        // removed.
+        db.add_replica(Timestamp::now(), ITEM, &elsewhere, sender())
+            .unwrap();
         db.remove_replica(Timestamp::now(), ITEM, &me).unwrap();
         db.add_replica(
             Timestamp::now(),
@@ -444,7 +457,16 @@ async fn the_daemon_remembers_when_replicas_were_current() {
             Replica::new(syncthing.dir("moved")),
         )
         .unwrap();
+        db.remove_replica(Timestamp::now(), ITEM, &elsewhere)
+            .unwrap();
     }
+    daemon.refresh().await;
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .add_replica(Timestamp::now(), ITEM, &elsewhere, sender())
+        .unwrap();
     daemon.pull_round().await.unwrap();
     daemon.pull_round().await.unwrap();
     assert_eq!(

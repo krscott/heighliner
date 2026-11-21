@@ -175,7 +175,7 @@ async fn a_changed_tailnet_stops_the_round() {
     fake.set_me(moved);
     assert!(matches!(
         daemon.pull_round().await,
-        Err(Error::AddressesChanged(tailnet)) if tailnet.me().ips == ["127.0.0.8".parse::<std::net::IpAddr>().unwrap()]
+        Err(Error::AddressesChanged)
     ));
 
     // A new identity.
@@ -261,12 +261,12 @@ async fn rebinding_keeps_the_records() {
     fake.set_me(moved.clone());
     // WhoIs from the new address must still identify this device.
     fake.add_device(moved);
-    let Err(Error::AddressesChanged(tailnet)) = daemon.pull_round().await else {
-        panic!("the addresses changed");
-    };
+    assert!(matches!(
+        daemon.pull_round().await,
+        Err(Error::AddressesChanged)
+    ));
     drop(servers);
-    daemon.tailnet = *tailnet;
-    let _servers = daemon.listen().await.unwrap();
+    let _servers = daemon.relisten().await.unwrap();
 
     let addr = SocketAddr::new("127.0.0.7".parse().unwrap(), port);
     let hello = protocol::hello(addr, Duration::from_secs(2)).await.unwrap();
@@ -274,4 +274,16 @@ async fn rebinding_keeps_the_records() {
         .await
         .unwrap();
     assert!(crate::config::Config::new(&store).items.contains_key(&ITEM));
+}
+
+#[tokio::test]
+async fn relistening_refuses_a_new_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = tailnet("127.0.0.1", &[]);
+    let mut daemon = Daemon::open(fake.clone(), dir.path(), 1).await.unwrap();
+    fake.set_me(device("someone-new", OWNER, "127.0.0.1"));
+    assert!(matches!(
+        daemon.relisten().await,
+        Err(Error::IdentityChanged)
+    ));
 }

@@ -246,6 +246,9 @@ impl<T: LocalApi + Clone> Daemon<T> {
         }
         let state_file = state_dir.join(STATE_FILE);
         let db = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
+        // Count the state as it was opened as saved, so nothing is written
+        // until it changes; a daemon that changed nothing writes no file.
+        let saved = Mutex::new(snapshot(&db, tailnet.owner()));
         Ok(Self {
             api,
             port,
@@ -253,7 +256,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             state_file,
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
-            saved: Mutex::new(Vec::new()),
+            saved,
         })
     }
 
@@ -411,16 +414,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Writes the records and clock to the state file, if they changed.
     pub fn save(&self) -> Result<(), Error> {
         let mut saved = self.saved.lock().unwrap();
-        let state = {
-            let db = self.db.lock().unwrap();
-            SavedState {
-                format: STATE_FORMAT,
-                owner: self.tailnet.owner(),
-                clock: db.last_reading(),
-                records: db.store().clone(),
-            }
-        };
-        let bytes = serde_json::to_vec(&state).expect("the state serializes");
+        let bytes = snapshot(&self.db.lock().unwrap(), self.tailnet.owner());
         if *saved == bytes {
             return Ok(());
         }
@@ -431,6 +425,17 @@ impl<T: LocalApi + Clone> Daemon<T> {
         *saved = bytes;
         Ok(())
     }
+}
+
+/// The state file's contents for `db`, a copy of `owner`'s Fleet.
+fn snapshot(db: &ConfigDb, owner: Owner) -> Vec<u8> {
+    let state = SavedState {
+        format: STATE_FORMAT,
+        owner,
+        clock: db.last_reading(),
+        records: db.store().clone(),
+    };
+    serde_json::to_vec(&state).expect("the state serializes")
 }
 
 /// Reads the state file for `node` of `owner`'s Fleet, or starts empty if

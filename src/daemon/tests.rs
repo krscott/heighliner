@@ -210,6 +210,7 @@ async fn state_from_another_owner_is_refused() {
     let before = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
         .await
         .unwrap();
+    track(&before, "docs");
     before.save().unwrap();
     drop(before);
 
@@ -286,4 +287,17 @@ async fn relistening_refuses_a_new_identity() {
         daemon.relisten().await,
         Err(Error::IdentityChanged)
     ));
+}
+
+#[tokio::test]
+async fn an_unchanged_daemon_writes_no_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    daemon.save().unwrap();
+    assert!(!dir.path().join(STATE_FILE).exists());
+    track(&daemon, "docs");
+    daemon.save().unwrap();
+    assert!(dir.path().join(STATE_FILE).exists());
 }

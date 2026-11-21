@@ -125,7 +125,7 @@ impl Record {
 
 /// A set of records.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "Vec<Value>", into = "Vec<WireRecord>")]
+#[serde(from = "Vec<WireRecord>", into = "Vec<WireRecord>")]
 pub struct Store {
     records: BTreeMap<RecordKey, Record>,
 }
@@ -206,10 +206,28 @@ struct LenientRecord {
     versions: Vec<Value>,
 }
 
-/// Decodes records one at a time, skipping (and logging) any that can't be
-/// read, so that one bad record from another Node doesn't cost the rest.
-impl From<Vec<Value>> for Store {
-    fn from(records: Vec<Value>) -> Self {
+impl From<Vec<WireRecord>> for Store {
+    fn from(records: Vec<WireRecord>) -> Self {
+        let mut store = Self::default();
+        for record in records {
+            let key = RecordKey {
+                kind: record.kind,
+                id: record.id,
+            };
+            for version in record.versions {
+                store.insert(key.clone(), version.hlc, version.content);
+            }
+        }
+        store
+    }
+}
+
+impl Store {
+    /// Decodes a serialized store one record and version at a time, and
+    /// returns how many it skipped because they couldn't be read. Used for
+    /// stores from other Nodes, so that one bad record doesn't cost the
+    /// rest; a Node's own state is decoded strictly.
+    pub fn decode_lenient(records: Vec<Value>) -> (Self, usize) {
         let mut store = Self::default();
         let mut skipped = 0;
         for record in records {
@@ -228,10 +246,7 @@ impl From<Vec<Value>> for Store {
                 }
             }
         }
-        if skipped > 0 {
-            tracing::warn!(skipped, "skipped records or versions that can't be read");
-        }
-        store
+        (store, skipped)
     }
 }
 
@@ -372,8 +387,14 @@ mod tests {
                 {"hlc": {"wall": 1, "counter": 0, "node": "a"}, "content": {"state": "archived"}},
             ]},
         ]);
-        let store: Store = serde_json::from_value(json).unwrap();
+        let serde_json::Value::Array(records) = json.clone() else {
+            unreachable!()
+        };
+        let (store, skipped) = Store::decode_lenient(records);
+        assert_eq!(skipped, 3);
         assert_eq!(store.records().count(), 1);
+        // Strict decoding refuses the whole store.
+        assert!(serde_json::from_value::<Store>(json).is_err());
         assert_eq!(store.get(&key("k", "1")).unwrap().versions().count(), 1);
     }
 

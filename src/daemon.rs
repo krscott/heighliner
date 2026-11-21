@@ -103,8 +103,9 @@ pub enum Error {
     /// None of this device's Tailscale addresses could be listened on, for
     /// example because the tailnet interface isn't up yet.
     NoAddress,
-    /// This device's Tailscale addresses changed since the daemon started.
-    AddressesChanged,
+    /// This device's Tailscale addresses, node ID or owner changed since the
+    /// daemon started.
+    TailnetChanged,
     Serve(tokio::task::JoinError),
 }
 
@@ -154,9 +155,9 @@ impl fmt::Display for Error {
             Self::NoAddress => {
                 f.write_str("can't listen on any of this device's Tailscale addresses")
             }
-            Self::AddressesChanged => f.write_str(
-                "this device's Tailscale addresses changed; restarting to listen on the new ones",
-            ),
+            Self::TailnetChanged => {
+                f.write_str("this device's Tailscale addresses, node ID or owner changed")
+            }
             Self::Serve(error) => write!(f, "a server failed: {error}"),
         }
     }
@@ -174,7 +175,7 @@ impl std::error::Error for Error {
             | Self::StateOwner { .. }
             | Self::StateLocked { .. }
             | Self::NoAddress
-            | Self::AddressesChanged => None,
+            | Self::TailnetChanged => None,
         }
     }
 }
@@ -282,16 +283,12 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// versions older than the Retention Window, then saves.
     pub async fn pull_round(&self) -> Result<Round, Error> {
         let tailnet = self.api.status().await?;
-        let addresses = |tailnet: &Tailnet| {
-            tailnet
-                .me()
-                .ips
-                .iter()
-                .copied()
-                .collect::<BTreeSet<IpAddr>>()
+        let identity = |tailnet: &Tailnet| {
+            let addresses: BTreeSet<IpAddr> = tailnet.me().ips.iter().copied().collect();
+            (tailnet.me().id.clone(), tailnet.owner(), addresses)
         };
-        if addresses(&tailnet) != addresses(&self.tailnet) {
-            return Err(Error::AddressesChanged);
+        if identity(&tailnet) != identity(&self.tailnet) {
+            return Err(Error::TailnetChanged);
         }
         let mut round = Round::default();
         let mut pulls = JoinSet::new();
@@ -327,7 +324,14 @@ impl<T: LocalApi + Clone> Daemon<T> {
         while let Some(joined) = pulls.join_next().await {
             let (device, pulled) = joined.expect("pull tasks don't panic");
             match pulled {
-                Ok(store) => {
+                Ok((store, skipped)) => {
+                    if skipped > 0 {
+                        tracing::warn!(
+                            from = %device.name,
+                            skipped,
+                            "skipped records or versions that can't be read"
+                        );
+                    }
                     let rejected = self.db.lock().unwrap().merge(&store, Timestamp::now());
                     if rejected > 0 {
                         tracing::warn!(
@@ -460,21 +464,31 @@ pub struct Options {
 }
 
 /// Runs the daemon. It waits for tailscaled to be ready, then serves and
-/// pulls until a server fails or this device's addresses change.
+/// pulls until a server fails. It starts again if this device's Tailscale
+/// addresses or identity change.
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
-    let (daemon, mut servers) = start(api, &options.state_dir, options.port).await?;
-    let mut pulls = tokio::time::interval(options.pull_every);
-    pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            _ = pulls.tick() => match daemon.pull_round().await {
-                Err(error @ Error::AddressesChanged) => return Err(error),
-                Err(error) => tracing::warn!(%error, "pulling records failed"),
-                Ok(_) => {}
-            },
-            Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
+        let (daemon, mut servers) = start(api.clone(), &options.state_dir, options.port).await?;
+        let mut pulls = tokio::time::interval(options.pull_every);
+        pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = pulls.tick() => match daemon.pull_round().await {
+                    Err(error @ Error::TailnetChanged) => {
+                        tracing::info!("{error}; starting again");
+                        break;
+                    }
+                    Err(error) => tracing::warn!(%error, "pulling records failed"),
+                    Ok(_) => {}
+                },
+                Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
+            }
         }
+        // Stop the servers and release the state directory before starting
+        // again.
+        servers.shutdown().await;
+        drop(daemon);
     }
 }
 

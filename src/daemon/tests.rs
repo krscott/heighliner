@@ -166,7 +166,7 @@ async fn addresses_this_machine_lacks_are_skipped() {
 }
 
 #[tokio::test]
-async fn changed_addresses_stop_the_round() {
+async fn a_changed_tailnet_stops_the_round() {
     let dir = tempfile::tempdir().unwrap();
     let fake = tailnet("127.0.0.1", &[]);
     let daemon = Daemon::open(fake.clone(), dir.path(), 1).await.unwrap();
@@ -175,7 +175,14 @@ async fn changed_addresses_stop_the_round() {
     fake.set_me(moved);
     assert!(matches!(
         daemon.pull_round().await,
-        Err(Error::AddressesChanged)
+        Err(Error::TailnetChanged)
+    ));
+
+    // A new identity on the same address.
+    fake.set_me(device("someone-new", OWNER, "127.0.0.1"));
+    assert!(matches!(
+        daemon.pull_round().await,
+        Err(Error::TailnetChanged)
     ));
 }
 

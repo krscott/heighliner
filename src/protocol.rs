@@ -174,15 +174,21 @@ pub async fn hello(addr: SocketAddr, timeout: Duration) -> Result<Hello, Error> 
 }
 
 /// Pulls the records of the Node at `addr`, whose `hello` answer was
-/// `theirs`. Refuses if it speaks another major version.
-pub async fn pull(addr: SocketAddr, theirs: &Hello, timeout: Duration) -> Result<Store, Error> {
+/// `theirs`, and returns them with how many records or versions couldn't be
+/// read and were skipped. Refuses if it speaks another major version.
+pub async fn pull(
+    addr: SocketAddr,
+    theirs: &Hello,
+    timeout: Duration,
+) -> Result<(Store, usize), Error> {
     if theirs.protocol != MAJOR {
         return Err(Error::Incompatible {
             addr,
             theirs: theirs.clone(),
         });
     }
-    get_json(addr, RECORDS_PATH, timeout).await
+    let records: Vec<serde_json::Value> = get_json(addr, RECORDS_PATH, timeout).await?;
+    Ok(Store::decode_lenient(records))
 }
 
 #[cfg(test)]

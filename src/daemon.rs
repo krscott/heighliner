@@ -24,7 +24,7 @@ use crate::hlc::{Hlc, Timestamp};
 use crate::model::NodeId;
 use crate::protocol::{self, Hello};
 use crate::record::Store;
-use crate::tailscale::{self, Client, LocalApi, Tailnet};
+use crate::tailscale::{self, Client, LocalApi, Owner, Tailnet};
 
 /// The port heighliner listens on unless configured otherwise.
 pub const DEFAULT_PORT: u16 = 7130;
@@ -42,6 +42,9 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(10);
 
 const STATE_FILE: &str = "state.json";
 
+/// Locked for as long as a daemon uses the state directory.
+const LOCK_FILE: &str = "lock";
+
 /// The version of the state file's layout this build reads and writes.
 const STATE_FORMAT: u32 = 1;
 
@@ -49,6 +52,8 @@ const STATE_FORMAT: u32 = 1;
 #[derive(Serialize, Deserialize)]
 struct SavedState {
     format: u32,
+    /// The user whose Fleet the records belong to.
+    owner: Owner,
     /// The clock's latest reading, so it resumes after it on restart. Its
     /// node is the Node the state belongs to.
     clock: Hlc,
@@ -82,6 +87,14 @@ pub enum Error {
         path: PathBuf,
         saved: NodeId,
         current: NodeId,
+    },
+    /// The state belongs to another user's Fleet.
+    StateOwner {
+        path: PathBuf,
+    },
+    /// Another daemon uses the state directory.
+    StateLocked {
+        path: PathBuf,
     },
     Listen {
         addr: SocketAddr,
@@ -129,6 +142,14 @@ impl fmt::Display for Error {
                 "{} belongs to Tailscale node {saved}, but this device is now {current}; its Replicas would belong to a Node that no longer exists. Move the file aside to start this Node afresh, then add its Replicas again",
                 path.display()
             ),
+            Self::StateOwner { path } => write!(
+                f,
+                "{} belongs to another Tailscale user's Fleet; move it aside to start this Node afresh",
+                path.display()
+            ),
+            Self::StateLocked { path } => {
+                write!(f, "another heighliner daemon is using {}", path.display())
+            }
             Self::Listen { addr, source } => write!(f, "can't listen on {addr}: {source}"),
             Self::NoAddress => {
                 f.write_str("can't listen on any of this device's Tailscale addresses")
@@ -150,6 +171,8 @@ impl std::error::Error for Error {
             Self::Serve(error) => Some(error),
             Self::StateFormat { .. }
             | Self::StateNode { .. }
+            | Self::StateOwner { .. }
+            | Self::StateLocked { .. }
             | Self::NoAddress
             | Self::AddressesChanged => None,
         }
@@ -180,6 +203,8 @@ pub struct Daemon<T> {
     /// The status when the daemon started.
     tailnet: Tailnet,
     state_file: PathBuf,
+    /// Held for the daemon's lifetime; see [`LOCK_FILE`].
+    _lock: File,
     db: Arc<Mutex<ConfigDb>>,
     /// What was last written to the state file, to skip unchanged writes.
     /// Held while saving, so saves happen one at a time and in order.
@@ -188,20 +213,33 @@ pub struct Daemon<T> {
 
 impl<T: LocalApi + Clone> Daemon<T> {
     /// Opens the state in `state_dir`, creating it if needed, for this
-    /// device.
+    /// device. Fails if another daemon uses it.
     pub async fn open(api: T, state_dir: &Path, port: u16) -> Result<Self, Error> {
         let tailnet = api.status().await?;
-        fs::create_dir_all(state_dir).map_err(|source| Error::State {
-            path: state_dir.to_owned(),
-            source,
-        })?;
+        let state_error = |path: &Path| {
+            let path = path.to_owned();
+            move |source| Error::State { path, source }
+        };
+        fs::create_dir_all(state_dir).map_err(state_error(state_dir))?;
+        let lock_file = state_dir.join(LOCK_FILE);
+        let lock = File::create(&lock_file).map_err(state_error(&lock_file))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(Error::StateLocked {
+                    path: state_dir.to_owned(),
+                });
+            }
+            Err(fs::TryLockError::Error(source)) => return Err(state_error(&lock_file)(source)),
+        }
         let state_file = state_dir.join(STATE_FILE);
-        let db = load(&state_file, tailnet.me().id.clone())?;
+        let db = load(&state_file, tailnet.me().id.clone(), tailnet.owner())?;
         Ok(Self {
             api,
             port,
             tailnet,
             state_file,
+            _lock: lock,
             db: Arc::new(Mutex::new(db)),
             saved: Mutex::new(Vec::new()),
         })
@@ -284,7 +322,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
             }
         }
-        for (device, pulled) in pulls.join_all().await {
+        // Merge each Node's records as they arrive, so a slow Node doesn't
+        // hold up the rest.
+        while let Some(joined) = pulls.join_next().await {
+            let (device, pulled) = joined.expect("pull tasks don't panic");
             match pulled {
                 Ok(store) => {
                     let rejected = self.db.lock().unwrap().merge(&store, Timestamp::now());
@@ -324,6 +365,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             let db = self.db.lock().unwrap();
             SavedState {
                 format: STATE_FORMAT,
+                owner: self.tailnet.owner(),
                 clock: db.last_reading(),
                 records: db.store().clone(),
             }
@@ -341,8 +383,9 @@ impl<T: LocalApi + Clone> Daemon<T> {
     }
 }
 
-/// Reads the state file for `node`, or starts empty if there is none.
-fn load(path: &Path, node: NodeId) -> Result<ConfigDb, Error> {
+/// Reads the state file for `node` of `owner`'s Fleet, or starts empty if
+/// there is none.
+fn load(path: &Path, node: NodeId, owner: Owner) -> Result<ConfigDb, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -367,6 +410,11 @@ fn load(path: &Path, node: NodeId) -> Result<ConfigDb, Error> {
         });
     }
     let saved: SavedState = serde_json::from_slice(&bytes).map_err(decode_error)?;
+    if saved.owner != owner {
+        return Err(Error::StateOwner {
+            path: path.to_owned(),
+        });
+    }
     if saved.clock.node != node {
         return Err(Error::StateNode {
             path: path.to_owned(),
@@ -378,13 +426,19 @@ fn load(path: &Path, node: NodeId) -> Result<ConfigDb, Error> {
 }
 
 /// Replaces `path` with `bytes`, readable only by this user, so that a
-/// crash leaves either the old or the new file.
+/// crash leaves either the old or the new file. Callers hold the state
+/// directory's lock, so the temporary file is theirs.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
+    // A file left by a crash may have other permissions, so start afresh.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
     file.write_all(bytes)?;

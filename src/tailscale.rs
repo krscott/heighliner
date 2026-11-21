@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use hyper::StatusCode;
 use hyper::body::Bytes;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 
 use crate::http::{self, BoxError};
@@ -29,7 +29,7 @@ pub const DEFAULT_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A Tailscale user ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserId(i64);
 
@@ -43,7 +43,8 @@ impl UserId {
 /// The user who owns this device. Only their untagged devices can be Nodes
 /// (ADR-0003): tagging a device moves its ownership to Tailscale's shared
 /// tagged-devices user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Owner(UserId);
 
 impl Owner {

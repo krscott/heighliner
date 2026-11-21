@@ -138,6 +138,7 @@ async fn state_from_another_node_is_refused() {
         .unwrap();
     track(&before, "docs");
     before.save().unwrap();
+    drop(before);
 
     let error = Daemon::open(tailnet("127.0.0.9", &[]), dir.path(), 1)
         .await
@@ -194,4 +195,47 @@ async fn nodes_that_refuse_are_reported() {
         .unwrap();
     let round = b.pull_round().await.unwrap();
     assert_eq!(round.failed, [NodeId::new("n-127.0.0.3").unwrap()]);
+}
+
+#[tokio::test]
+async fn state_from_another_owner_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    before.save().unwrap();
+    drop(before);
+
+    let other = Fake::new(device("127.0.0.1", UserId::new(2), "127.0.0.1"));
+    let error = Daemon::open(other, dir.path(), 1).await.err().unwrap();
+    assert!(matches!(error, Error::StateOwner { .. }));
+}
+
+#[tokio::test]
+async fn one_daemon_per_state_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let _first = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    let second = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1).await;
+    assert!(matches!(second, Err(Error::StateLocked { .. })));
+}
+
+#[tokio::test]
+async fn a_stale_temporary_file_doesnt_loosen_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let stale = dir.path().join("state.tmp");
+    fs::write(&stale, "stale").unwrap();
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    track(&daemon, "docs");
+    daemon.save().unwrap();
+    let mode = fs::metadata(dir.path().join(STATE_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
 }

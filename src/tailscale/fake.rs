@@ -6,22 +6,14 @@ use std::net::{IpAddr, SocketAddr};
 use super::{Device, Error, Identity, LocalApi, Tailnet, UserId};
 use crate::model::NodeId;
 
-/// A device named `name`, with node ID `n-<name>`, at `ip`.
+/// An untagged device named `name`, with node ID `n-<name>`, at `ip`.
 pub(crate) fn device(name: &str, user: UserId, ip: &str) -> Device {
     Device {
         id: NodeId::new(format!("n-{name}")).unwrap(),
         name: name.to_owned(),
         user,
+        tagged: false,
         ips: vec![ip.parse().unwrap()],
-        online: true,
-    }
-}
-
-pub(crate) fn identity(name: &str, user: UserId) -> Identity {
-    Identity {
-        node: NodeId::new(format!("n-{name}")).unwrap(),
-        name: name.to_owned(),
-        user,
     }
 }
 
@@ -36,7 +28,7 @@ impl Fake {
         let mut fake = Self {
             tailnet: Tailnet {
                 me: me.clone(),
-                peers: Vec::new(),
+                others: Vec::new(),
             },
             identities: BTreeMap::new(),
             failing_whois: BTreeSet::new(),
@@ -45,14 +37,10 @@ impl Fake {
         fake
     }
 
-    /// Adds a peer, which WhoIs then identifies.
-    pub(crate) fn add_peer(&mut self, peer: Device) {
-        self.add_identities(&peer);
-        self.tailnet.peers.push(peer);
-    }
-
-    pub(crate) fn add_identity(&mut self, ip: IpAddr, identity: Identity) {
-        self.identities.insert(ip, identity);
+    /// Adds another device, which WhoIs then identifies.
+    pub(crate) fn add_device(&mut self, device: Device) {
+        self.add_identities(&device);
+        self.tailnet.others.push(device);
     }
 
     pub(crate) fn fail_whois_for(&mut self, ip: IpAddr) {
@@ -67,6 +55,7 @@ impl Fake {
                     node: device.id.clone(),
                     name: device.name.clone(),
                     user: device.user,
+                    tagged: device.tagged,
                 },
             );
         }

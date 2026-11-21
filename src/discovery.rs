@@ -1,0 +1,92 @@
+//! Finding the devices that run heighliner.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use tokio::net::TcpStream;
+use tokio::task::JoinSet;
+
+use crate::tailscale::{self, Device, Tailnet};
+
+/// Finds the devices owned by this device's owner that accept TCP
+/// connections on `port`, the port heighliner listens on. Each device's
+/// addresses are tried in turn, each for at most `timeout`; devices are
+/// probed concurrently.
+pub async fn discover(
+    tailnet: &Tailnet,
+    port: u16,
+    timeout: Duration,
+) -> Result<Vec<Device>, tailscale::Error> {
+    let mut probes = JoinSet::new();
+    for device in tailnet.owned_devices()?.cloned() {
+        probes.spawn(async move {
+            for ip in &device.ips {
+                let connect = TcpStream::connect(SocketAddr::new(*ip, port));
+                if let Ok(Ok(_)) = tokio::time::timeout(timeout, connect).await {
+                    return Some(device);
+                }
+            }
+            None
+        });
+    }
+    let mut found: Vec<Device> = probes.join_all().await.into_iter().flatten().collect();
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::tailscale::UserId;
+    use crate::tailscale::fake::device;
+
+    const OWNER: UserId = UserId::new(1);
+    const OTHER: UserId = UserId::new(2);
+
+    #[tokio::test]
+    async fn finds_owned_devices_that_listen() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+
+        // Listens, on its second address.
+        let mut listening = device("listening", OWNER, "127.0.0.2");
+        listening.ips.push("127.0.0.1".parse().unwrap());
+        let mut tagged = device("tagged", OWNER, "127.0.0.1");
+        tagged.tagged = true;
+        let tailnet = Tailnet {
+            me: device("me", OWNER, "100.64.0.1"),
+            others: vec![
+                listening,
+                // Owned, but nothing listens.
+                device("idle", OWNER, "127.0.0.3"),
+                // Listens, but isn't the owner's.
+                device("friend", OTHER, "127.0.0.1"),
+                tagged,
+            ],
+        };
+
+        let found = discover(&tailnet, port, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let names: Vec<_> = found.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["listening"]);
+    }
+
+    #[tokio::test]
+    async fn a_tagged_device_finds_nothing() {
+        let mut me = device("me", OWNER, "100.64.0.1");
+        me.tagged = true;
+        let tailnet = Tailnet { me, others: vec![] };
+        assert!(matches!(
+            discover(&tailnet, 1, Duration::from_secs(1)).await,
+            Err(tailscale::Error::Tagged)
+        ));
+    }
+}

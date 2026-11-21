@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty};
@@ -18,8 +19,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokio::net::{TcpStream, UnixStream};
-use tokio::task::JoinSet;
+use tokio::net::UnixStream;
 
 use crate::model::NodeId;
 
@@ -29,21 +29,28 @@ pub const DEFAULT_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 /// How long a local API call may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A Tailscale user ID. Tagged devices belong to a separate tagged-devices
-/// user, so they never have the ID of a person.
+/// A Tailscale user ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(transparent)]
 pub struct UserId(i64);
 
 impl UserId {
-    pub const fn new(id: i64) -> Self {
+    #[cfg(test)]
+    pub(crate) const fn new(id: i64) -> Self {
         Self(id)
     }
 }
 
-impl fmt::Display for UserId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+/// The user who owns this device. Only their untagged devices can be Nodes
+/// (ADR-0003): tagging a device moves its ownership to Tailscale's shared
+/// tagged-devices user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner(UserId);
+
+impl Owner {
+    /// Whether a device of `user`, with or without tags, is the owner's.
+    pub fn owns(&self, user: UserId, tagged: bool) -> bool {
+        !tagged && user == self.0
     }
 }
 
@@ -54,22 +61,34 @@ pub struct Device {
     /// The machine name: the first label of its MagicDNS name.
     pub name: String,
     pub user: UserId,
+    pub tagged: bool,
     pub ips: Vec<IpAddr>,
-    pub online: bool,
 }
 
-/// This device and the others it can see.
+/// This device and the others on its tailnet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tailnet {
     pub me: Device,
-    pub peers: Vec<Device>,
+    pub others: Vec<Device>,
 }
 
 impl Tailnet {
-    /// The other devices owned by this device's user, which are the ones
-    /// that can be Nodes.
-    pub fn owned_peers(&self) -> impl Iterator<Item = &Device> {
-        self.peers.iter().filter(|peer| peer.user == self.me.user)
+    /// The user who owns this device, unless it is tagged.
+    pub fn owner(&self) -> Result<Owner, Error> {
+        if self.me.tagged {
+            return Err(Error::Tagged);
+        }
+        Ok(Owner(self.me.user))
+    }
+
+    /// The other devices the owner owns, which are the ones that can be
+    /// Nodes.
+    pub fn owned_devices(&self) -> Result<impl Iterator<Item = &Device>, Error> {
+        let owner = self.owner()?;
+        Ok(self
+            .others
+            .iter()
+            .filter(move |device| owner.owns(device.user, device.tagged)))
     }
 }
 
@@ -80,6 +99,7 @@ pub struct Identity {
     /// The machine name, as in [`Device::name`].
     pub name: String,
     pub user: UserId,
+    pub tagged: bool,
 }
 
 /// The parts of the local API heighliner uses. [`Client`] talks to
@@ -87,8 +107,8 @@ pub struct Identity {
 pub trait LocalApi: Send + Sync + 'static {
     fn status(&self) -> impl Future<Output = Result<Tailnet, Error>> + Send;
 
-    /// Identifies the device a connection from `addr` comes from, or `None`
-    /// if `addr` isn't on the tailnet.
+    /// Identifies the device a TCP connection from `addr` comes from, or
+    /// `None` if `addr` isn't on the tailnet.
     fn whois(
         &self,
         addr: SocketAddr,
@@ -100,7 +120,7 @@ pub trait LocalApi: Send + Sync + 'static {
 pub enum Error {
     Connect {
         socket: PathBuf,
-        source: std::io::Error,
+        source: io::Error,
     },
     Http {
         path: String,
@@ -118,21 +138,30 @@ pub enum Error {
         path: String,
         source: serde_json::Error,
     },
-    /// `tailscaled` is up but not connected, for example because it needs
-    /// a login.
-    NotRunning {
+    /// `tailscaled` is up but not connected to the tailnet, for example
+    /// because it needs a login.
+    NotConnected {
         state: String,
     },
+    /// This device is tagged, so it isn't owned by a user.
+    Tagged,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect { socket, source } => write!(
-                f,
-                "can't connect to tailscaled at {}: {source}; is tailscaled running?",
-                socket.display()
-            ),
+            Self::Connect { socket, source } => {
+                let hint = if source.kind() == io::ErrorKind::PermissionDenied {
+                    "check that this user may use it"
+                } else {
+                    "is tailscaled running?"
+                };
+                write!(
+                    f,
+                    "can't connect to tailscaled at {}: {source}; {hint}",
+                    socket.display()
+                )
+            }
             Self::Http { path, source } => write!(f, "tailscaled request {path} failed: {source}"),
             Self::Timeout { path } => write!(
                 f,
@@ -140,18 +169,17 @@ impl fmt::Display for Error {
                 TIMEOUT.as_secs()
             ),
             Self::Status { path, status, body } => {
-                write!(
-                    f,
-                    "tailscaled answered {path} with {status}: {}",
-                    body.trim()
-                )
+                write!(f, "tailscaled answered {path} with {status}: {}", body.trim())
             }
             Self::Decode { path, source } => {
                 write!(f, "can't read tailscaled's answer to {path}: {source}")
             }
-            Self::NotRunning { state } => write!(
+            Self::NotConnected { state } => write!(
                 f,
                 "tailscale is not connected (state {state}); run `tailscale up`"
+            ),
+            Self::Tagged => f.write_str(
+                "this device is tagged, but heighliner only runs on devices owned by a user; remove its tags",
             ),
         }
     }
@@ -163,7 +191,10 @@ impl std::error::Error for Error {
             Self::Connect { source, .. } => Some(source),
             Self::Http { source, .. } => Some(source),
             Self::Decode { source, .. } => Some(source),
-            Self::Timeout { .. } | Self::Status { .. } | Self::NotRunning { .. } => None,
+            Self::Timeout { .. }
+            | Self::Status { .. }
+            | Self::NotConnected { .. }
+            | Self::Tagged => None,
         }
     }
 }
@@ -179,10 +210,6 @@ impl Client {
         Self {
             socket: socket.into(),
         }
-    }
-
-    pub fn socket(&self) -> &Path {
-        &self.socket
     }
 
     /// Sends a GET and returns the status and body.
@@ -220,46 +247,50 @@ impl Client {
                 path: path.to_owned(),
             })?
     }
+}
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>, Error> {
-        let (status, body) = self.get(path).await?;
-        if status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            return Err(Error::Status {
-                path: path.to_owned(),
-                status,
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
-        }
-        serde_json::from_slice(&body)
-            .map(Some)
-            .map_err(|source| Error::Decode {
-                path: path.to_owned(),
-                source,
-            })
+/// Decodes a successful JSON answer to `path`.
+fn decode<T: DeserializeOwned>(path: &str, status: StatusCode, body: &[u8]) -> Result<T, Error> {
+    if !status.is_success() {
+        return Err(Error::Status {
+            path: path.to_owned(),
+            status,
+            body: String::from_utf8_lossy(body).into_owned(),
+        });
     }
+    serde_json::from_slice(body).map_err(|source| Error::Decode {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 impl LocalApi for Client {
     async fn status(&self) -> Result<Tailnet, Error> {
         const PATH: &str = "/localapi/v0/status";
-        let status: StatusResponse = self.get_json(PATH).await?.ok_or(Error::Status {
-            path: PATH.to_owned(),
-            status: StatusCode::NOT_FOUND,
-            body: String::new(),
-        })?;
-        status.into_tailnet()
+        let (status, body) = self.get(PATH).await?;
+        // Without a network map, the rest of the answer holds zero values,
+        // so look at the state first.
+        let BackendState { backend_state } = decode(PATH, status, &body)?;
+        if backend_state != "Running" {
+            return Err(Error::NotConnected {
+                state: backend_state,
+            });
+        }
+        let status: StatusResponse = decode(PATH, status, &body)?;
+        Ok(status.into_tailnet())
     }
 
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {
         let path = format!(
-            "/localapi/v0/whois?addr={}",
+            "/localapi/v0/whois?addr={}&proto=tcp",
             percent_encode(&addr.to_string())
         );
-        let response: Option<WhoIsResponse> = self.get_json(&path).await?;
-        Ok(response.map(WhoIsResponse::into_identity))
+        let (status, body) = self.get(&path).await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let whois: WhoIsResponse = decode(&path, status, &body)?;
+        Ok(Some(whois.into_identity()))
     }
 }
 
@@ -276,23 +307,27 @@ fn percent_encode(value: &str) -> String {
     encoded
 }
 
-/// The machine name in a MagicDNS name such as `laptop.tailnet.ts.net.`,
-/// falling back to the OS host name.
-fn machine_name(dns_name: &str, host_name: &str) -> String {
-    match dns_name.split('.').next() {
-        Some(label) if !label.is_empty() => label.to_owned(),
-        _ => host_name.to_owned(),
-    }
+/// The machine name in a MagicDNS name such as `laptop.tailnet.ts.net.`.
+fn machine_name(dns_name: &str) -> String {
+    dns_name.split('.').next().unwrap_or_default().to_owned()
+}
+
+fn is_tagged(tags: Option<Vec<String>>) -> bool {
+    tags.is_some_and(|tags| !tags.is_empty())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct BackendState {
+    backend_state: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct StatusResponse {
-    backend_state: String,
     #[serde(rename = "Self")]
-    me: Option<PeerStatus>,
+    me: PeerStatus,
     /// Keyed by node key.
-    #[serde(default)]
     peer: Option<BTreeMap<String, PeerStatus>>,
 }
 
@@ -302,53 +337,38 @@ struct PeerStatus {
     /// The stable node ID.
     #[serde(rename = "ID")]
     id: NodeId,
-    #[serde(default)]
-    host_name: String,
     #[serde(rename = "DNSName", default)]
     dns_name: String,
     #[serde(rename = "UserID")]
     user_id: UserId,
-    #[serde(rename = "TailscaleIPs", default)]
+    tags: Option<Vec<String>>,
+    #[serde(rename = "TailscaleIPs")]
     tailscale_ips: Option<Vec<IpAddr>>,
-    #[serde(default)]
-    online: bool,
 }
 
 impl PeerStatus {
     fn into_device(self) -> Device {
         Device {
-            name: machine_name(&self.dns_name, &self.host_name),
+            name: machine_name(&self.dns_name),
             id: self.id,
             user: self.user_id,
+            tagged: is_tagged(self.tags),
             ips: self.tailscale_ips.unwrap_or_default(),
-            online: self.online,
         }
     }
 }
 
 impl StatusResponse {
-    fn into_tailnet(self) -> Result<Tailnet, Error> {
-        let Self {
-            backend_state,
-            me,
-            peer,
-        } = self;
-        let Some(me) = me.filter(|_| backend_state == "Running") else {
-            return Err(Error::NotRunning {
-                state: backend_state,
-            });
-        };
-        Ok(Tailnet {
-            me: Device {
-                online: true,
-                ..me.into_device()
-            },
-            peers: peer
+    fn into_tailnet(self) -> Tailnet {
+        Tailnet {
+            me: self.me.into_device(),
+            others: self
+                .peer
                 .unwrap_or_default()
                 .into_values()
                 .map(PeerStatus::into_device)
                 .collect(),
-        })
+        }
     }
 }
 
@@ -367,6 +387,7 @@ struct WhoIsNode {
     /// The MagicDNS name.
     #[serde(default)]
     name: String,
+    tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -378,37 +399,12 @@ struct WhoIsUser {
 impl WhoIsResponse {
     fn into_identity(self) -> Identity {
         Identity {
-            name: machine_name(&self.node.name, ""),
+            name: machine_name(&self.node.name),
             node: self.node.stable_id,
             user: self.user_profile.id,
+            tagged: is_tagged(self.node.tags),
         }
     }
-}
-
-/// Finds the devices owned by this device's user that accept TCP
-/// connections on `port`, the port heighliner listens on. Each device's
-/// addresses are tried in turn, each for at most `timeout`.
-pub async fn discover(
-    api: &impl LocalApi,
-    port: u16,
-    timeout: Duration,
-) -> Result<Vec<Device>, Error> {
-    let tailnet = api.status().await?;
-    let mut probes = JoinSet::new();
-    for device in tailnet.owned_peers().cloned() {
-        probes.spawn(async move {
-            for ip in &device.ips {
-                let connect = TcpStream::connect(SocketAddr::new(*ip, port));
-                if let Ok(Ok(_)) = tokio::time::timeout(timeout, connect).await {
-                    return Some(device);
-                }
-            }
-            None
-        });
-    }
-    let mut found: Vec<Device> = probes.join_all().await.into_iter().flatten().collect();
-    found.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(found)
 }
 
 #[cfg(test)]

@@ -2,24 +2,30 @@
 //! must come from a device owned by the user who owns this Node.
 //!
 //! Tailscale's WhoIs identifies the device behind a connection, so this
-//! needs no keys of its own. Tagged devices belong to Tailscale's
-//! tagged-devices user, so they are refused like any other user's.
+//! needs no keys of its own. It relies on the caller's address being its
+//! real tailnet address, so servers listen only on this Node's Tailscale
+//! addresses.
 
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::StatusCode;
-use axum::middleware::Next;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use tokio::net::TcpListener;
 
-use crate::tailscale::{self, Identity, LocalApi, UserId};
+use crate::tailscale::{self, Identity, LocalApi, Owner};
 
-/// Checks callers against the user who owns this Node.
+/// Checks callers against the user who owns this Node. The owner is read
+/// once, so an Authorizer must be recreated if this device's Tailscale
+/// login changes.
 pub struct Authorizer<T> {
     api: T,
-    owner: UserId,
+    owner: Owner,
 }
 
 /// Why a caller was refused.
@@ -37,9 +43,11 @@ impl fmt::Display for Denied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotOnTailnet(addr) => write!(f, "{addr} is not on the tailnet"),
-            Self::NotOwned(identity) => {
-                write!(f, "{} is not owned by this Node's user", identity.name)
-            }
+            Self::NotOwned(identity) => write!(
+                f,
+                "{} ({}) is not owned by this Node's user",
+                identity.name, identity.node
+            ),
             Self::Lookup(error) => write!(f, "can't identify the caller: {error}"),
         }
     }
@@ -47,29 +55,34 @@ impl fmt::Display for Denied {
 
 impl IntoResponse for Denied {
     fn into_response(self) -> Response {
-        let status = match self {
-            Self::NotOnTailnet(_) | Self::NotOwned(_) => StatusCode::FORBIDDEN,
-            Self::Lookup(_) => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        (status, self.to_string()).into_response()
+        match self {
+            Self::NotOnTailnet(_) | Self::NotOwned(_) => {
+                (StatusCode::FORBIDDEN, self.to_string()).into_response()
+            }
+            // The details stay in the log, away from unidentified callers.
+            Self::Lookup(_) => {
+                tracing::warn!("{self}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "can't identify the caller right now; try again",
+                )
+                    .into_response()
+            }
+        }
     }
 }
 
 impl<T: LocalApi> Authorizer<T> {
-    /// Reads this Node's owner from `api`.
+    /// Reads this Node's owner from `api`. Fails if this device is tagged.
     pub async fn new(api: T) -> Result<Self, tailscale::Error> {
-        let owner = api.status().await?.me.user;
+        let owner = api.status().await?.owner()?;
         Ok(Self { api, owner })
-    }
-
-    pub fn owner(&self) -> UserId {
-        self.owner
     }
 
     /// Identifies the caller at `addr`, if it may make requests.
     pub async fn authorize(&self, addr: SocketAddr) -> Result<Identity, Denied> {
         match self.api.whois(addr).await {
-            Ok(Some(identity)) if identity.user == self.owner => Ok(identity),
+            Ok(Some(identity)) if self.owner.owns(identity.user, identity.tagged) => Ok(identity),
             Ok(Some(identity)) => Err(Denied::NotOwned(identity)),
             Ok(None) => Err(Denied::NotOnTailnet(addr)),
             Err(error) => Err(Denied::Lookup(error)),
@@ -77,14 +90,23 @@ impl<T: LocalApi> Authorizer<T> {
     }
 }
 
-/// Axum middleware that refuses requests from callers [`Authorizer`]
-/// refuses, and gives handlers the caller's [`Identity`] as a request
-/// extension.
-///
-/// The server must provide `ConnectInfo<SocketAddr>`, as
-/// `into_make_service_with_connect_info::<SocketAddr>()` does; without it,
-/// every request fails.
-pub async fn require_owner<T: LocalApi>(
+/// Serves `router` on `listener`, refusing every request, including ones
+/// for unknown routes, that `authorizer` refuses. Handlers get the caller's
+/// [`Identity`] as a request extension.
+pub async fn serve<T: LocalApi>(
+    listener: TcpListener,
+    router: Router,
+    authorizer: Arc<Authorizer<T>>,
+) -> io::Result<()> {
+    let app = router.layer(middleware::from_fn_with_state(authorizer, require_owner));
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+}
+
+async fn require_owner<T: LocalApi>(
     State(authorizer): State<Arc<Authorizer<T>>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut request: Request,
@@ -101,48 +123,60 @@ pub async fn require_owner<T: LocalApi>(
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-
-    use axum::Router;
-    use axum::body::Body;
     use axum::extract::Extension;
-    use axum::extract::connect_info::MockConnectInfo;
     use axum::routing::get;
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpSocket;
 
     use super::*;
-    use crate::tailscale::fake::{Fake, device, identity};
+    use crate::tailscale::UserId;
+    use crate::tailscale::fake::{Fake, device};
 
     const OWNER: UserId = UserId::new(1);
     const OTHER: UserId = UserId::new(2);
 
     fn fake() -> Fake {
-        let mut fake = Fake::new(device("me", OWNER, "100.64.0.1"));
-        fake.add_peer(device("laptop", OWNER, "100.64.0.2"));
-        fake.add_peer(device("friend", OTHER, "100.64.0.3"));
+        let mut fake = Fake::new(device("me", OWNER, "127.0.0.1"));
+        fake.add_device(device("laptop", OWNER, "127.0.0.2"));
+        fake.add_device(device("friend", OTHER, "127.0.0.3"));
+        let mut tagged = device("server", OWNER, "127.0.0.4");
+        tagged.tagged = true;
+        fake.add_device(tagged);
+        fake.fail_whois_for("127.0.0.5".parse().unwrap());
         fake
     }
 
-    async fn call(fake: Fake, from: &str) -> (StatusCode, String) {
+    /// Serves a route that answers with the caller's name.
+    async fn start(fake: Fake) -> SocketAddr {
         let authorizer = Arc::new(Authorizer::new(fake).await.unwrap());
-        let app = Router::new()
-            .route(
-                "/",
-                get(|Extension(caller): Extension<Identity>| async move { caller.name }),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                authorizer,
-                require_owner,
-            ))
-            .layer(MockConnectInfo(SocketAddr::new(
-                from.parse::<IpAddr>().unwrap(),
-                40000,
-            )));
-        let response = app
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        let router = Router::new().route(
+            "/",
+            get(|Extension(caller): Extension<Identity>| async move { caller.name }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, router, authorizer));
+        addr
+    }
+
+    /// Sends a GET for `path` to `server` from the address `from`.
+    async fn get_from(from: &str, server: SocketAddr, path: &str) -> (StatusCode, String) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket
+            .bind(SocketAddr::new(from.parse().unwrap(), 0))
+            .unwrap();
+        let stream = socket.connect(server).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .unwrap();
+        tokio::spawn(connection);
+        let request = hyper::Request::get(path)
+            .header(hyper::header::HOST, "heighliner")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8(body.to_vec()).unwrap())
@@ -150,33 +184,50 @@ mod tests {
 
     #[tokio::test]
     async fn owners_devices_are_allowed() {
+        let server = start(fake()).await;
         assert_eq!(
-            call(fake(), "100.64.0.2").await,
-            (StatusCode::OK, "laptop".into())
-        );
-        assert_eq!(
-            call(fake(), "100.64.0.1").await,
+            get_from("127.0.0.1", server, "/").await,
             (StatusCode::OK, "me".into())
         );
+        assert_eq!(
+            get_from("127.0.0.2", server, "/").await,
+            (StatusCode::OK, "laptop".into())
+        );
     }
 
     #[tokio::test]
-    async fn other_users_and_strangers_are_refused() {
-        let (status, body) = call(fake(), "100.64.0.3").await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(body.contains("friend"), "{body}");
-
-        let (status, _) = call(fake(), "192.0.2.1").await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+    async fn others_are_refused_on_every_route() {
+        let server = start(fake()).await;
+        for (from, name) in [
+            ("127.0.0.3", Some("friend")),
+            ("127.0.0.4", Some("server")),
+            ("127.0.0.6", None),
+        ] {
+            for path in ["/", "/no-such-route"] {
+                let (status, body) = get_from(from, server, path).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{from} {path}");
+                if let Some(name) = name {
+                    assert!(body.contains(name), "{body}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
-    async fn failed_lookups_refuse_the_request() {
-        let mut fake = fake();
-        fake.add_identity("100.64.0.9".parse().unwrap(), identity("broken", OWNER));
-        fake.fail_whois_for("100.64.0.9".parse().unwrap());
-        let (status, body) = call(fake, "100.64.0.9").await;
+    async fn failed_lookups_refuse_the_request_without_details() {
+        let server = start(fake()).await;
+        let (status, body) = get_from("127.0.0.5", server, "/").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.contains("can't identify"), "{body}");
+        assert_eq!(body, "can't identify the caller right now; try again");
+    }
+
+    #[tokio::test]
+    async fn a_tagged_node_refuses_to_start() {
+        let mut me = device("me", OWNER, "127.0.0.1");
+        me.tagged = true;
+        assert!(matches!(
+            Authorizer::new(Fake::new(me)).await,
+            Err(tailscale::Error::Tagged)
+        ));
     }
 }

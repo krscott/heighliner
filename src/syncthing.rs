@@ -45,7 +45,9 @@
 //!   used.
 //! - A Data Conflict's losing copy is never deleted early: Syncthing keeps
 //!   every one (`maxConflicts` -1), and heighliner moves it into the
-//!   Displaced Versions, which expire with the Item's Retention Window.
+//!   Displaced Versions, where it expires a Retention Window after the
+//!   move. Conflict copies already in a path when it was set up are the
+//!   user's files, and stay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -973,6 +975,8 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(error(e)),
     }
+    // Conflict copies already here are the user's, not ones to move.
+    conflicts::mark_set_up(path).map_err(error)?;
     // Written beside it and renamed over it, so that neither a symlink nor
     // a hard link to a file elsewhere is written through.
     let staged = path.join(STAGED_IGNORE_FILE);
@@ -1033,7 +1037,7 @@ pub mod conflicts;
 mod events;
 mod state;
 
-pub use events::Finished;
+pub use events::{Finished, Seen};
 #[cfg(test)]
 pub(crate) mod test_instance;
 #[cfg(test)]

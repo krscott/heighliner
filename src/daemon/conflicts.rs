@@ -1,27 +1,37 @@
-//! Finding this Node's Data Conflicts, and keeping or swapping them.
+//! Finding this Node's Data Conflicts, expiring them, and keeping or
+//! swapping them.
 //!
-//! Conflict copies are moved into the Displaced Versions by a worker, one
-//! job at a time and away from the async runtime, so a slow or hung
-//! filesystem holds up only the worker. It looks in the directory of each
-//! item Syncthing finishes syncing, which is where Syncthing leaves a
-//! conflict's copy, and sweeps every Replica after the daemon's first
-//! round and then daily, for copies made while it wasn't looking.
+//! Conflict copies are moved into the Displaced Versions by a worker, away
+//! from the async runtime, so a slow or hung filesystem holds up only the
+//! worker. It looks in the directory of each item Syncthing finishes
+//! syncing, which is where Syncthing leaves a conflict's copy. It also
+//! sweeps every Replica, expiring old conflicts too, after the daemon's
+//! first round, daily, and whenever events may have been missed. Work
+//! waiting for it is merged, and when there is too much it becomes one
+//! sweep, so it stays bounded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::mem;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
-use super::Daemon;
+use super::{Daemon, RETENTION_WINDOW};
+use crate::hlc::Timestamp;
 use crate::model::{ItemId, Role};
-use crate::syncthing::Finished;
 use crate::syncthing::conflicts::{self, Collected, DataConflict};
+use crate::syncthing::{Finished, Outcome, Seen};
 use crate::tailscale::LocalApi;
 
 /// How often every Replica is swept for conflict copies.
 pub(super) const SWEEP_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many directories may wait to be looked in before a sweep replaces
+/// them.
+const MAX_WAITING_DIRS: usize = 10_000;
 
 /// A Replica of this Node whose folder is configured.
 #[derive(Clone, Debug)]
@@ -29,32 +39,40 @@ pub(super) struct Root {
     item: ItemId,
     name: String,
     path: PathBuf,
-    role: Role,
+    retention: Duration,
+    /// Whether its folder sends, so that a local change reaches the other
+    /// Replicas.
+    sends: bool,
 }
 
-/// Work for the conflict worker.
-#[derive(Debug)]
-pub(super) enum Job {
-    /// Look in these directories of these Replicas.
-    Collect(Vec<(Root, BTreeSet<String>)>),
-    /// Look everywhere in these Replicas.
-    Sweep(Vec<Root>),
+/// Work waiting for the conflict worker.
+#[derive(Debug, Default)]
+struct Waiting {
+    dirs: BTreeMap<ItemId, (Root, BTreeSet<String>)>,
+    count: usize,
+    sweep: Option<Vec<Root>>,
 }
 
-impl Job {
-    pub(super) fn run(self) {
-        match self {
-            Self::Collect(dirs) => {
-                for (root, dirs) in dirs {
-                    for dir in dirs {
-                        report(&root, conflicts::collect(&root.path, &dir));
+impl Waiting {
+    fn run(self) {
+        if let Some(roots) = self.sweep {
+            for root in roots {
+                report(&root, conflicts::sweep(&root.path));
+                let Root { item, name, .. } = &root;
+                match conflicts::expire(&root.path, root.retention, Timestamp::now()) {
+                    Ok(0) | Err(conflicts::Error::NotMounted) => {}
+                    Ok(removed) => {
+                        tracing::info!(%item, %name, removed, "expired data conflicts' kept versions");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%item, %name, %error, "can't expire data conflicts")
                     }
                 }
             }
-            Self::Sweep(roots) => {
-                for root in roots {
-                    report(&root, conflicts::sweep(&root.path));
-                }
+        }
+        for (root, dirs) in self.dirs.into_values() {
+            for dir in dirs {
+                report(&root, conflicts::collect(&root.path, &dir));
             }
         }
     }
@@ -77,7 +95,7 @@ fn report(root: &Root, collected: Result<Collected, conflicts::Error>) {
                 } = conflict;
                 tracing::info!(
                     %item, %name, %path, %file, %winner,
-                    "a data conflict: device {winner}'s change won, and the other is kept as .stversions/{version}"
+                    "a data conflict: device {winner}'s change won, and the other is kept in .stversions/{version}"
                 );
             }
             for error in failed {
@@ -87,12 +105,68 @@ fn report(root: &Root, collected: Result<Collected, conflicts::Error>) {
     }
 }
 
-/// Runs the jobs sent to `jobs`, one at a time, until it closes.
-pub(super) async fn worker(mut jobs: mpsc::UnboundedReceiver<Job>) {
-    while let Some(job) = jobs.recv().await {
-        // Each move is one rename, so a job cut short by the daemon
-        // stopping leaves no file half moved.
-        let _ = tokio::task::spawn_blocking(move || job.run()).await;
+/// The conflict worker's waiting work.
+#[derive(Debug, Default)]
+pub(super) struct Queue {
+    waiting: Mutex<Waiting>,
+    ready: Notify,
+}
+
+impl Queue {
+    fn add_dirs(&self, dirs: Vec<(Root, BTreeSet<String>)>, roots: impl FnOnce() -> Vec<Root>) {
+        let mut waiting = self.waiting.lock().unwrap();
+        // A sweep looks everywhere anyway.
+        if waiting.sweep.is_none() {
+            for (root, new) in dirs {
+                let (_, known) = waiting
+                    .dirs
+                    .entry(root.item)
+                    .or_insert_with(|| (root, BTreeSet::new()));
+                let before = known.len();
+                known.extend(new);
+                let added = known.len() - before;
+                waiting.count += added;
+            }
+            if waiting.count > MAX_WAITING_DIRS {
+                *waiting = Waiting {
+                    sweep: Some(roots()),
+                    ..Waiting::default()
+                };
+            }
+        }
+        drop(waiting);
+        self.ready.notify_one();
+    }
+
+    fn add_sweep(&self, roots: Vec<Root>) {
+        *self.waiting.lock().unwrap() = Waiting {
+            sweep: Some(roots),
+            ..Waiting::default()
+        };
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Waiting {
+        mem::take(&mut *self.waiting.lock().unwrap())
+    }
+
+    /// Runs the waiting work as it arrives. Runs until it is dropped.
+    pub(super) async fn work(&self) {
+        loop {
+            self.ready.notified().await;
+            let waiting = self.take();
+            if waiting.sweep.is_some() || !waiting.dirs.is_empty() {
+                // Each move is one rename, so work cut short by the daemon
+                // stopping leaves no file half moved.
+                let _ = tokio::task::spawn_blocking(move || waiting.run()).await;
+            }
+        }
+    }
+
+    /// Runs the waiting work now.
+    #[cfg(test)]
+    pub(super) fn run_now(&self) {
+        self.take().run();
     }
 }
 
@@ -101,9 +175,9 @@ pub(super) async fn worker(mut jobs: mpsc::UnboundedReceiver<Job>) {
 pub enum ActionError {
     /// The Item has no configured Replica on this Node.
     NoReplica(ItemId),
-    /// Only a peer's conflicts can be swapped, since a swap is a local
-    /// change.
-    NotAPeer(ItemId),
+    /// This Node's Replica doesn't send, so a swap, which is a local
+    /// change, wouldn't reach the others.
+    DoesntSend(ItemId),
     Conflict(conflicts::Error),
 }
 
@@ -111,7 +185,7 @@ impl fmt::Display for ActionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoReplica(item) => write!(f, "item {item} has no synced replica on this Node"),
-            Self::NotAPeer(item) => write!(
+            Self::DoesntSend(item) => write!(
                 f,
                 "this Node's replica of item {item} doesn't send, so its conflicts can't be swapped"
             ),
@@ -136,26 +210,42 @@ impl<T: LocalApi + Clone> Daemon<T> {
             .config
             .replicas_on(&me)
             .into_iter()
-            .filter(|local| {
-                outcomes
-                    .get(&local.item_id)
-                    .is_some_and(|outcome| outcome.is_configured())
-            })
-            .map(|local| Root {
-                item: local.item_id,
-                name: local.entry.item.name.clone(),
-                path: PathBuf::from(local.replica.path().as_str()),
-                role: local.role,
+            .filter_map(|local| {
+                let outcome = outcomes.get(&local.item_id)?;
+                let retention = local
+                    .entry
+                    .item
+                    .retention_days
+                    .map_or(RETENTION_WINDOW, |days| {
+                        Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
+                    });
+                outcome.is_configured().then(|| Root {
+                    item: local.item_id,
+                    name: local.entry.item.name.clone(),
+                    path: PathBuf::from(local.replica.path().as_str()),
+                    retention,
+                    // A peer with local changes from when it was a mirror
+                    // is still receive-only.
+                    sends: local.role == Role::Peer && *outcome == Outcome::Configured,
+                })
             })
             .collect()
     }
 
-    /// The job that looks for conflicts where Syncthing finished `items`.
-    pub(super) fn collect_job(&self, items: Vec<Finished>) -> Option<Job> {
+    /// Queues the work for what the watcher saw.
+    pub(super) fn look_for_conflicts(&self, queue: &Queue, seen: Vec<Seen>) {
         let mut dirs: BTreeMap<ItemId, BTreeSet<String>> = BTreeMap::new();
-        for Finished { item, path } in items {
-            let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-            dirs.entry(item).or_default().insert(dir.to_owned());
+        for seen in seen {
+            match seen {
+                Seen::Finished(Finished { item, path }) => {
+                    let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    dirs.entry(item).or_default().insert(dir.to_owned());
+                }
+                Seen::Missed => {
+                    self.queue_sweep(queue);
+                    return;
+                }
+            }
         }
         let jobs: Vec<_> = self
             .roots()
@@ -163,20 +253,29 @@ impl<T: LocalApi + Clone> Daemon<T> {
             .filter_map(|root| Some((dirs.remove(&root.item)?, root)))
             .map(|(dirs, root)| (root, dirs))
             .collect();
-        (!jobs.is_empty()).then_some(Job::Collect(jobs))
+        if !jobs.is_empty() {
+            queue.add_dirs(jobs, || self.roots());
+        }
     }
 
-    /// The job that sweeps every configured Replica.
-    pub(super) fn sweep_job(&self) -> Option<Job> {
+    /// Queues a sweep of every configured Replica, if there are any.
+    /// Returns whether it did.
+    pub(super) fn queue_sweep(&self, queue: &Queue) -> bool {
         let roots = self.roots();
-        (!roots.is_empty()).then_some(Job::Sweep(roots))
+        let any = !roots.is_empty();
+        if any {
+            queue.add_sweep(roots);
+        }
+        any
     }
 
-    /// Moves every conflict copy in this Node's Replicas into their
-    /// Displaced Versions now.
+    /// Sweeps every configured Replica now, moving conflict copies into the
+    /// Displaced Versions and expiring old conflicts.
     pub async fn sweep_conflicts(&self) {
-        if let Some(job) = self.sweep_job() {
-            let _ = tokio::task::spawn_blocking(move || job.run()).await;
+        let queue = Queue::default();
+        if self.queue_sweep(&queue) {
+            let waiting = queue.take();
+            let _ = tokio::task::spawn_blocking(move || waiting.run()).await;
         }
     }
 
@@ -225,8 +324,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
         version: &str,
     ) -> Result<DataConflict, ActionError> {
         let root = self.root(item)?;
-        if root.role != Role::Peer {
-            return Err(ActionError::NotAPeer(item));
+        if !root.sends {
+            return Err(ActionError::DoesntSend(item));
         }
         let path = root.path.clone();
         let version = version.to_owned();

@@ -949,10 +949,10 @@ async fn the_watcher_reports_items_syncthing_finishes() {
     fs::create_dir(file(&pair.a_path, "sub")).unwrap();
     fs::write(file(&pair.a_path, "sub/hello.txt"), "hi").unwrap();
     scan(&pair.a).await;
-    let wanted = Finished {
+    let wanted = Seen::Finished(Finished {
         item: ITEM,
         path: "sub/hello.txt".into(),
-    };
+    });
     let seen = tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(item) = items.recv().await {
             if item == wanted {
@@ -1046,4 +1046,19 @@ async fn a_data_conflict_stays_on_its_node_and_can_be_swapped() {
         .unwrap();
     assert!(eventually(|| fs::read_to_string(&a_notes).is_ok_and(|text| text == "from b")).await);
     assert!(conflicts::list(b_root).unwrap().is_empty());
+}
+
+#[test]
+fn an_adopted_paths_conflict_copies_are_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = path(dir.path().join("adopted"));
+    fs::create_dir(at.as_str()).unwrap();
+    let copy = "thesis.sync-conflict-20240101-120000-ABCDEFG.tex";
+    fs::write(file(&at, copy), "the only copy of some edits").unwrap();
+    // Set up in a later second than the copy was made.
+    std::thread::sleep(Duration::from_millis(1100));
+    prepare(&at, true, &[]).unwrap();
+    let swept = conflicts::sweep(Path::new(at.as_str())).unwrap();
+    assert!(swept.found.is_empty() && swept.failed.is_empty());
+    assert!(file(&at, copy).exists());
 }

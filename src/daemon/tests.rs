@@ -563,7 +563,9 @@ async fn the_daemon_collects_keeps_and_swaps_data_conflicts() {
         item: ITEM,
         path: "sub/a.txt".into(),
     };
-    daemon.collect_job(vec![finished]).unwrap().run();
+    let queue = super::conflicts::Queue::default();
+    daemon.look_for_conflicts(&queue, vec![crate::syncthing::Seen::Finished(finished)]);
+    queue.run_now();
     async fn found(daemon: &Daemon<Fake>) -> Vec<crate::syncthing::conflicts::DataConflict> {
         daemon.conflicts().await.remove(&ITEM).unwrap().unwrap()
     }

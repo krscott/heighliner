@@ -827,25 +827,28 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     // Dropped, and so stopped, with the daemon's other tasks.
     let mut tasks = JoinSet::new();
     let changed = Arc::new(Notify::new());
-    let (finished, mut finished_items) = mpsc::unbounded_channel();
-    let (jobs, conflict_jobs) = mpsc::unbounded_channel();
-    tasks.spawn(conflicts::worker(conflict_jobs));
+    let (seen, mut seen_by_watcher) = mpsc::unbounded_channel();
+    let queue = Arc::new(conflicts::Queue::default());
+    {
+        let queue = queue.clone();
+        tasks.spawn(async move { queue.work().await });
+    }
     if let Some(driver) = daemon.driver.clone() {
         let changed = changed.clone();
-        tasks.spawn(async move { driver.watch(&changed, &finished).await });
+        tasks.spawn(async move { driver.watch(&changed, &seen).await });
     }
+    // Taken from the watcher as it comes, so that it can't pile up.
+    let look = |daemon: &Daemon<Client>, first, rest: &mut mpsc::UnboundedReceiver<_>| {
+        let mut items = vec![first];
+        while let Ok(item) = rest.try_recv() {
+            items.push(item);
+        }
+        daemon.look_for_conflicts(&queue, items);
+    };
     let mut last_sweep: Option<Instant> = None;
     loop {
         tokio::select! {
-            Some(item) = finished_items.recv() => {
-                let mut items = vec![item];
-                while let Ok(item) = finished_items.try_recv() {
-                    items.push(item);
-                }
-                if let Some(job) = daemon.collect_job(items) {
-                    let _ = jobs.send(job);
-                }
-            }
+            Some(first) = seen_by_watcher.recv() => look(daemon, first, &mut seen_by_watcher),
             _ = changed.notified() => {
                 tokio::select! {
                     () = daemon.refresh() => {}
@@ -865,6 +868,7 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                     let round = loop {
                         tokio::select! {
                             round = &mut round => break round,
+                            Some(first) = seen_by_watcher.recv() => look(daemon, first, &mut seen_by_watcher),
                             () = async {
                                 changed.notified().await;
                                 refreshing.set(true);
@@ -895,9 +899,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Ok(_) => {}
                 }
                 if last_sweep.is_none_or(|at| at.elapsed() >= conflicts::SWEEP_EVERY)
-                    && let Some(job) = daemon.sweep_job()
+                    && daemon.queue_sweep(&queue)
                 {
-                    let _ = jobs.send(job);
                     last_sweep = Some(Instant::now());
                 }
             }

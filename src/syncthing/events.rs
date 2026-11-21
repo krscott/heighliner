@@ -30,7 +30,8 @@ pub(super) struct Event {
     data: Value,
 }
 
-/// A file or directory Syncthing finished syncing into a folder.
+/// A file or directory Syncthing finished syncing into a folder, or failed
+/// to: it may have moved a conflict's copy aside either way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finished {
     pub item: ItemId,
@@ -38,9 +39,18 @@ pub struct Finished {
     pub path: String,
 }
 
+/// What the watcher saw that may have left a conflict's copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Seen {
+    Finished(Finished),
+    /// Events may have been missed: Syncthing restarted or didn't answer,
+    /// or dropped some.
+    Missed,
+}
+
 impl Event {
     fn finished(&self) -> Option<Finished> {
-        if self.kind != "ItemFinished" || !self.data["error"].is_null() {
+        if self.kind != "ItemFinished" {
             return None;
         }
         let folder = self.data["folder"].as_str()?;
@@ -76,9 +86,14 @@ impl Client {
 impl Driver {
     /// Notifies `changed` whenever Syncthing reports an event after which
     /// a Replica's state may have changed, and when Syncthing stops or
-    /// starts answering again, and sends each item Syncthing finishes
-    /// syncing to `finished`. Runs until it is dropped.
-    pub async fn watch(&self, changed: &Notify, finished: &mpsc::UnboundedSender<Finished>) {
+    /// starts answering again. Sends `seen` each item Syncthing finishes
+    /// syncing, and [`Seen::Missed`] when events may have been missed.
+    /// Runs until it is dropped.
+    pub async fn watch(&self, changed: &Notify, seen: &mpsc::UnboundedSender<Seen>) {
+        // Only a dropped daemon stops listening.
+        let send = |what| {
+            let _ = seen.send(what);
+        };
         let mut since = self.client.latest_event().await.unwrap_or(0);
         let mut failing = false;
         loop {
@@ -87,6 +102,7 @@ impl Driver {
                 // Syncthing is back, perhaps with nothing new to report.
                 failing = false;
                 changed.notify_one();
+                send(Seen::Missed);
             }
             match events {
                 Ok(events) if events.is_empty() => {
@@ -96,13 +112,24 @@ impl Driver {
                     {
                         since = latest;
                         changed.notify_one();
+                        send(Seen::Missed);
                     }
                 }
                 Ok(events) => {
-                    since = events.iter().map(|event| event.id).max().unwrap_or(since);
+                    // Syncthing numbers each filter's events one by one,
+                    // so a gap means some were dropped.
+                    let mut next = since + 1;
+                    let mut missed = false;
+                    for event in &events {
+                        missed |= event.id != next;
+                        next = event.id + 1;
+                    }
+                    since = next - 1;
+                    if missed {
+                        send(Seen::Missed);
+                    }
                     for item in events.iter().filter_map(Event::finished) {
-                        // Only a dropped daemon stops listening.
-                        let _ = finished.send(item);
+                        send(Seen::Finished(item));
                     }
                     changed.notify_one();
                 }

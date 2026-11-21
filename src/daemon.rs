@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
@@ -103,9 +104,12 @@ pub enum Error {
     /// None of this device's Tailscale addresses could be listened on, for
     /// example because the tailnet interface isn't up yet.
     NoAddress,
-    /// This device's Tailscale addresses, node ID or owner changed since the
-    /// daemon started.
-    TailnetChanged,
+    /// This device's Tailscale addresses changed since the daemon last
+    /// listened; the status is the new one.
+    AddressesChanged(Box<Tailnet>),
+    /// This device's Tailscale node ID or owner changed since the daemon
+    /// started, so its records belong to another identity.
+    IdentityChanged,
     Serve(tokio::task::JoinError),
 }
 
@@ -155,9 +159,10 @@ impl fmt::Display for Error {
             Self::NoAddress => {
                 f.write_str("can't listen on any of this device's Tailscale addresses")
             }
-            Self::TailnetChanged => {
-                f.write_str("this device's Tailscale addresses, node ID or owner changed")
-            }
+            Self::AddressesChanged(_) => f.write_str("this device's Tailscale addresses changed"),
+            Self::IdentityChanged => f.write_str(
+                "this device's Tailscale node ID or owner changed since heighliner started, so its records belong to the old identity",
+            ),
             Self::Serve(error) => write!(f, "a server failed: {error}"),
         }
     }
@@ -175,7 +180,8 @@ impl std::error::Error for Error {
             | Self::StateOwner { .. }
             | Self::StateLocked { .. }
             | Self::NoAddress
-            | Self::TailnetChanged => None,
+            | Self::AddressesChanged(_)
+            | Self::IdentityChanged => None,
         }
     }
 }
@@ -283,12 +289,20 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// versions older than the Retention Window, then saves.
     pub async fn pull_round(&self) -> Result<Round, Error> {
         let tailnet = self.api.status().await?;
-        let identity = |tailnet: &Tailnet| {
-            let addresses: BTreeSet<IpAddr> = tailnet.me().ips.iter().copied().collect();
-            (tailnet.me().id.clone(), tailnet.owner(), addresses)
-        };
+        let identity = |tailnet: &Tailnet| (tailnet.me().id.clone(), tailnet.owner());
         if identity(&tailnet) != identity(&self.tailnet) {
-            return Err(Error::TailnetChanged);
+            return Err(Error::IdentityChanged);
+        }
+        let addresses = |tailnet: &Tailnet| {
+            tailnet
+                .me()
+                .ips
+                .iter()
+                .copied()
+                .collect::<BTreeSet<IpAddr>>()
+        };
+        if addresses(&tailnet) != addresses(&self.tailnet) {
+            return Err(Error::AddressesChanged(Box::new(tailnet)));
         }
         let mut round = Round::default();
         let mut pulls = JoinSet::new();
@@ -464,58 +478,53 @@ pub struct Options {
 }
 
 /// Runs the daemon. It waits for tailscaled to be ready, then serves and
-/// pulls until a server fails. It starts again if this device's Tailscale
-/// addresses or identity change.
+/// pulls, listening again when this device's Tailscale addresses change.
+/// It stops when a server fails, or when this device's Tailscale identity
+/// changes, since its records then belong to the old one.
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
+    let state_dir = &options.state_dir;
+    let mut daemon = retrying(|| Daemon::open(api.clone(), state_dir, options.port)).await?;
+    let mut servers = retrying(|| daemon.listen()).await?;
+    let mut pulls = tokio::time::interval(options.pull_every);
+    pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let (daemon, mut servers) = start(api.clone(), &options.state_dir, options.port).await?;
-        let mut pulls = tokio::time::interval(options.pull_every);
-        pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = pulls.tick() => match daemon.pull_round().await {
-                    Err(error @ Error::TailnetChanged) => {
-                        tracing::info!("{error}; starting again");
-                        break;
-                    }
-                    Err(error) => tracing::warn!(%error, "pulling records failed"),
-                    Ok(_) => {}
-                },
-                Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
-            }
+        tokio::select! {
+            _ = pulls.tick() => match daemon.pull_round().await {
+                Err(Error::AddressesChanged(tailnet)) => {
+                    tracing::info!("this device's Tailscale addresses changed; listening on the new ones");
+                    // Stop the servers and their connections first, so the
+                    // port is free on addresses that stay.
+                    servers.shutdown().await;
+                    daemon.tailnet = *tailnet;
+                    servers = retrying(|| daemon.listen()).await?;
+                }
+                Err(error @ Error::IdentityChanged) => {
+                    daemon.save()?;
+                    return Err(error);
+                }
+                Err(error) => tracing::warn!(%error, "pulling records failed"),
+                Ok(_) => {}
+            },
+            Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
         }
-        // Stop the servers and their connections, save, and release the
-        // state directory before starting again.
-        servers.shutdown().await;
-        if let Err(error) = daemon.save() {
-            tracing::warn!(%error, "saving before starting again failed");
-        }
-        drop(daemon);
     }
 }
 
-/// Opens the daemon and starts its servers, retrying while tailscaled
-/// isn't ready.
-async fn start(
-    api: Client,
-    state_dir: &Path,
-    port: u16,
-) -> Result<(Daemon<Client>, JoinSet<Infallible>), Error> {
+/// Runs `attempt` until it succeeds or fails for good, waiting longer
+/// between attempts while tailscaled isn't ready.
+async fn retrying<R, F: Future<Output = Result<R, Error>>>(
+    mut attempt: impl FnMut() -> F,
+) -> Result<R, Error> {
     let mut delay = Duration::from_secs(1);
     loop {
-        let started = async {
-            let daemon = Daemon::open(api.clone(), state_dir, port).await?;
-            let servers = daemon.listen().await?;
-            Ok::<_, Error>((daemon, servers))
-        };
-        match started.await {
+        match attempt().await {
             Err(error) if error.is_transient() => {
                 tracing::warn!(%error, "can't start yet; retrying in {}s", delay.as_secs());
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
-            started => return started,
+            result => return result,
         }
     }
 }

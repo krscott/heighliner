@@ -1,4 +1,5 @@
-//! The daemon: serves the Node protocol on this Node's Tailscale addresses,
+//! The daemon: serves the Node protocol and the API the CLI uses on this
+//! Node's Tailscale addresses,
 //! pulls the other Nodes' records on a timer, and keeps its copy of all
 //! records in a state file. When it drives Syncthing, it configures it each
 //! round and follows its Replicas' states.
@@ -254,6 +255,8 @@ pub struct Daemon<T> {
     saved: Mutex<Vec<u8>>,
     driver: Option<Driver>,
     replicas: Arc<Mutex<Replicas>>,
+    /// Notified after each edit through the API.
+    edited: Arc<Notify>,
 }
 
 /// A reconcile: the configuration it applied, and its outcome for each
@@ -326,6 +329,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 last_current,
                 logged: BTreeMap::new(),
             })),
+            edited: Arc::default(),
         })
     }
 
@@ -382,12 +386,16 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
                 Err(source) => return Err(Error::Listen { addr, source }),
             };
-            tracing::info!(%addr, "serving the Node protocol");
-            servers.spawn(auth::serve(
-                listener,
-                protocol::router(self.db.clone()),
-                authorizer.clone(),
-            ));
+            tracing::info!(%addr, "serving the Node protocol and the API");
+            let api = api::Api {
+                db: self.db.clone(),
+                replicas: self.replicas.clone(),
+                tailscale: self.api.clone(),
+                edited: self.edited.clone(),
+                home: std::env::var_os("HOME").map(PathBuf::from),
+            };
+            let router = protocol::router(self.db.clone()).merge(api::router(api));
+            servers.spawn(auth::serve(listener, router, authorizer.clone()));
         }
         if servers.is_empty() {
             return Err(Error::NoAddress);
@@ -838,8 +846,11 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
         tasks.spawn(async move { driver.watch(&changed, |seen| queue.add(seen)).await });
     }
     let mut last_sweep: Option<Instant> = None;
+    let edited = daemon.edited.clone();
     loop {
         tokio::select! {
+            // An edit is applied by a round, now rather than at its time.
+            _ = edited.notified() => pulls.reset_immediately(),
             _ = changed.notified() => {
                 tokio::select! {
                     () = daemon.refresh() => {}
@@ -921,6 +932,7 @@ async fn open_when_ready(
     }
 }
 
+mod api;
 mod conflicts;
 
 pub use conflicts::ActionError;

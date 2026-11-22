@@ -226,6 +226,16 @@ impl From<ExcludePattern> for String {
     }
 }
 
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Source => "source",
+            Self::Mirror => "mirror",
+            Self::Peer => "peer",
+        })
+    }
+}
+
 /// Whether an Item is one-way, from the Replica on `source`, or two-way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -246,7 +256,8 @@ impl Direction {
 }
 
 /// How a Replica takes part in its Item.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Role {
     Source,
     Mirror,
@@ -514,7 +525,8 @@ impl NodeInfo {
 }
 
 /// What a Replica knows about its own freshness.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ReplicaState {
     /// Has everything its reachable senders have.
     Current,

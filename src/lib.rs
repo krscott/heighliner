@@ -1,7 +1,9 @@
 //! Heighliner tracks directories across a Tailscale fleet and keeps them
 //! replicated with Syncthing.
 
+pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod discovery;

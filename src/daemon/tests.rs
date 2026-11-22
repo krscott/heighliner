@@ -554,9 +554,13 @@ async fn the_daemon_collects_keeps_and_swaps_data_conflicts() {
         fs::write(path, content).unwrap();
     };
     write("sub/a.txt", "won");
-    write("sub/a.sync-conflict-20261121-073910-ABCDEFG.txt", "lost");
+    // Named as Syncthing would now, so that they're newer than the set-up.
+    let now = Timestamp::now().to_string();
+    let at: String = now[..19].chars().filter(char::is_ascii_digit).collect();
+    let at = format!("{}-{}", &at[..8], &at[8..]);
+    write(&format!("sub/a.sync-conflict-{at}-ABCDEFG.txt"), "lost");
     write("b.txt", "won");
-    write("b.sync-conflict-20261121-073911-ABCDEFG.txt", "lost");
+    write(&format!("b.sync-conflict-{at}-ABCDEFH.txt"), "lost");
 
     // Where Syncthing finished an item, its directory is looked in.
     let finished = crate::syncthing::Finished {

@@ -155,3 +155,62 @@ async fn a_tilde_is_the_daemons_users_home() {
     let expected = format!("{}/notes", home.to_str().unwrap());
     assert_eq!(status.items[0].replicas[0].path, expected);
 }
+
+#[tokio::test]
+async fn edits_are_saved_and_ids_are_only_ids() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    // The first address isn't this machine's, so the daemon skips it.
+    let mut me = device("laptop", OWNER, "192.0.2.1");
+    me.ips.push("127.0.0.1".parse().unwrap());
+    let fake = Fake::new(me);
+    let state = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(fake.clone(), state.path(), port)
+        .await
+        .unwrap();
+    let _servers = daemon.listen().await.unwrap();
+    let client = Client::connect(&fake, port).await.unwrap();
+
+    let docs = tempfile::tempdir().unwrap();
+    let first = client
+        .track(&track(docs.path().to_str().unwrap()))
+        .await
+        .unwrap();
+    // Saved before it was acknowledged.
+    let saved = std::fs::read_to_string(state.path().join("state.json")).unwrap();
+    assert!(saved.contains(&first.id.to_string()));
+
+    // An Item named with another's ID isn't reached by that ID.
+    let other = tempfile::tempdir().unwrap();
+    let mut named = track(other.path().to_str().unwrap());
+    named.name = Some(first.id.to_string());
+    client.track(&named).await.unwrap();
+    client.untrack(&first.id.to_string()).await.unwrap();
+    let again = client.untrack(&first.id.to_string()).await;
+    assert!(
+        matches!(&again, Err(Error::Refused { status, .. }) if *status == StatusCode::NOT_FOUND),
+        "{again:?}"
+    );
+    assert_eq!(client.status().await.unwrap().items.len(), 1);
+
+    // A body that isn't the JSON a route takes is refused as JSON.
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let request = hyper::Request::post(crate::api::ITEMS)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+            "{\"path\": 1}",
+        )))
+        .unwrap();
+    let (status, body) = crate::http::send(stream, &format!("127.0.0.1:{port}"), request)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let refused: crate::api::Refused = serde_json::from_slice(&body).unwrap();
+    assert!(!refused.error.is_empty());
+}

@@ -7,6 +7,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -23,6 +24,9 @@ use crate::tailscale::{self, LocalApi};
 
 /// How long a request may take.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long connecting to one of the daemon's addresses may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub enum Error {
@@ -73,7 +77,10 @@ impl std::error::Error for Error {}
 
 /// This Node's daemon.
 pub struct Client {
-    addr: SocketAddr,
+    /// The device's Tailscale addresses, tried in turn, starting with the
+    /// one that last connected.
+    addrs: Vec<SocketAddr>,
+    last: AtomicUsize,
     me: NodeId,
     name: String,
 }
@@ -82,9 +89,12 @@ impl Client {
     /// The daemon on this device, serving on `port`.
     pub async fn connect(tailscale: &impl LocalApi, port: u16) -> Result<Self, Error> {
         let me = tailscale.this_device().await.map_err(Error::Tailscale)?;
-        let ip = *me.ips.first().ok_or(Error::NoAddress)?;
+        if me.ips.is_empty() {
+            return Err(Error::NoAddress);
+        }
         Ok(Self {
-            addr: SocketAddr::new(ip, port),
+            addrs: me.ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect(),
+            last: AtomicUsize::new(0),
             me: me.id,
             name: me.name,
         })
@@ -106,7 +116,6 @@ impl Client {
         path: &str,
         body: Option<&impl Serialize>,
     ) -> Result<R, Error> {
-        let addr = self.addr;
         let body = body.map_or_else(Bytes::new, |body| {
             Bytes::from(serde_json::to_vec(body).expect("requests serialize"))
         });
@@ -116,17 +125,32 @@ impl Client {
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(Full::new(body))
             .expect("a valid request");
-        let exchange = async {
-            let stream = TcpStream::connect(addr)
-                .await
-                .map_err(|source| Error::Connect { addr, source })?;
-            http::send(stream, &addr.to_string(), request)
-                .await
-                .map_err(|source| Error::Http { addr, source })
+        // The daemon may not have every address, so each is tried until
+        // one connects; the request is sent only once.
+        let mut connected = None;
+        let mut failed = None;
+        let first = self.last.load(Ordering::Relaxed);
+        for i in (first..self.addrs.len()).chain(0..first) {
+            let addr = self.addrs[i];
+            match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    self.last.store(i, Ordering::Relaxed);
+                    connected = Some((addr, stream));
+                    break;
+                }
+                Ok(Err(source)) => failed = Some(Error::Connect { addr, source }),
+                Err(_) => failed = Some(Error::Timeout { addr }),
+            }
+        }
+        let Some((addr, stream)) = connected else {
+            return Err(failed.expect("an address was tried"));
         };
+        let host = addr.to_string();
+        let exchange = http::send(stream, &host, request);
         let (status, body) = tokio::time::timeout(TIMEOUT, exchange)
             .await
-            .map_err(|_| Error::Timeout { addr })??;
+            .map_err(|_| Error::Timeout { addr })?
+            .map_err(|source| Error::Http { addr, source })?;
         if !status.is_success() {
             let message = match serde_json::from_slice::<Refused>(&body) {
                 Ok(refused) => refused.error,

@@ -80,10 +80,10 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import shlex
+
     def as_alice(machine, command):
         return machine.succeed(f"su - alice -c {shlex.quote(command)}")
-
-    import shlex
 
     start_all()
     headscale.wait_for_unit("headscale")
@@ -118,13 +118,19 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Both Nodes see the item fully replicated"):
         for machine in [alpha, beta]:
+            # The whole line: "not confirmed fully replicated" contains it.
             machine.wait_until_succeeds(
-                "su - alice -c 'heighliner status' | grep -q 'fully replicated'", timeout=120
+                "su - alice -c 'heighliner status' | grep -qx '  fully replicated'", timeout=120
             )
 
     with subtest("The web UI answers at the Node's MagicDNS name, from another Node"):
-        page = beta.wait_until_succeeds("curl -sf http://alpha.tailnet:7130/", timeout=60)
-        assert "docs" in page and "fully replicated" in page, page
+        beta.wait_until_succeeds(
+            "curl -sf http://alpha.tailnet:7130/"
+            " | grep -qF '<span class=\"badge good\">fully replicated</span>'",
+            timeout=60,
+        )
+        page = beta.succeed("curl -sf http://alpha.tailnet:7130/")
+        assert ">docs</a>" in page, page
 
     with subtest("A Node that stops is shown unreachable, as last read"):
         beta.succeed("systemctl stop heighliner.service heighliner-syncthing.service")

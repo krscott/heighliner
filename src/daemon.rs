@@ -256,6 +256,8 @@ pub struct Daemon<T> {
     replicas: Arc<Mutex<Replicas>>,
     /// Notified after each edit through the API.
     edited: Arc<Notify>,
+    /// The other Nodes' Replicas' states, as last read, and when.
+    remote: Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, ReplicaState>)>>>,
 }
 
 /// A reconcile: the configuration it applied, and its outcome for each
@@ -329,6 +331,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 logged: BTreeMap::new(),
             })),
             edited: Arc::default(),
+            remote: Arc::default(),
         })
     }
 
@@ -391,6 +394,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 replicas: self.replicas.clone(),
                 tailscale: self.api.clone(),
                 edited: self.edited.clone(),
+                remote: self.remote.clone(),
                 home: std::env::var_os("HOME").map(PathBuf::from),
             };
             let router = protocol::router(self.db.clone()).merge(api::router(api));
@@ -431,8 +435,15 @@ impl<T: LocalApi + Clone> Daemon<T> {
         {
             match hello {
                 Ok(hello) if hello.protocol == protocol::MAJOR => {
+                    let remote = self.remote.clone();
                     pulls.spawn(async move {
                         let pulled = protocol::pull(addr, &hello, PULL_TIMEOUT).await;
+                        // Only shown, so a Node that can't answer keeps its
+                        // last-known states.
+                        if let Ok(read) = protocol::states(addr, PULL_TIMEOUT).await {
+                            let read_at = Timestamp::now();
+                            remote.lock().unwrap().insert(device.id.clone(), (read_at, read.states));
+                        }
                         (device, pulled)
                     });
                 }

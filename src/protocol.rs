@@ -1,6 +1,7 @@
 //! The Node protocol: the HTTP API daemons use to talk to each other.
 //!
-//! Daemons pull each other's records. `GET /node/hello` says which major
+//! Daemons pull each other's records, and the states of each other's
+//! Replicas. `GET /node/hello` says which major
 //! version of the protocol a Node speaks; every version keeps its
 //! `protocol` and `heighliner` fields. Every other route sits under
 //! `/node/v<major>/`, and Nodes whose majors differ don't exchange records.
@@ -22,7 +23,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 
+use std::collections::BTreeMap;
+
 use crate::config::ConfigDb;
+use crate::model::{ItemId, ReplicaState};
 use crate::http::{self, BoxError};
 use crate::record::Store;
 
@@ -31,6 +35,16 @@ pub const MAJOR: u32 = 1;
 
 pub const HELLO_PATH: &str = "/node/hello";
 const RECORDS_PATH: &str = "/node/v1/records";
+
+/// A Node's Replicas' states, as [`NodeStates`].
+pub const STATES_PATH: &str = "/node/v1/states";
+
+/// The answer to `GET` [`STATES_PATH`]: the states of the answering Node's
+/// Replicas, as it last read them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeStates {
+    pub states: BTreeMap<ItemId, ReplicaState>,
+}
 
 /// The answer to `GET /node/hello`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +203,12 @@ pub async fn pull(
     }
     let records: Vec<serde_json::Value> = get_json(addr, RECORDS_PATH, timeout).await?;
     Ok(Store::decode_lenient(records))
+}
+
+/// The states of the Replicas of the Node at `addr`. A Node that doesn't
+/// serve them yet fails.
+pub async fn states(addr: SocketAddr, timeout: Duration) -> Result<NodeStates, Error> {
+    get_json(addr, STATES_PATH, timeout).await
 }
 
 #[cfg(test)]

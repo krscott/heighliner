@@ -379,6 +379,23 @@ fn nodes_publish_their_device_ids() {
 }
 
 #[test]
+fn a_node_leaves_by_its_own_record() {
+    let id = |s: &str| DeviceId::new(s).unwrap();
+    let first = id("MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD");
+    let second = id("AAAAAAA-BBBBBBX-BCCCCCC-CDDDDDU-DDEEEEE-EEFFFFR-FFFGGGG-2222223");
+    let mut a = db("a");
+    assert!(matches!(a.leave(t(1)), Err(EditError::NotJoined)));
+    a.set_device_id(t(2), first.clone()).unwrap();
+    a.leave(t(3)).unwrap();
+    let info = &a.config().nodes[&node("a")];
+    assert!(info.departed);
+    assert_eq!(info.device_id, first);
+    // A new Syncthing device ID doesn't bring it back.
+    a.set_device_id(t(4), second).unwrap();
+    assert!(a.config().nodes[&node("a")].departed);
+}
+
+#[test]
 fn an_unreadable_node_record_is_not_overwritten() {
     let future = foreign_store(vec![(
         node_key(&node("a")),

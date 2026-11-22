@@ -431,6 +431,9 @@ pub enum EditError {
     Unreadable(RecordKey),
     /// The edit would cause a Problem that wasn't there before.
     WouldCause(Problem),
+    /// This Node hasn't published its record, which it does once it runs
+    /// Syncthing, so it isn't part of the Fleet to leave.
+    NotJoined,
 }
 
 impl fmt::Display for EditError {
@@ -454,6 +457,9 @@ impl fmt::Display for EditError {
                 key.kind, key.id
             ),
             Self::WouldCause(problem) => write!(f, "refused, because {problem}"),
+            Self::NotJoined => f.write_str(
+                "this Node hasn't joined the Fleet yet: it joins once its daemon drives Syncthing",
+            ),
         }
     }
 }
@@ -675,10 +681,25 @@ impl ConfigDb {
         let mut info = NodeInfo::new(device_id);
         match self.config().nodes.remove(self.node()) {
             Some(original) if original.device_id == info.device_id => return Ok(()),
-            Some(original) => info.keep_unknown_fields(original),
+            Some(original) => info.keep_fields(original),
             None if is_live(self.store.get(&key)) => return Err(EditError::Unreadable(key)),
             None => {}
         }
+        self.edit(|db| db.write(now, key, &info))
+    }
+
+    /// Records that this Node leaves the Fleet, so that no Node syncs with
+    /// it any more. Its Replicas stay until they are removed. It needs the
+    /// Node's record, which it publishes once it runs Syncthing.
+    pub fn leave(&mut self, now: Timestamp) -> Result<(), EditError> {
+        let key = node_key(self.node());
+        let mut info = match self.config().nodes.remove(self.node()) {
+            Some(info) if info.departed => return Ok(()),
+            Some(info) => info,
+            None if is_live(self.store.get(&key)) => return Err(EditError::Unreadable(key)),
+            None => return Err(EditError::NotJoined),
+        };
+        info.departed = true;
         self.edit(|db| db.write(now, key, &info))
     }
 

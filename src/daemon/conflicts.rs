@@ -322,7 +322,11 @@ impl Conflicts {
 
     /// Keeps the winning change of the Data Conflict `version` in `item`'s
     /// Replica.
-    pub(super) async fn keep(&self, item: ItemId, version: &str) -> Result<DataConflict, ActionError> {
+    pub(super) async fn keep(
+        &self,
+        item: ItemId,
+        version: &str,
+    ) -> Result<DataConflict, ActionError> {
         let root = self.root(item)?;
         let version = version.to_owned();
         tokio::task::spawn_blocking(move || conflicts::keep(&root.path, &version))
@@ -334,7 +338,11 @@ impl Conflicts {
     /// Makes the losing change of the Data Conflict `version` in `item`'s
     /// Replica the file's content again, which Syncthing then sends to the
     /// other Replicas. Its folder must send now, as Syncthing has it.
-    pub(super) async fn swap(&self, item: ItemId, version: &str) -> Result<DataConflict, ActionError> {
+    pub(super) async fn swap(
+        &self,
+        item: ItemId,
+        version: &str,
+    ) -> Result<DataConflict, ActionError> {
         let root = self.root(item)?;
         let driver = self.driver.as_ref().ok_or(ActionError::NoReplica(item))?;
         let sends = driver

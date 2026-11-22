@@ -26,8 +26,8 @@ use tokio::net::TcpStream;
 use std::collections::BTreeMap;
 
 use crate::config::ConfigDb;
-use crate::model::{ItemId, ReplicaState};
 use crate::http::{self, BoxError};
+use crate::model::{ItemId, ReplicaState};
 use crate::record::Store;
 
 /// The major version of the protocol this build speaks.

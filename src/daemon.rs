@@ -256,8 +256,7 @@ pub struct Daemon<T> {
     replicas: Arc<Mutex<Replicas>>,
     /// Notified after each edit through the API.
     edited: Arc<Notify>,
-    /// The other Nodes' Replicas' states, as last read, and when.
-    remote: Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, ReplicaState>)>>>,
+    remote: RemoteStates,
 }
 
 /// A reconcile: the configuration it applied, and its outcome for each
@@ -267,6 +266,9 @@ struct Reconciled {
     config: Config,
     outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
 }
+
+/// The other Nodes' Replicas' states, as last read in a round, and when.
+type RemoteStates = Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, ReplicaState>)>>>;
 
 /// This Node's Replicas, as last seen in Syncthing.
 struct Replicas {
@@ -395,6 +397,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 tailscale: self.api.clone(),
                 edited: self.edited.clone(),
                 remote: self.remote.clone(),
+                conflicts: self.conflict_ops(),
                 home: std::env::var_os("HOME").map(PathBuf::from),
             };
             let hosts = self
@@ -452,7 +455,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
                         // last-known states.
                         if let Ok(read) = protocol::states(addr, PULL_TIMEOUT).await {
                             let read_at = Timestamp::now();
-                            remote.lock().unwrap().insert(device.id.clone(), (read_at, read.states));
+                            remote
+                                .lock()
+                                .unwrap()
+                                .insert(device.id.clone(), (read_at, read.states));
                         }
                         (device, pulled)
                     });

@@ -27,8 +27,10 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum Error {
     Tailscale(tailscale::Error),
-    /// This device has no Tailscale address.
+    /// This device, or the Node asked for, has no Tailscale address.
     NoAddress,
+    /// No Node, or more than one, has that name.
+    UnknownNode(String),
     Connect {
         addr: SocketAddr,
         source: io::Error,
@@ -54,9 +56,13 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tailscale(error) => write!(f, "can't ask Tailscale for this device: {error}"),
-            Self::NoAddress => {
-                f.write_str("this device has no Tailscale address; is Tailscale up?")
+            Self::UnknownNode(name) => {
+                write!(
+                    f,
+                    "no one Node of the owner's on the tailnet is named {name}"
+                )
             }
+            Self::NoAddress => f.write_str("the device has no Tailscale address; is Tailscale up?"),
             Self::Connect { addr, source } => write!(
                 f,
                 "can't reach this Node's daemon at {addr}: {source}; is it running?"
@@ -79,25 +85,58 @@ pub struct Client {
 }
 
 impl Client {
-    /// The daemon on this device, serving on `port`.
-    pub async fn connect(tailscale: &impl LocalApi, port: u16) -> Result<Self, Error> {
-        let me = tailscale.this_device().await.map_err(Error::Tailscale)?;
-        let ip = *me.ips.first().ok_or(Error::NoAddress)?;
+    /// The daemon on this device, or on the Node `on` names by machine
+    /// name or node ID, serving on `port`.
+    pub async fn connect(
+        tailscale: &impl LocalApi,
+        port: u16,
+        on: Option<&str>,
+    ) -> Result<Self, Error> {
+        let device = match on {
+            None => tailscale.this_device().await.map_err(Error::Tailscale)?,
+            Some(name) => {
+                let tailnet = tailscale.status().await.map_err(Error::Tailscale)?;
+                let mut matching = std::iter::once(tailnet.me())
+                    .chain(tailnet.owned_devices())
+                    .filter(|device| device.name == name || device.id.as_str() == name);
+                match (matching.next(), matching.next()) {
+                    (Some(device), None) => device.clone(),
+                    _ => return Err(Error::UnknownNode(name.to_owned())),
+                }
+            }
+        };
+        let ip = *device.ips.first().ok_or(Error::NoAddress)?;
         Ok(Self {
             addr: SocketAddr::new(ip, port),
-            me: me.id,
-            name: me.name,
+            me: device.id,
+            name: device.name,
         })
     }
 
-    /// This Node.
+    /// The Node whose daemon this is.
     pub fn me(&self) -> &NodeId {
         &self.me
     }
 
-    /// This Node's machine name.
+    /// Its machine name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub async fn conflicts(&self) -> Result<api::Conflicts, Error> {
+        self.call(Method::GET, api::CONFLICTS, None::<&()>).await
+    }
+
+    pub async fn keep(&self, resolve: &api::Resolve) -> Result<(), Error> {
+        self.call(Method::POST, api::KEEP, Some(resolve)).await
+    }
+
+    pub async fn swap(&self, resolve: &api::Resolve) -> Result<(), Error> {
+        self.call(Method::POST, api::SWAP, Some(resolve)).await
+    }
+
+    pub async fn leave(&self) -> Result<(), Error> {
+        self.call(Method::POST, api::LEAVE, None::<&()>).await
     }
 
     async fn call<R: DeserializeOwned>(
@@ -175,18 +214,16 @@ impl Client {
     }
 }
 
-/// A `[node:]path` argument, split. A path on this Node, which `local`
-/// names (by machine name or node ID) or which has no node, is made
-/// absolute from `cwd` if it is relative; `~` is left for the daemon.
-pub fn node_path(argument: &str, cwd: &Path, local: &[&str]) -> (Option<String>, String) {
-    let here = |path: &str| {
-        if path == "~" || path.starts_with("~/") {
-            path.to_owned()
-        } else if path.starts_with('/') {
-            api::normalize(path)
-        } else {
-            api::normalize(&cwd.join(path).to_string_lossy())
-        }
+/// A `[node:]path` argument, split. A path on the daemon's Node, which
+/// `local` names (by machine name or node ID) or which has no node, is
+/// made absolute from `cwd`, if this is that Node, when it is relative;
+/// `~` is left for the daemon.
+pub fn node_path(argument: &str, cwd: Option<&Path>, local: &[&str]) -> (Option<String>, String) {
+    let here = |path: &str| match cwd {
+        _ if path == "~" || path.starts_with("~/") => path.to_owned(),
+        _ if path.starts_with('/') => api::normalize(path),
+        Some(cwd) => api::normalize(&cwd.join(path).to_string_lossy()),
+        None => path.to_owned(),
     };
     match argument.split_once(':') {
         Some((node, path))
@@ -237,11 +274,16 @@ pub fn format_status(status: &Status) -> String {
                 .as_deref()
                 .unwrap_or(replica.node.as_str());
             let mut line = format!("  {node}:{} {}", replica.path, replica.role);
+            if replica.departed {
+                line.push_str(", departed");
+            }
             if replica.paused {
                 line.push_str(", paused");
             }
-            if let Some(state) = &replica.state {
-                line.push_str(&format!(", {state}"));
+            match (&replica.state, replica.state_read_at) {
+                (Some(state), None) => line.push_str(&format!(", {state}")),
+                (Some(state), Some(at)) => line.push_str(&format!(", {state} (as of {at})")),
+                (None, _) => {}
             }
             out.push_str(&line);
             out.push('\n');
@@ -252,6 +294,29 @@ pub fn format_status(status: &Status) -> String {
         for problem in &status.problems {
             out.push_str(&format!("  {problem}\n"));
         }
+    }
+    out
+}
+
+/// This Node's Data Conflicts as text.
+pub fn format_conflicts(listed: &api::Conflicts) -> String {
+    let mut out = String::new();
+    if listed.conflicts.is_empty() {
+        out.push_str("No data conflicts.\n");
+    }
+    for conflict in &listed.conflicts {
+        out.push_str(&format!(
+            "{} {}: device {}'s change won at {}; the other expires at {}\n  version {}\n",
+            conflict.item_name,
+            conflict.path,
+            conflict.winner,
+            conflict.at,
+            conflict.expires_at,
+            conflict.version
+        ));
+    }
+    for error in &listed.errors {
+        out.push_str(&format!("Can't read the conflicts of {error}\n"));
     }
     out
 }

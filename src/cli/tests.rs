@@ -13,7 +13,7 @@ const OWNER: UserId = UserId::new(1);
 #[test]
 fn node_paths_split() {
     let cwd = PathBuf::from("/home/me/work");
-    let split = |argument| node_path(argument, &cwd);
+    let split = |argument| node_path(argument, &cwd, &["laptop"]);
     assert_eq!(
         split("nas:/srv/docs"),
         (Some("nas".into()), "/srv/docs".into())
@@ -22,8 +22,15 @@ fn node_paths_split() {
     assert_eq!(split("/srv/a:b"), (None, "/srv/a:b".into()));
     assert_eq!(split("~/docs"), (None, "~/docs".into()));
     assert_eq!(split("docs"), (None, "/home/me/work/docs".into()));
-    assert_eq!(split("./a:b"), (None, "/home/me/work/./a:b".into()));
     assert_eq!(split("sub/a:b"), (None, "/home/me/work/sub/a:b".into()));
+    // Written as a Replica's path is.
+    assert_eq!(split("."), (None, "/home/me/work".into()));
+    assert_eq!(split("./a:b"), (None, "/home/me/work/a:b".into()));
+    assert_eq!(split("docs/"), (None, "/home/me/work/docs".into()));
+    assert_eq!(split("../x"), (None, "/home/me/x".into()));
+    assert_eq!(split("docs//sub"), (None, "/home/me/work/docs/sub".into()));
+    // This Node, named.
+    assert_eq!(split("laptop:docs"), (None, "/home/me/work/docs".into()));
 }
 
 fn track(path: &str) -> Track {
@@ -77,12 +84,20 @@ async fn the_cli_edits_through_the_daemon() {
         matches!(&refused, Err(Error::Refused { message, .. }) if message.contains("absolute")),
         "{refused:?}"
     );
+    // Only at this device's address: not a rebound name.
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (status, _) = crate::http::get(stream, "evil.example", crate::api::STATUS)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
     let refused = client.add_replica("docs", &add("attic", "/srv/docs")).await;
     assert!(
         matches!(&refused, Err(Error::Refused { status, .. }) if *status == StatusCode::NOT_FOUND)
     );
     client
-        .add_replica("docs", &add("nas", "/srv/docs"))
+        .add_replica("docs", &add("nas", "/srv//docs/"))
         .await
         .unwrap();
     client.pause_replica("docs", "nas", true).await.unwrap();

@@ -397,7 +397,17 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 remote: self.remote.clone(),
                 home: std::env::var_os("HOME").map(PathBuf::from),
             };
-            let router = protocol::router(self.db.clone()).merge(api::router(api));
+            let hosts = self
+                .tailnet
+                .me()
+                .ips
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, self.port).to_string())
+                .collect();
+            let router = auth::only_for_hosts(
+                protocol::router(self.db.clone()).merge(api::router(api)),
+                hosts,
+            );
             servers.spawn(auth::serve(listener, router, authorizer.clone()));
         }
         if servers.is_empty() {

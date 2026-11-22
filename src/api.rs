@@ -13,6 +13,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ItemId, NodeId, ReplicaState, Role};
 
+/// `path`, absolute, with `.` and empty components dropped and `..`
+/// resolved by its name alone, as a Replica's path is written.
+pub fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
 /// This Node's view of the Fleet's configuration.
 pub const STATUS: &str = "/api/v1/status";
 

@@ -948,13 +948,12 @@ async fn syncthing_takes_the_event_filter() {
     syncthing
         .reconcile(&tracked("a", &syncthing.dir("docs")).config(), &alone())
         .await;
+    // Read first: more events may come while the others are read.
+    let latest = client.latest_event().await.unwrap();
+    assert!(latest > 0);
     let events = client.events(0, Duration::from_secs(1)).await.unwrap();
     let ids: Vec<u64> = events.iter().map(|event| event.id).collect();
-    assert!(!ids.is_empty());
-    assert_eq!(
-        ids.iter().max().copied(),
-        Some(client.latest_event().await.unwrap())
-    );
+    assert!(ids.contains(&latest), "{ids:?} has {latest}");
 }
 
 #[tokio::test]

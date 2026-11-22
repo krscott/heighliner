@@ -11,8 +11,7 @@ const ITEM: ItemId = ItemId::from_u128(1);
 
 /// A free port, shared by every test daemon on its own loopback address.
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    crate::syncthing::test_instance::free_port()
 }
 
 /// A Fake for the device at `me` that sees the devices at `others`.

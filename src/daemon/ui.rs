@@ -430,7 +430,10 @@ async fn fleet<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
         @if !conflicts.conflicts.is_empty() {
             p.callout {
                 a href="/conflicts" {
-                    (conflicts.conflicts.len()) " data conflicts on this Node to review"
+                    @match conflicts.conflicts.len() {
+                        1 => "1 data conflict on this Node to review",
+                        count => { (count) " data conflicts on this Node to review" },
+                    }
                 }
             }
         }
@@ -692,7 +695,7 @@ fn conflict_list(now: Timestamp, listed: &api::Conflicts, back: &str) -> Markup 
                         " " code { (conflict.path) }
                     }
                     p {
-                        "Device " code { (conflict.winner) } "'s change won at " (conflict.at) ". "
+                        "Device " code { (conflict.winner) } "'s change won at " (conflict.local_time()) ", its local time. "
                         "The other change is kept until "
                         time datetime=(conflict.expires_at) title=(conflict.expires_at) {
                             (until(now, conflict.expires_at))

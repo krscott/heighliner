@@ -425,7 +425,7 @@ pub fn format_conflicts(listed: &api::Conflicts) -> String {
             conflict.item_name,
             conflict.path,
             conflict.winner,
-            conflict.at,
+            conflict.local_time(),
             conflict.expires_at,
             conflict.version
         ));

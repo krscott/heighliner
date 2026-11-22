@@ -4,6 +4,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -135,12 +136,20 @@ impl Drop for Syncthing {
     }
 }
 
-/// A port free on both loopback addresses the tests use.
+/// A port free on the loopback addresses the tests use, and unique in
+/// this process. It is below Linux's ephemeral range (32768 and up), so
+/// no connection can take it as its own port between choosing and binding
+/// it. Processes running tests at once start at different ports.
 pub(crate) fn free_port() -> u16 {
+    const FIRST: u32 = 10_000;
+    const COUNT: u32 = 22_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let start = std::process::id().wrapping_mul(97) % COUNT;
     loop {
-        let first = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = first.local_addr().unwrap().port();
-        if TcpListener::bind(("127.0.0.2", port)).is_ok() {
+        let offset = (start + NEXT.fetch_add(1, Ordering::Relaxed)) % COUNT;
+        let port = u16::try_from(FIRST + offset).expect("ports fit");
+        let free = (1..=5).all(|last| TcpListener::bind((format!("127.0.0.{last}"), port)).is_ok());
+        if free {
             return port;
         }
     }

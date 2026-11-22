@@ -211,6 +211,28 @@ pub struct Conflicts {
     pub errors: Vec<String>,
 }
 
+impl Conflict {
+    /// When it happened, as `2026-11-22 20:50:22`, in the local time of
+    /// the device that saw it, or as Syncthing wrote it if it can't be read.
+    pub fn local_time(&self) -> String {
+        let at = self.at.as_bytes();
+        let digits = |range: std::ops::Range<usize>| at[range].iter().all(u8::is_ascii_digit);
+        if at.len() != 15 || at[8] != b'-' || !digits(0..8) || !digits(9..15) {
+            return self.at.clone();
+        }
+        let at = &self.at;
+        format!(
+            "{}-{}-{} {}:{}:{}",
+            &at[0..4],
+            &at[4..6],
+            &at[6..8],
+            &at[9..11],
+            &at[11..13],
+            &at[13..15]
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
     pub item: ItemId,
@@ -251,4 +273,30 @@ pub struct Tracked {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refused {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_times_read_as_dates() {
+        let conflict = |at: &str| Conflict {
+            item: ItemId::from_u128(1),
+            item_name: "docs".into(),
+            path: "notes.txt".into(),
+            at: at.into(),
+            winner: "ABCDEFG".into(),
+            version: "v".into(),
+            expires_at: Timestamp::from_millis(0),
+        };
+        assert_eq!(
+            conflict("20261122-205022").local_time(),
+            "2026-11-22 20:50:22"
+        );
+        // Anything else is shown as Syncthing wrote it.
+        for odd in ["2026112-205022", "20261122_205022", "2026112x-205022", ""] {
+            assert_eq!(conflict(odd).local_time(), odd);
+        }
+    }
 }

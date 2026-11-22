@@ -311,6 +311,8 @@ async fn coming_back_stays_on_the_daemons_pages() {
         "%2F%2Fevil.example",
         "https%3A%2F%2Fevil.example",
         "%2F%5Cevil.example",
+        "%2F%09%2Fevil.example",
+        "%2F%0D%0A%2Fevil.example",
     ] {
         let form = format!("paused=false&back={back}");
         let (_, location, _) = post_form(&daemon, &path, &form, OURS).await;

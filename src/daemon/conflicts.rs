@@ -259,21 +259,25 @@ const WORK_TIMEOUT: Duration = Duration::from_secs(5);
 /// thread per Replica, however often its conflicts are asked for.
 pub(super) type Gates = Arc<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>;
 
+/// The gate for the Replica at `path`.
+fn gate(gates: &Gates, path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = gates.lock().unwrap();
+    // Gates no work holds or waits on are dropped, so they don't pile up
+    // as Replicas move.
+    gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+    gates.entry(path.to_owned()).or_default().clone()
+}
+
 /// Runs `work` on the Replica at `path` away from the async runtime, after
 /// any earlier work on it finishes, for at most [`WORK_TIMEOUT`]. Work
-/// that times out still runs to its end, holding the gate.
+/// that times out still runs to its end, holding the gate; work that
+/// times out waiting for it is dropped.
 async fn gated<R: Send + 'static>(
     gates: &Gates,
     path: PathBuf,
     work: impl FnOnce(&std::path::Path) -> R + Send + 'static,
 ) -> Result<R, ActionError> {
-    let gate = {
-        let mut gates = gates.lock().unwrap();
-        // Gates no work holds or waits on are dropped, so they don't pile
-        // up as Replicas move.
-        gates.retain(|_, gate| Arc::strong_count(gate) > 1);
-        gates.entry(path.clone()).or_default().clone()
-    };
+    let gate = gate(gates, &path);
     let run = async move {
         let open = gate.lock_owned().await;
         tokio::task::spawn_blocking(move || {
@@ -287,6 +291,33 @@ async fn gated<R: Send + 'static>(
     tokio::time::timeout(WORK_TIMEOUT, run)
         .await
         .map_err(|_| ActionError::Hung)
+}
+
+/// Like [`gated`], for an action the user asked for: it runs to its end
+/// even if the answer times out, then `then` sees what it did.
+async fn gated_action<R: Send + 'static>(
+    gates: &Gates,
+    path: PathBuf,
+    work: impl FnOnce(&std::path::Path) -> R + Send + 'static,
+    then: impl FnOnce(&R) + Send + 'static,
+) -> Result<R, ActionError> {
+    let gate = gate(gates, &path);
+    let task = tokio::spawn(async move {
+        let open = gate.lock_owned().await;
+        let done = tokio::task::spawn_blocking(move || {
+            let done = work(&path);
+            drop(open);
+            done
+        })
+        .await
+        .expect("conflict work doesn't panic");
+        then(&done);
+        done
+    });
+    match tokio::time::timeout(WORK_TIMEOUT, task).await {
+        Ok(done) => Ok(done.expect("conflict work doesn't panic")),
+        Err(_) => Err(ActionError::Hung),
+    }
 }
 
 /// Why a Data Conflict couldn't be listed, kept or swapped.
@@ -390,13 +421,19 @@ impl Conflicts {
     ) -> Result<DataConflict, ActionError> {
         let root = self.root(item)?;
         let version = version.to_owned();
-        let kept = gated(&self.gates, root.path, move |path| {
-            conflicts::keep(path, &version)
-        })
+        let changes = self.changes.clone();
+        gated_action(
+            &self.gates,
+            root.path,
+            move |path| conflicts::keep(path, &version),
+            move |kept| {
+                if kept.is_ok() {
+                    signal(&changes);
+                }
+            },
+        )
         .await?
-        .map_err(ActionError::Conflict)?;
-        signal(&self.changes);
-        Ok(kept)
+        .map_err(ActionError::Conflict)
     }
 
     /// Makes the losing change of the Data Conflict `version` in `item`'s
@@ -418,21 +455,28 @@ impl Conflicts {
             return Err(ActionError::DoesntSend(item));
         }
         let version = version.to_owned();
-        let conflict = gated(&self.gates, root.path, move |path| {
-            conflicts::swap(path, &version)
-        })
+        let (changes, client) = (self.changes.clone(), driver.client().clone());
+        gated_action(
+            &self.gates,
+            root.path,
+            move |path| conflicts::swap(path, &version),
+            move |swapped| {
+                let Ok(conflict) = swapped else {
+                    return;
+                };
+                signal(&changes);
+                // Syncthing would notice on its own, but later. The swap is
+                // done whatever the scan takes.
+                let file = conflict.path.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = client.scan_path(item, &file).await {
+                        tracing::warn!(%item, %file, %error, "can't ask Syncthing to scan a swapped file");
+                    }
+                });
+            },
+        )
         .await?
-        .map_err(ActionError::Conflict)?;
-        signal(&self.changes);
-        // Syncthing would notice on its own, but later. The swap is done
-        // whatever the scan takes.
-        let (client, file) = (driver.client().clone(), conflict.path.clone());
-        tokio::spawn(async move {
-            if let Err(error) = client.scan_path(item, &file).await {
-                tracing::warn!(%item, %file, %error, "can't ask Syncthing to scan a swapped file");
-            }
-        });
-        Ok(conflict)
+        .map_err(ActionError::Conflict)
     }
 }
 
@@ -479,5 +523,42 @@ impl<T: LocalApi + Clone> Daemon<T> {
         version: &str,
     ) -> Result<DataConflict, ActionError> {
         self.conflict_ops().swap(item, version).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_action_that_times_out_still_finishes_and_follows_up() {
+        let gates = Gates::default();
+        let path = PathBuf::from("/srv/x");
+        // As if earlier work were stuck on the Replica's filesystem.
+        let stuck = gate(&gates, &path).lock_owned().await;
+        let (ran, followed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let answer = {
+            let (ran, followed) = (ran.clone(), followed.clone());
+            gated_action(
+                &gates,
+                path,
+                move |_| ran.store(true, Ordering::SeqCst),
+                move |()| followed.store(true, Ordering::SeqCst),
+            )
+            .await
+        };
+        assert!(matches!(answer, Err(ActionError::Hung)), "{answer:?}");
+        assert!(!ran.load(Ordering::SeqCst));
+
+        drop(stuck);
+        for _ in 0..100 {
+            if followed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ran.load(Ordering::SeqCst) && followed.load(Ordering::SeqCst));
     }
 }

@@ -98,10 +98,17 @@ async fn same_origin(request: Request, next: Next) -> Response {
 /// A checkbox, which a form sends only when it is checked.
 type Checkbox = Option<String>;
 
-/// The page to go back to: one of the daemon's own, or `default`.
+/// The page to go back to: one of the daemon's own, or `default`. A
+/// browser drops tabs and line breaks from a URL, so `/\t/site` would lead
+/// to another site; none is accepted.
 fn back(field: Option<String>, default: String) -> String {
     field
-        .filter(|back| back.starts_with('/') && !back.starts_with("//") && !back.contains('\\'))
+        .filter(|back| {
+            back.starts_with('/')
+                && !back.starts_with("//")
+                && !back.contains('\\')
+                && !back.chars().any(char::is_control)
+        })
         .unwrap_or(default)
 }
 

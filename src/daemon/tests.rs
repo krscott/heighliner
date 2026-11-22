@@ -695,6 +695,20 @@ async fn a_node_leaves_through_the_api() {
     client.leave().await.unwrap();
     let status = client.status().await.unwrap();
     assert!(status.items[0].replicas[0].departed);
+    // Nothing new goes on a Node that has left.
+    let track = crate::api::Track {
+        node: None,
+        path: "/srv/more".into(),
+        name: None,
+        one_way: false,
+        excludes: Vec::new(),
+        retention_days: None,
+    };
+    let refused = client.track(&track).await;
+    assert!(
+        matches!(&refused, Err(crate::cli::Error::Refused { message, .. }) if message.contains("left")),
+        "{refused:?}"
+    );
     assert!(crate::cli::format_status(&status).contains("departed"));
 }
 

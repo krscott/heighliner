@@ -127,6 +127,17 @@ impl<T: LocalApi + Clone> Api<T> {
     /// named; one being `placing` must be on one of the owner's devices on
     /// the tailnet now.
     async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
+        let node = self.find_node(name, placing).await?;
+        if placing && self.db.lock().unwrap().config().departed.contains(&node) {
+            return Err(Refusal(
+                StatusCode::CONFLICT,
+                format!("{node} has left the Fleet, so nothing can be added there"),
+            ));
+        }
+        Ok(node)
+    }
+
+    async fn find_node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
         let me = self.me();
         let Some(name) = name else {
             return Ok(me);

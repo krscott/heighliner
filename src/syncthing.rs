@@ -43,6 +43,11 @@
 //!   finds no local changes; otherwise it stays receive-only.
 //! - Syncthing's "Override Changes" and "Revert Local Changes" are never
 //!   used.
+//! - A Data Conflict's losing copy is never deleted early: Syncthing keeps
+//!   every one (`maxConflicts` -1), and heighliner moves it into its own
+//!   ignored directory in the Replica, `.heighliner`, where it expires a
+//!   Retention Window after the move. Conflict copies already in a path
+//!   when it was set up are the user's files, and stay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -303,6 +308,30 @@ impl Client {
         Ok(())
     }
 
+    /// Pauses or resumes a folder.
+    async fn set_folder_paused(&self, folder: ItemId, paused: bool) -> Result<(), Error> {
+        let path = format!("/rest/config/folders/{folder}");
+        self.call(Method::PATCH, &path, Some(&json!({ "paused": paused })))
+            .await?;
+        Ok(())
+    }
+
+    /// Whether a folder sends its local changes now: it is send-receive
+    /// and running.
+    pub(crate) async fn folder_sends(&self, folder: ItemId) -> Result<bool, Error> {
+        let folder: Value = self.get(&format!("/rest/config/folders/{folder}")).await?;
+        Ok(folder["type"] == "sendreceive" && folder["paused"] == false)
+    }
+
+    /// Scans one file or directory of a folder, and waits for the scan.
+    pub(crate) async fn scan_path(&self, folder: ItemId, sub: &str) -> Result<(), Error> {
+        let sub = http::percent_encode(sub);
+        let path = format!("/rest/db/scan?folder={folder}&sub={sub}");
+        self.call_within(SCAN_TIMEOUT, Method::POST, &path, None)
+            .await?;
+        Ok(())
+    }
+
     /// How many files a receive-only folder has changed locally, as of its
     /// last scan.
     pub(crate) async fn local_changes(&self, folder: &str) -> Result<u64, Error> {
@@ -483,7 +512,10 @@ impl Driver {
                     .in_blocking(|path| check_initialized(&path), path.clone())
                     .await
                 {
-                    Ok(()) if !local.paused => self.sync_ignores(local, &mut report.changed).await,
+                    Ok(()) if !local.paused => {
+                        self.sync_ignores(local, !was_paused, &mut report.changed)
+                            .await
+                    }
                     other => other,
                 },
                 // Syncthing keeps a folder's state across a change of path,
@@ -553,14 +585,19 @@ impl Driver {
                 .filter(|node| *node != me && peers.contains_key(node))
                 .collect();
             shared_with.extend(devices.iter().copied());
-            folders.push(self.folder(
+            let mut folder = self.folder(
                 folder_template,
                 local,
                 folder_type,
                 device_id,
                 &peers,
                 &devices,
-            ));
+            );
+            if in_place.is_none() {
+                // Until Syncthing has loaded its excludes without an error.
+                folder["paused"] = json!(true);
+            }
+            folders.push(folder);
             report.replicas.insert(local.item_id, outcome);
         }
         for item in config.unusable_on(me) {
@@ -612,10 +649,17 @@ impl Driver {
             report.changed = true;
         }
 
-        // A new folder starts with the `.stignore` prepared for it, so this
-        // only checks that Syncthing can use it.
+        // A new folder starts paused with the `.stignore` prepared for it,
+        // so this checks that Syncthing can use it, then lets it run.
         for local in ignores_after {
-            if let Err(outcome) = self.sync_ignores(local, &mut report.changed).await {
+            let fresh = existing
+                .get(local.item_id.to_string().as_str())
+                .is_none_or(|folder| folder["path"] != local.replica.path().as_str());
+            let mut synced = self.sync_ignores(local, false, &mut report.changed).await;
+            if synced.is_ok() && fresh && !local.paused {
+                synced = self.resume(local).await;
+            }
+            if let Err(outcome) = synced {
                 report.replicas.insert(local.item_id, outcome);
             }
         }
@@ -623,11 +667,16 @@ impl Driver {
     }
 
     /// Sets a configured Replica's excludes, unless its marker is missing,
+    /// pausing its folder meanwhile if it is `running`: while Syncthing
+    /// can't parse a folder's ignore patterns, it ignores nothing, so new
+    /// ones must not reach a folder that is scanning or pulling until they
+    /// are known to parse. If they don't, the folder stays paused.
     /// since Syncthing would recreate its path. Sets `changed` if they
     /// changed.
     async fn sync_ignores(
         &self,
         local: &LocalReplica<'_>,
+        running: bool,
         changed: &mut bool,
     ) -> Result<(), Outcome> {
         let wanted = ignore_lines(&excludes(local));
@@ -639,6 +688,32 @@ impl Driver {
         if lines == wanted {
             return error.map_or(Ok(()), |error| Err(unparsed(error)));
         }
+        if running {
+            self.client
+                .set_folder_paused(local.item_id, true)
+                .await
+                .map_err(failed)?;
+        }
+        // Once paused, in case its disk went meanwhile.
+        self.marker_present(local).await?;
+        self.client
+            .set_ignores(local.item_id, &wanted)
+            .await
+            .map_err(failed)?;
+        *changed = true;
+        let (_, error) = self.client.ignores(local.item_id).await.map_err(failed)?;
+        if let Some(error) = error {
+            return Err(unparsed(error));
+        }
+        if running {
+            self.resume(local).await?;
+        }
+        Ok(())
+    }
+
+    /// Checks that a Replica's marker is there, since Syncthing would
+    /// recreate its path or run on whatever is mounted there instead.
+    async fn marker_present(&self, local: &LocalReplica<'_>) -> Result<(), Outcome> {
         self.in_blocking(
             |path| {
                 Path::new(path.as_str())
@@ -649,14 +724,17 @@ impl Driver {
             },
             local.replica.path().clone(),
         )
-        .await?;
+        .await
+    }
+
+    /// Lets a folder paused while its excludes were checked run, unless
+    /// its marker went meanwhile.
+    async fn resume(&self, local: &LocalReplica<'_>) -> Result<(), Outcome> {
+        self.marker_present(local).await?;
         self.client
-            .set_ignores(local.item_id, &wanted)
+            .set_folder_paused(local.item_id, false)
             .await
-            .map_err(failed)?;
-        *changed = true;
-        let (_, error) = self.client.ignores(local.item_id).await.map_err(failed)?;
-        error.map_or(Ok(()), |error| Err(unparsed(error)))
+            .map_err(|error| Outcome::Failed(error.to_string()))
     }
 
     /// How many local changes a folder has, scanning it first so that none
@@ -776,11 +854,22 @@ impl Driver {
         folder["paused"] = json!(local.paused);
         folder["markerName"] = json!(MARKER);
         folder["ignoreDelete"] = json!(false);
+        // Syncthing never deletes a conflict's copy; heighliner moves it
+        // into the Displaced Versions (see `conflicts`).
+        folder["maxConflicts"] = json!(-1);
+        // Any change of modification time makes Syncthing look at a file's
+        // content, as a swapped conflict needs.
+        folder["modTimeWindowS"] = json!(0);
+        let retention_days = local
+            .entry
+            .item
+            .retention_days
+            .map_or(self.retention_days, |days| u64::from(days.get()));
         folder["versioning"] = json!({
             "type": "simple",
             "params": {
                 "keep": KEEP_VERSIONS.to_string(),
-                "cleanoutDays": self.retention_days.to_string(),
+                "cleanoutDays": retention_days.to_string(),
             },
             "cleanupIntervalS": 3600,
             "fsPath": "",
@@ -861,10 +950,18 @@ fn excludes(local: &LocalReplica<'_>) -> Vec<String> {
 }
 
 /// The `.stignore` lines for `excludes`.
+/// Data Conflicts' copies and heighliner's own directory are ignored
+/// first, so that no exclude can undo it.
 fn ignore_lines(excludes: &[String]) -> Vec<String> {
-    std::iter::once(IGNORE_HEADER.to_owned())
-        .chain(excludes.iter().cloned())
-        .collect()
+    [
+        IGNORE_HEADER,
+        conflicts::IGNORE_PATTERN,
+        conflicts::STORE_PATTERN,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(excludes.iter().cloned())
+    .collect()
 }
 
 /// `lines` as a file.
@@ -904,9 +1001,17 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
     let ignore_file = path.join(IGNORE_FILE);
     match fs::read_dir(path) {
         Ok(entries) => {
+            // A .heighliner that isn't heighliner's holds the user's files,
+            // which every folder ignores, so the path is refused even
+            // with adopt.
+            conflicts::has_store(path).map_err(|error| Outcome::PathError(error.to_string()))?;
             for entry in entries {
                 let name = entry.map_err(error)?.file_name();
-                if name == MARKER || name == IGNORE_FILE || name == STAGED_IGNORE_FILE {
+                if name == MARKER
+                    || name == IGNORE_FILE
+                    || name == STAGED_IGNORE_FILE
+                    || name == conflicts::STORE
+                {
                     continue;
                 }
                 if !adopt {
@@ -949,6 +1054,8 @@ fn prepare(path: &AbsPath, adopt: bool, excludes: &[String]) -> Result<(), Outco
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(error(e)),
     }
+    // Conflict copies already here are the user's, not ones to move.
+    conflicts::mark_set_up(path).map_err(|error| Outcome::PathError(error.to_string()))?;
     // Written beside it and renamed over it, so that neither a symlink nor
     // a hard link to a file elsewhere is written through.
     let staged = path.join(STAGED_IGNORE_FILE);
@@ -1005,7 +1112,11 @@ fn normalized(config: &Value) -> Value {
     config
 }
 
+pub mod conflicts;
+mod events;
 mod state;
+
+pub use events::{Finished, Seen};
 #[cfg(test)]
 pub(crate) mod test_instance;
 #[cfg(test)]

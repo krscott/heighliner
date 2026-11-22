@@ -294,7 +294,7 @@ impl LocalApi for Client {
     async fn whois(&self, addr: SocketAddr) -> Result<Option<Identity>, Error> {
         let path = format!(
             "/localapi/v0/whois?addr={}&proto=tcp",
-            percent_encode(&addr.to_string())
+            http::percent_encode(&addr.to_string())
         );
         let (status, body) = self.get(&path).await?;
         if status == StatusCode::NOT_FOUND {
@@ -303,19 +303,6 @@ impl LocalApi for Client {
         let whois: WhoIsResponse = decode(&path, status, &body)?;
         Ok(Some(whois.into_identity()))
     }
-}
-
-/// Percent-encodes everything but unreserved characters, as a query value.
-fn percent_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
 }
 
 /// The machine name in a MagicDNS name such as `laptop.tailnet.ts.net.`.

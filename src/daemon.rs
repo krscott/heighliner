@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -253,7 +253,7 @@ pub struct Daemon<T> {
     /// Held while saving, so saves happen one at a time and in order.
     saved: Mutex<Vec<u8>>,
     driver: Option<Driver>,
-    replicas: Mutex<Replicas>,
+    replicas: Arc<Mutex<Replicas>>,
 }
 
 /// A reconcile: the configuration it applied, and its outcome for each
@@ -317,7 +317,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             db: Arc::new(Mutex::new(db)),
             saved,
             driver: None,
-            replicas: Mutex::new(Replicas {
+            replicas: Arc::new(Mutex::new(Replicas {
                 reconciled: None,
                 states: BTreeMap::new(),
                 started: 0,
@@ -325,7 +325,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 current: BTreeMap::new(),
                 last_current,
                 logged: BTreeMap::new(),
-            }),
+            })),
         })
     }
 
@@ -825,12 +825,19 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     let mut pulls = tokio::time::interval(pull_every);
     pulls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Dropped, and so stopped, with the daemon's other tasks.
-    let mut watcher = JoinSet::new();
+    let mut tasks = JoinSet::new();
     let changed = Arc::new(Notify::new());
-    if let Some(driver) = daemon.driver.clone() {
-        let changed = changed.clone();
-        watcher.spawn(async move { driver.watch(&changed).await });
+    let queue = Arc::new(conflicts::Queue::default());
+    {
+        let (queue, replicas) = (queue.clone(), daemon.replicas.clone());
+        let me = daemon.db.lock().unwrap().node().clone();
+        tasks.spawn(async move { queue.work(replicas, me).await });
     }
+    if let Some(driver) = daemon.driver.clone() {
+        let (changed, queue) = (changed.clone(), queue.clone());
+        tasks.spawn(async move { driver.watch(&changed, |seen| queue.add(seen)).await });
+    }
+    let mut last_sweep: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = changed.notified() => {
@@ -881,6 +888,12 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 Err(error) => tracing::warn!(%error, "pulling records failed"),
                 Ok(_) => {}
                 }
+                if last_sweep.is_none_or(|at| at.elapsed() >= conflicts::SWEEP_EVERY) {
+                    queue.sweep();
+                    last_sweep = Some(Instant::now());
+                } else {
+                    queue.retry();
+                }
             }
             Some(Err(error)) = servers.join_next() => return Err(Error::Serve(error)),
             _ = terminate.recv() => return Ok(()),
@@ -907,6 +920,10 @@ async fn open_when_ready(
         }
     }
 }
+
+mod conflicts;
+
+pub use conflicts::ActionError;
 
 #[cfg(test)]
 mod tests;

@@ -127,9 +127,12 @@ fn whois_is_read() {
 
 #[test]
 fn query_values_are_percent_encoded() {
-    assert_eq!(percent_encode("100.64.0.2:41641"), "100.64.0.2%3A41641");
     assert_eq!(
-        percent_encode("[fd7a:115c::1]:80"),
+        crate::http::percent_encode("100.64.0.2:41641"),
+        "100.64.0.2%3A41641"
+    );
+    assert_eq!(
+        crate::http::percent_encode("[fd7a:115c::1]:80"),
         "%5Bfd7a%3A115c%3A%3A1%5D%3A80"
     );
 }

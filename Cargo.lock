@@ -365,6 +365,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

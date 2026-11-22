@@ -75,10 +75,12 @@ let
     Group = config.users.users.${cfg.user}.group;
     StateDirectory = "heighliner";
     StateDirectoryMode = "0700";
-    UMask = "0077";
     Restart = "on-failure";
     RestartSec = 5;
     # Only Tailscale's addresses and this machine; the egress allowlist.
+    # The IPv6 range is where headscale and Tailscale give devices their
+    # addresses; it also holds Tailscale's 4via6 routes to subnets behind
+    # subnet routers, which a deny can't carve out, since allows win.
     IPAddressAllow = [
       "localhost"
       "100.64.0.0/10"
@@ -91,9 +93,9 @@ let
       "AF_INET6"
       "AF_NETLINK"
     ];
-    # Not PrivateTmp: a Replica may be anywhere the user can write.
+    # Not PrivateTmp or PrivateDevices: a Replica may be anywhere the user
+    # can write, /tmp and /dev/shm included.
     NoNewPrivileges = true;
-    PrivateDevices = true;
     ProtectSystem = "full";
     ProtectKernelTunables = true;
     ProtectKernelModules = true;

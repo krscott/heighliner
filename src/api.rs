@@ -13,19 +13,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ItemId, NodeId, ReplicaState, Role};
 
-/// `path`, absolute, with `.` and empty components dropped and `..`
-/// resolved by its name alone, as a Replica's path is written.
+/// `path`, absolute, with `.` and empty components dropped. A `..` is
+/// kept, since resolving it by name alone would be wrong after a symlink;
+/// only the Node the path is on can resolve it.
 pub fn normalize(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            part => parts.push(part),
-        }
-    }
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
     format!("/{}", parts.join("/"))
 }
 

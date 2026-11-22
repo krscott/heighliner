@@ -6,7 +6,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -206,10 +206,9 @@ pub fn node_path(argument: &str, cwd: &Path, local: &[&str]) -> (Option<String>,
     let here = |path: &str| {
         if path == "~" || path.starts_with("~/") {
             path.to_owned()
-        } else if path.starts_with('/') {
-            api::normalize(path)
         } else {
-            api::normalize(&cwd.join(path).to_string_lossy())
+            let path = resolve_parents(&cwd.join(path));
+            api::normalize(&path.to_string_lossy())
         }
     };
     match argument.split_once(':') {
@@ -226,6 +225,24 @@ pub fn node_path(argument: &str, cwd: &Path, local: &[&str]) -> (Option<String>,
         }
         _ => (None, here(argument)),
     }
+}
+
+/// `path` with each `..` resolved as the filesystem does, after following
+/// the symlinks before it, as far as the path exists.
+fn resolve_parents(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if let Ok(real) = std::fs::canonicalize(&resolved) {
+                    resolved = real;
+                }
+                resolved.pop();
+            }
+            component => resolved.push(component),
+        }
+    }
+    resolved
 }
 
 /// `status` as text, one Item and its Replicas after another.

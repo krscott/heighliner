@@ -104,14 +104,7 @@ impl<T: LocalApi + Clone> Api<T> {
             return Ok(me);
         };
         if let Ok(id) = NodeId::new(name) {
-            let config = self.db.lock().unwrap().config();
-            let known = id == me
-                || (!placing
-                    && (config.nodes.contains_key(&id)
-                        || config
-                            .items
-                            .values()
-                            .any(|entry| entry.replicas.contains_key(&id))));
+            let known = id == me || (!placing && self.db.lock().unwrap().knows_node(&id));
             if known {
                 return Ok(id);
             }
@@ -162,7 +155,13 @@ impl<T: LocalApi + Clone> Api<T> {
         } else {
             path.to_owned()
         };
-        AbsPath::new(api::normalize(&path)).map_err(invalid)
+        let path = api::normalize(&path);
+        if path.split('/').any(|part| part == "..") {
+            return Err(invalid(format!(
+                "{path} has a .. in it, which only its Node can resolve; give the path without it"
+            )));
+        }
+        AbsPath::new(path).map_err(invalid)
     }
 
     /// Applies `edit` to the records, saves them, and has it applied to

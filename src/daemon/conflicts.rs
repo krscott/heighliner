@@ -286,7 +286,7 @@ async fn gated<R: Send + 'static>(
             let open = gate.lock_owned().await;
             started.store(true, Ordering::SeqCst);
             tokio::task::spawn_blocking(move || {
-            let done = work(&path);
+                let done = work(&path);
                 drop(open);
                 done
             })
@@ -319,7 +319,7 @@ async fn gated_action<R: Send + 'static>(
     let state = Arc::new(AtomicU8::new(WAITING));
     let gate = gate(gates, &path);
     let claimed = state.clone();
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         let open = gate.lock_owned().await;
         claimed
             .compare_exchange(WAITING, STARTED, Ordering::SeqCst, Ordering::SeqCst)
@@ -334,18 +334,20 @@ async fn gated_action<R: Send + 'static>(
         then(&done);
         Some(done)
     });
-    match tokio::time::timeout(WORK_TIMEOUT, task).await {
+    match tokio::time::timeout(WORK_TIMEOUT, &mut task).await {
         Ok(done) => Ok(done
             .expect("conflict work doesn't panic")
             .expect("only a timed-out answer drops the work")),
         Err(_) => {
             let dropped =
                 state.compare_exchange(WAITING, DROPPED, Ordering::SeqCst, Ordering::SeqCst);
-            Err(if dropped.is_ok() {
-                ActionError::Busy
+            if dropped.is_ok() {
+                // It would only wait, then do nothing.
+                task.abort();
+                Err(ActionError::Busy)
             } else {
-                ActionError::Hung
-            })
+                Err(ActionError::Hung)
+            }
         }
     }
 }
@@ -588,9 +590,23 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let answer = {
             let ran = ran.clone();
-            gated_action(&gates, path, move |_| ran.store(true, Ordering::SeqCst), |()| {}).await
+            gated_action(
+                &gates,
+                path,
+                move |_| ran.store(true, Ordering::SeqCst),
+                |()| {},
+            )
+            .await
         };
         assert!(matches!(answer, Err(ActionError::Busy)), "{answer:?}");
+        // Nothing of it is kept waiting, even while the gate stays shut.
+        for _ in 0..100 {
+            if Arc::strong_count(&ran) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(Arc::strong_count(&ran), 1);
         drop(stuck);
         assert!(!eventually(&ran).await);
     }

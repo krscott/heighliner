@@ -41,6 +41,10 @@
             inherit pkgs;
             module = ./nix/module.nix;
           };
+          fleet = import ./nix/tests/fleet.nix {
+            inherit pkgs;
+            module = ./nix/module.nix;
+          };
         };
 
         devShells.default = pkgs.mkShell {

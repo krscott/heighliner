@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::mem;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -278,32 +279,51 @@ async fn gated<R: Send + 'static>(
     work: impl FnOnce(&std::path::Path) -> R + Send + 'static,
 ) -> Result<R, ActionError> {
     let gate = gate(gates, &path);
-    let run = async move {
-        let open = gate.lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+    let started = Arc::new(AtomicBool::new(false));
+    let run = {
+        let started = started.clone();
+        async move {
+            let open = gate.lock_owned().await;
+            started.store(true, Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || {
             let done = work(&path);
-            drop(open);
-            done
-        })
-        .await
-        .expect("conflict work doesn't panic")
+                drop(open);
+                done
+            })
+            .await
+            .expect("conflict work doesn't panic")
+        }
     };
-    tokio::time::timeout(WORK_TIMEOUT, run)
-        .await
-        .map_err(|_| ActionError::Hung)
+    tokio::time::timeout(WORK_TIMEOUT, run).await.map_err(|_| {
+        if started.load(Ordering::SeqCst) {
+            ActionError::Hung
+        } else {
+            ActionError::Busy
+        }
+    })
 }
 
-/// Like [`gated`], for an action the user asked for: it runs to its end
-/// even if the answer times out, then `then` sees what it did.
+/// Like [`gated`], for an action the user asked for: once started, it
+/// runs to its end even if the answer times out, then `then` sees what it
+/// did. One still waiting for the gate when the answer times out is
+/// dropped, so the answer can say it wasn't done.
 async fn gated_action<R: Send + 'static>(
     gates: &Gates,
     path: PathBuf,
     work: impl FnOnce(&std::path::Path) -> R + Send + 'static,
     then: impl FnOnce(&R) + Send + 'static,
 ) -> Result<R, ActionError> {
+    const WAITING: u8 = 0;
+    const STARTED: u8 = 1;
+    const DROPPED: u8 = 2;
+    let state = Arc::new(AtomicU8::new(WAITING));
     let gate = gate(gates, &path);
+    let claimed = state.clone();
     let task = tokio::spawn(async move {
         let open = gate.lock_owned().await;
+        claimed
+            .compare_exchange(WAITING, STARTED, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
         let done = tokio::task::spawn_blocking(move || {
             let done = work(&path);
             drop(open);
@@ -312,11 +332,21 @@ async fn gated_action<R: Send + 'static>(
         .await
         .expect("conflict work doesn't panic");
         then(&done);
-        done
+        Some(done)
     });
     match tokio::time::timeout(WORK_TIMEOUT, task).await {
-        Ok(done) => Ok(done.expect("conflict work doesn't panic")),
-        Err(_) => Err(ActionError::Hung),
+        Ok(done) => Ok(done
+            .expect("conflict work doesn't panic")
+            .expect("only a timed-out answer drops the work")),
+        Err(_) => {
+            let dropped =
+                state.compare_exchange(WAITING, DROPPED, Ordering::SeqCst, Ordering::SeqCst);
+            Err(if dropped.is_ok() {
+                ActionError::Busy
+            } else {
+                ActionError::Hung
+            })
+        }
     }
 }
 
@@ -331,6 +361,9 @@ pub enum ActionError {
     /// Syncthing couldn't say whether it does.
     Syncthing(syncthing::Error),
     Conflict(conflicts::Error),
+    /// Earlier work on the Replica didn't finish in time, so this wasn't
+    /// done.
+    Busy,
     /// The Replica's filesystem didn't answer in time. A keep or swap may
     /// still finish.
     Hung,
@@ -346,6 +379,11 @@ impl fmt::Display for ActionError {
             ),
             Self::Syncthing(error) => write!(f, "can't ask Syncthing about the replica: {error}"),
             Self::Conflict(error) => error.fmt(f),
+            Self::Busy => write!(
+                f,
+                "earlier work on the replica's files didn't finish within {}s, so nothing was done; is its filesystem hung?",
+                WORK_TIMEOUT.as_secs()
+            ),
             Self::Hung => write!(
                 f,
                 "the replica's filesystem didn't answer within {}s; is it hung? A keep or swap may still finish",
@@ -528,37 +566,54 @@ impl<T: LocalApi + Clone> Daemon<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
 
+    /// Waits up to a second for `flag`.
+    async fn eventually(flag: &AtomicBool) -> bool {
+        for _ in 0..100 {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     #[tokio::test]
-    async fn an_action_that_times_out_still_finishes_and_follows_up() {
+    async fn an_action_still_waiting_when_its_answer_times_out_isnt_done() {
         let gates = Gates::default();
         let path = PathBuf::from("/srv/x");
         // As if earlier work were stuck on the Replica's filesystem.
         let stuck = gate(&gates, &path).lock_owned().await;
-        let (ran, followed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let ran = Arc::new(AtomicBool::new(false));
         let answer = {
-            let (ran, followed) = (ran.clone(), followed.clone());
+            let ran = ran.clone();
+            gated_action(&gates, path, move |_| ran.store(true, Ordering::SeqCst), |()| {}).await
+        };
+        assert!(matches!(answer, Err(ActionError::Busy)), "{answer:?}");
+        drop(stuck);
+        assert!(!eventually(&ran).await);
+    }
+
+    #[tokio::test]
+    async fn an_action_that_outlives_its_answer_still_finishes_and_follows_up() {
+        let gates = Gates::default();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let followed = Arc::new(AtomicBool::new(false));
+        let answer = {
+            let followed = followed.clone();
             gated_action(
                 &gates,
-                path,
-                move |_| ran.store(true, Ordering::SeqCst),
+                PathBuf::from("/srv/x"),
+                // As if its filesystem were slow to answer.
+                move |_| wait.recv().unwrap(),
                 move |()| followed.store(true, Ordering::SeqCst),
             )
             .await
         };
         assert!(matches!(answer, Err(ActionError::Hung)), "{answer:?}");
-        assert!(!ran.load(Ordering::SeqCst));
-
-        drop(stuck);
-        for _ in 0..100 {
-            if followed.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(ran.load(Ordering::SeqCst) && followed.load(Ordering::SeqCst));
+        assert!(!followed.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        assert!(eventually(&followed).await);
     }
 }

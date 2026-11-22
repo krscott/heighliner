@@ -103,7 +103,7 @@ impl From<ActionError> for Refusal {
                 StatusCode::NOT_FOUND
             }
             ActionError::Conflict(_) => StatusCode::CONFLICT,
-            ActionError::Hung => StatusCode::SERVICE_UNAVAILABLE,
+            ActionError::Busy | ActionError::Hung => StatusCode::SERVICE_UNAVAILABLE,
         };
         Self(status, error.to_string())
     }

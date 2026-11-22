@@ -1026,9 +1026,12 @@ async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
         .clone();
     let stuck = gate.lock().await;
     let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
-    assert!(matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+    assert!(matches!(listed, Err(ActionError::Busy)), "{listed:?}");
 
     drop(stuck);
     let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
-    assert!(!matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+    assert!(
+        !matches!(listed, Err(ActionError::Busy | ActionError::Hung)),
+        "{listed:?}"
+    );
 }

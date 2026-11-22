@@ -11,8 +11,7 @@ const ITEM: ItemId = ItemId::from_u128(1);
 
 /// A free port, shared by every test daemon on its own loopback address.
 async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    crate::syncthing::test_instance::free_port()
 }
 
 /// A Fake for the device at `me` that sees the devices at `others`.
@@ -1018,7 +1017,7 @@ async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
     }));
     // As if an earlier listing were stuck on the Replica's filesystem.
     let gate: Arc<tokio::sync::Mutex<()>> = daemon
-        .list_gates
+        .conflict_gates
         .lock()
         .unwrap()
         .entry(PathBuf::from("/srv/x"))
@@ -1026,9 +1025,12 @@ async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
         .clone();
     let stuck = gate.lock().await;
     let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
-    assert!(matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+    assert!(matches!(listed, Err(ActionError::Busy)), "{listed:?}");
 
     drop(stuck);
     let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
-    assert!(!matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+    assert!(
+        !matches!(listed, Err(ActionError::Busy | ActionError::Hung)),
+        "{listed:?}"
+    );
 }

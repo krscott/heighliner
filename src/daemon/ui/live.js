@@ -6,15 +6,35 @@
   let fetching = false;
   let again = false;
 
-  // Whether the user is selecting or typing in the page, which a swap would
-  // undo; the page is updated at the next change after.
+  // The form fields' values in `main`, to tell when the user changed one.
+  function values(main) {
+    return JSON.stringify(
+      [...main.querySelectorAll("input, textarea, select")].map((field) =>
+        field.type === "checkbox" ? field.checked : field.value,
+      ),
+    );
+  }
+
+  let shownValues = values(document.querySelector("main"));
+
+  // Whether the user is selecting in the page, typing in it, or has a form
+  // open or filled in, which a swap would undo; the page is updated at the
+  // next change after.
   function inUse(main) {
     const selection = document.getSelection();
     const selecting =
       selection &&
       !selection.isCollapsed &&
       (main.contains(selection.anchorNode) || main.contains(selection.focusNode));
-    return selecting || main.contains(document.activeElement);
+    const editing =
+      main.contains(document.activeElement) &&
+      document.activeElement.matches("input, textarea, select, [contenteditable]");
+    return (
+      selecting ||
+      editing ||
+      values(main) !== shownValues ||
+      main.querySelector("details[open]") !== null
+    );
   }
 
   async function update() {
@@ -35,6 +55,7 @@
         if (next.innerHTML !== main.innerHTML && !inUse(main)) {
           main.replaceWith(next);
           document.title = page.title;
+          shownValues = values(next);
         }
       }
     } catch {

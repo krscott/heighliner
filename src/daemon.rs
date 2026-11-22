@@ -257,7 +257,7 @@ pub struct Daemon<T> {
     edited: Arc<Notify>,
     remote: Arc<Mutex<Remote>>,
     changes: Changes,
-    list_gates: conflicts::ListGates,
+    conflict_gates: conflicts::Gates,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -411,7 +411,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             edited: Arc::default(),
             remote: Arc::default(),
             changes: Arc::new(watch::Sender::new(())),
-            list_gates: Arc::default(),
+            conflict_gates: Arc::default(),
         })
     }
 

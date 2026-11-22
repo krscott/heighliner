@@ -94,8 +94,9 @@ pub enum Reach {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "replication", rename_all = "kebab-case")]
 pub enum Replication {
-    /// Every Replica on a Node still in the Fleet is current, live here or
-    /// as the answering Node's latest round read.
+    /// Every Replica on a Node still in the Fleet is current and connected
+    /// to every Replica that sends to it, live here or as the answering
+    /// Node's latest round read.
     Full,
     /// Not every one is confirmed current now. `oldest` is the oldest time
     /// one of them was last confirmed so, or none if one never was.
@@ -150,6 +151,11 @@ pub struct ReplicaStatus {
     /// When its Node last confirmed it current, if ever.
     #[serde(default)]
     pub confirmed_at: Option<Timestamp>,
+    /// Whether, when its state was read, it was connected to every Replica
+    /// that sends to it, so that being current means it has what they all
+    /// have.
+    #[serde(default)]
+    pub every_sender: bool,
 }
 
 /// Tracks a path as a new Item, with its first Replica there, which adopts

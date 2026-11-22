@@ -6,27 +6,41 @@
   let fetching = false;
   let again = false;
 
+  // Whether the user is selecting or typing in the page, which a swap would
+  // undo; the page is updated at the next change after.
+  function inUse(main) {
+    const selection = document.getSelection();
+    const selecting =
+      selection && !selection.isCollapsed && main.contains(selection.anchorNode);
+    return selecting || main.contains(document.activeElement);
+  }
+
   async function update() {
     if (fetching) {
       again = true;
       return;
     }
     fetching = true;
+    let shown = false;
     try {
       // A page that is gone answers with one saying so, which is shown too.
       const response = await fetch(location.href);
       const page = new DOMParser().parseFromString(await response.text(), "text/html");
       const next = page.querySelector("main");
       const main = document.querySelector("main");
-      if (next && main && next.innerHTML !== main.innerHTML) {
-        main.replaceWith(next);
-        document.title = page.title;
+      if (next && main) {
+        shown = true;
+        if (next.innerHTML !== main.innerHTML && !inUse(main)) {
+          main.replaceWith(next);
+          document.title = page.title;
+        }
       }
     } catch {
-      // The next change, or reconnecting, tries again.
+      // Shown as lost below; the next change, or reconnecting, tries again.
     } finally {
       fetching = false;
     }
+    document.body.classList.toggle("disconnected", !shown);
     if (again) {
       again = false;
       update();
@@ -37,10 +51,11 @@
   let opened = false;
   events.addEventListener("changed", update);
   events.addEventListener("open", () => {
-    document.body.classList.remove("disconnected");
     // Catch up on what changed while disconnected.
     if (opened) {
       update();
+    } else {
+      document.body.classList.remove("disconnected");
     }
     opened = true;
   });

@@ -241,7 +241,12 @@ fn state(now: Timestamp, status: &Status, replica: &ReplicaStatus) -> Markup {
         span.state {
             @match &replica.state {
                 None => span.badge.unknown { "unknown" },
-                Some(ReplicaState::Current) => span.badge.good { "current" },
+                Some(ReplicaState::Current) => {
+                    span.badge.good { "current" }
+                    @if !replica.every_sender {
+                        " " span.note { "with the senders it reaches; not every one is connected" }
+                    }
+                },
                 Some(ReplicaState::Syncing { files_left, bytes_left }) => {
                     span.badge.busy { "syncing" }
                     " " (files_left) " items, " (size(*bytes_left)) " left"

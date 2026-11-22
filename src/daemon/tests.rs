@@ -795,6 +795,7 @@ fn confirm_current(daemon: &Daemon<Fake>, path: &str, at: Timestamp) {
     replicas.states.insert(ITEM, ReplicaState::Current);
     replicas.read_for.insert(ITEM, path.clone());
     replicas.current.insert(ITEM, Confirmed { path, at });
+    replicas.every_sender.insert(ITEM);
 }
 
 #[tokio::test]
@@ -839,6 +840,15 @@ async fn an_item_is_fully_replicated_only_while_every_replica_is_seen_current() 
     a.pull_round().await.unwrap();
     let status = a.api().status().await;
     assert_eq!(status.items[0].replication, Replication::Full);
+
+    // Current, but not connected to every sender, isn't enough.
+    a.replicas.lock().unwrap().every_sender.clear();
+    let status = a.api().status().await;
+    assert_eq!(
+        status.items[0].replication,
+        Replication::Unconfirmed { oldest: Some(b_at) }
+    );
+    a.replicas.lock().unwrap().every_sender.insert(ITEM);
     let reaches: Vec<_> = status
         .nodes
         .iter()
@@ -929,7 +939,6 @@ fn requests_may_name_the_daemon_by_address_or_magicdns_name() {
         "100.64.0.1:7130",
         "[fd7a:115c:a1e0::1]:7130",
         "laptop.tail.ts.net:7130",
-        "laptop:7130",
     ]
     .map(String::from)
     .into();
@@ -938,4 +947,34 @@ fn requests_may_name_the_daemon_by_address_or_magicdns_name() {
     // Without MagicDNS, only by address.
     me.dns_name.clear();
     assert_eq!(hosts(&me, 7130).len(), 2);
+}
+
+#[tokio::test]
+async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    track(&daemon, "docs");
+    let config = daemon.db().lock().unwrap().config();
+    let outcomes = BTreeMap::from([(ITEM, Outcome::Configured)]);
+    daemon.replicas.lock().unwrap().reconciled = Some(Arc::new(Reconciled {
+        config,
+        outcomes: Ok(outcomes),
+    }));
+    // As if an earlier listing were stuck on the Replica's filesystem.
+    let gate: Arc<tokio::sync::Mutex<()>> = daemon
+        .list_gates
+        .lock()
+        .unwrap()
+        .entry(PathBuf::from("/srv/x"))
+        .or_default()
+        .clone();
+    let stuck = gate.lock().await;
+    let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
+    assert!(matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+
+    drop(stuck);
+    let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
+    assert!(!matches!(listed, Err(ActionError::Hung)), "{listed:?}");
 }

@@ -56,6 +56,10 @@ pub struct NodeState {
     /// When its Node last confirmed it current, if ever.
     #[serde(default)]
     pub confirmed_at: Option<Timestamp>,
+    /// Whether it was connected to every Replica that sends to it, so that
+    /// being current means it has what they all have.
+    #[serde(default)]
+    pub every_sender: bool,
 }
 
 /// The answer to `GET /node/hello`.

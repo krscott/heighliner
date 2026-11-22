@@ -1119,6 +1119,7 @@ mod events;
 mod state;
 
 pub use events::{Finished, Seen};
+pub use state::Observed;
 #[cfg(test)]
 pub(crate) mod test_instance;
 #[cfg(test)]

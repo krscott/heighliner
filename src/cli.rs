@@ -21,7 +21,7 @@ use crate::api::{
     self, AddReplica, Reach, Refused, Replication, SetPaused, Status, Track, Tracked,
 };
 use crate::http::{self, BoxError};
-use crate::model::NodeId;
+use crate::model::{NodeId, ReplicaState};
 use crate::tailscale::{self, LocalApi};
 
 /// How long a request may take.
@@ -363,9 +363,16 @@ pub fn format_status(status: &Status) -> String {
             if replica.paused {
                 line.push_str(", paused");
             }
+            let partly = if replica.state == Some(ReplicaState::Current) && !replica.every_sender {
+                " with only the senders it reaches"
+            } else {
+                ""
+            };
             match (&replica.state, replica.state_read_at) {
-                (Some(state), None) => line.push_str(&format!(", {state}")),
-                (Some(state), Some(at)) => line.push_str(&format!(", {state} (as of {at})")),
+                (Some(state), None) => line.push_str(&format!(", {state}{partly}")),
+                (Some(state), Some(at)) => {
+                    line.push_str(&format!(", {state}{partly} (as of {at})"));
+                }
                 (None, _) => {}
             }
             out.push_str(&line);

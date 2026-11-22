@@ -103,6 +103,7 @@ impl From<ActionError> for Refusal {
                 StatusCode::NOT_FOUND
             }
             ActionError::Conflict(_) => StatusCode::CONFLICT,
+            ActionError::Hung => StatusCode::SERVICE_UNAVAILABLE,
         };
         Self(status, error.to_string())
     }
@@ -167,28 +168,32 @@ impl<T: LocalApi + Clone> Api<T> {
                         let path = replica.path();
                         // Only for the path it was read for: one added again
                         // elsewhere starts afresh.
-                        let (state, state_read_at, confirmed_at, live) = if *node == me {
-                            let state = (replicas.read_for.get(id) == Some(path))
-                                .then(|| replicas.states.get(id).cloned())
-                                .flatten();
-                            (state, None, replicas.confirmed(id, path), true)
-                        } else {
-                            match remote.states.get(node) {
-                                Some((read_at, states)) => {
-                                    let read = states
-                                        .get(id)
-                                        .filter(|state| state.path == path.as_str());
-                                    (
-                                        read.map(|read| read.state.clone()),
-                                        Some(*read_at),
-                                        read.and_then(|read| read.confirmed_at),
-                                        remote.live.contains(node),
-                                    )
+                        let (state, state_read_at, confirmed_at, every_sender, live) =
+                            if *node == me {
+                                let read = replicas.read_for.get(id) == Some(path);
+                                let state =
+                                    read.then(|| replicas.states.get(id).cloned()).flatten();
+                                let every_sender = read && replicas.every_sender.contains(id);
+                                (state, None, replicas.confirmed(id, path), every_sender, true)
+                            } else {
+                                match remote.states.get(node) {
+                                    Some((read_at, states)) => {
+                                        let read = states
+                                            .get(id)
+                                            .filter(|state| state.path == path.as_str());
+                                        (
+                                            read.map(|read| read.state.clone()),
+                                            Some(*read_at),
+                                            read.and_then(|read| read.confirmed_at),
+                                            read.is_some_and(|read| read.every_sender),
+                                            remote.live.contains(node),
+                                        )
+                                    }
+                                    None => (None, None, None, false, false),
                                 }
-                                None => (None, None, None, false),
-                            }
-                        };
-                        let current_now = live && state == Some(ReplicaState::Current);
+                            };
+                        let current_now =
+                            live && every_sender && state == Some(ReplicaState::Current);
                         let status = ReplicaStatus {
                             node: node.clone(),
                             node_name: name_of(node),
@@ -199,6 +204,7 @@ impl<T: LocalApi + Clone> Api<T> {
                             state,
                             state_read_at,
                             confirmed_at,
+                            every_sender,
                         };
                         (status, current_now)
                     })
@@ -603,6 +609,7 @@ async fn node_states<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Nod
                 path: path.as_str().to_owned(),
                 state: state.clone(),
                 confirmed_at: replicas.confirmed(item, path),
+                every_sender: replicas.every_sender.contains(item),
             };
             Some((*item, read))
         })

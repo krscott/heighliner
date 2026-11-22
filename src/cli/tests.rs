@@ -280,6 +280,7 @@ fn status_names_flags_replication_and_nodes() {
                 state: Some(ReplicaState::Current),
                 state_read_at: Some(at),
                 confirmed_at: Some(at),
+                every_sender: false,
             }],
         }],
         problems: Vec::new(),
@@ -288,7 +289,7 @@ fn status_names_flags_replication_and_nodes() {
     let expected = format!(
         "docs ({}, two-way, resurrected, name shared)
   not confirmed fully replicated; the oldest confirmation is from 1970-01-01T00:00:00Z
-  nas:/srv/docs peer, is current (as of 1970-01-01T00:00:00Z)
+  nas:/srv/docs peer, is current with only the senders it reaches (as of 1970-01-01T00:00:00Z)
 Nodes:
   laptop: this Node
   nas: unreachable; last read at 1970-01-01T00:00:00Z

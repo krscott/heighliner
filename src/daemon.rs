@@ -257,6 +257,7 @@ pub struct Daemon<T> {
     edited: Arc<Notify>,
     remote: Arc<Mutex<Remote>>,
     changes: Changes,
+    list_gates: conflicts::ListGates,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -338,6 +339,9 @@ struct Replicas {
     last_current: BTreeMap<ItemId, Confirmed>,
     /// The state last logged for each Replica, to log changes only.
     logged: BTreeMap<ItemId, ReplicaState>,
+    /// The Replicas connected to every one of their senders when their
+    /// states were read.
+    every_sender: BTreeSet<ItemId>,
 }
 
 impl Replicas {
@@ -387,6 +391,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             current: BTreeMap::new(),
             last_current,
             logged: BTreeMap::new(),
+            every_sender: BTreeSet::new(),
         }));
         let state = Arc::new(StateFile {
             path: state_file,
@@ -407,6 +412,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             edited: Arc::default(),
             remote: Arc::default(),
             changes: Arc::new(watch::Sender::new(())),
+            list_gates: Arc::default(),
         })
     }
 
@@ -522,21 +528,13 @@ impl<T: LocalApi + Clone> Daemon<T> {
         {
             match hello {
                 Ok(hello) if hello.protocol == protocol::MAJOR => {
-                    let remote = self.remote.clone();
                     pulls.spawn(async move {
                         let pulled = protocol::pull(addr, &hello, PULL_TIMEOUT).await;
-                        // Only shown, so a Node that can't answer keeps its
-                        // last-known states.
-                        let read = protocol::states(addr, PULL_TIMEOUT).await.ok();
-                        if let Some(read) = &read {
-                            let read_at = Timestamp::now();
-                            let mut remote = remote.lock().unwrap();
-                            remote
-                                .states
-                                .insert(device.id.clone(), (read_at, read.states.clone()));
-                            remote.live.insert(device.id.clone());
-                        }
-                        (device, pulled, read.is_some())
+                        let read = protocol::states(addr, PULL_TIMEOUT)
+                            .await
+                            .ok()
+                            .map(|read| (Timestamp::now(), read.states));
+                        (device, pulled, read)
                     });
                 }
                 Ok(hello) => {
@@ -555,11 +553,11 @@ impl<T: LocalApi + Clone> Daemon<T> {
         }
         // Merge each Node's records as they arrive, so a slow Node doesn't
         // hold up the rest.
-        let mut read = BTreeSet::new();
+        let mut read = BTreeMap::new();
         while let Some(joined) = pulls.join_next().await {
-            let (device, pulled, states_read) = joined.expect("pull tasks don't panic");
-            if states_read {
-                read.insert(device.id.clone());
+            let (device, pulled, states) = joined.expect("pull tasks don't panic");
+            if let Some(states) = states {
+                read.insert(device.id.clone(), states);
             }
             match pulled {
                 Ok((store, skipped)) => {
@@ -586,9 +584,13 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
             }
         }
+        // Published together, so that what is live is all from this round.
+        // States are only shown, so a Node that can't answer keeps its
+        // last-known ones.
         {
             let mut remote = self.remote.lock().unwrap();
-            remote.live.retain(|node| read.contains(node));
+            remote.live = read.keys().cloned().collect();
+            remote.states.extend(read);
             remote.incompatible = round
                 .incompatible
                 .iter()
@@ -675,8 +677,20 @@ impl<T: LocalApi + Clone> Daemon<T> {
         // Taken before reading, so that a confirmation is never dated later
         // than it happened.
         let read_at = Timestamp::now();
-        let mut states = match &reconciled.outcomes {
-            Ok(outcomes) => driver.states(config, &me, outcomes).await,
+        let observed = match &reconciled.outcomes {
+            Ok(outcomes) => driver.observe_all(config, &me, outcomes).await,
+            Err(_) => BTreeMap::new(),
+        };
+        let every_sender: BTreeSet<ItemId> = observed
+            .iter()
+            .filter(|(_, observed)| observed.every_sender)
+            .map(|(item, _)| *item)
+            .collect();
+        let mut states: BTreeMap<ItemId, ReplicaState> = match &reconciled.outcomes {
+            Ok(_) => observed
+                .into_iter()
+                .map(|(item, observed)| (item, observed.state))
+                .collect(),
             Err(reason) => config
                 .replicas_on(&me)
                 .into_iter()
@@ -690,6 +704,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         if number < replicas.applied {
             return;
         }
+        replicas.every_sender = every_sender;
         replicas.applied = number;
         let Replicas {
             states: before,
@@ -796,17 +811,16 @@ impl<T: LocalApi + Clone> Daemon<T> {
 }
 
 /// The `Host`s a request to `device`'s daemon on `port` may name: its
-/// Tailscale addresses and, with MagicDNS, its name, in full and short.
+/// Tailscale addresses and its full MagicDNS name, if it has one. Not its
+/// short name, which whatever network the browser is on may answer for.
 fn hosts(device: &tailscale::Device, port: u16) -> BTreeSet<String> {
     let addrs = device
         .ips
         .iter()
         .map(|ip| SocketAddr::new(*ip, port).to_string());
-    let names = [device.dns_name.as_str(), device.name.as_str()]
-        .into_iter()
-        .filter(|_| !device.dns_name.is_empty())
-        .map(|name| format!("{}:{port}", name.to_ascii_lowercase()));
-    addrs.chain(names).collect()
+    let name = (!device.dns_name.is_empty())
+        .then(|| format!("{}:{port}", device.dns_name.to_ascii_lowercase()));
+    addrs.chain(name).collect()
 }
 
 /// The state file's contents for `db`, a copy of `owner`'s Fleet.

@@ -251,7 +251,15 @@ impl Queue {
     }
 }
 
-/// Why a Data Conflict couldn't be kept or swapped.
+/// How long listing one Replica's Data Conflicts may take, including
+/// waiting for an earlier listing of it.
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One gate per Replica path, so that a hung filesystem holds at most one
+/// listing thread per Replica, however often its conflicts are asked for.
+pub(super) type ListGates = Arc<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Why a Data Conflict couldn't be listed, kept or swapped.
 #[derive(Debug)]
 pub enum ActionError {
     /// The Item has no configured Replica on this Node.
@@ -262,6 +270,8 @@ pub enum ActionError {
     /// Syncthing couldn't say whether it does.
     Syncthing(syncthing::Error),
     Conflict(conflicts::Error),
+    /// Listing the Replica's conflicts took too long.
+    Hung,
 }
 
 impl fmt::Display for ActionError {
@@ -274,6 +284,11 @@ impl fmt::Display for ActionError {
             ),
             Self::Syncthing(error) => write!(f, "can't ask Syncthing about the replica: {error}"),
             Self::Conflict(error) => error.fmt(f),
+            Self::Hung => write!(
+                f,
+                "its conflicts weren't listed within {}s; is its filesystem hung?",
+                LIST_TIMEOUT.as_secs()
+            ),
         }
     }
 }
@@ -288,6 +303,7 @@ pub(super) struct Conflicts {
     pub(super) me: NodeId,
     pub(super) driver: Option<Driver>,
     pub(super) changes: Changes,
+    pub(super) gates: ListGates,
 }
 
 impl Conflicts {
@@ -304,18 +320,35 @@ impl Conflicts {
 
     /// The Data Conflicts kept on this Node, for each Replica whose folder
     /// is configured, or why they can't be read.
-    pub(super) async fn list(
-        &self,
-    ) -> BTreeMap<ItemId, Result<Vec<DataConflict>, conflicts::Error>> {
-        let roots = self.roots();
-        tokio::task::spawn_blocking(move || {
-            roots
-                .into_iter()
-                .map(|root| (root.item, conflicts::list(&root.path)))
-                .collect()
-        })
-        .await
-        .expect("listing conflicts doesn't panic")
+    pub(super) async fn list(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, ActionError>> {
+        let mut listings = tokio::task::JoinSet::new();
+        for root in self.roots() {
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .entry(root.path.clone())
+                .or_default()
+                .clone();
+            listings.spawn(async move {
+                let listing = async move {
+                    let open = gate.lock_owned().await;
+                    tokio::task::spawn_blocking(move || {
+                        let listed = conflicts::list(&root.path);
+                        drop(open);
+                        listed
+                    })
+                    .await
+                    .expect("listing conflicts doesn't panic")
+                };
+                let listed = match tokio::time::timeout(LIST_TIMEOUT, listing).await {
+                    Ok(listed) => listed.map_err(ActionError::Conflict),
+                    Err(_) => Err(ActionError::Hung),
+                };
+                (root.item, listed)
+            });
+        }
+        listings.join_all().await.into_iter().collect()
     }
 
     /// `item`'s configured Replica on this Node, if the records still have
@@ -394,6 +427,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             me: self.db.lock().unwrap().node().clone(),
             driver: self.driver.clone(),
             changes: self.changes.clone(),
+            gates: self.list_gates.clone(),
         }
     }
 
@@ -405,7 +439,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
 
     /// The Data Conflicts kept on this Node, for each Replica whose folder
     /// is configured, or why they can't be read.
-    pub async fn conflicts(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, conflicts::Error>> {
+    pub async fn conflicts(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, ActionError>> {
         self.conflict_ops().list().await
     }
 

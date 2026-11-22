@@ -1018,7 +1018,7 @@ async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
     }));
     // As if an earlier listing were stuck on the Replica's filesystem.
     let gate: Arc<tokio::sync::Mutex<()>> = daemon
-        .list_gates
+        .conflict_gates
         .lock()
         .unwrap()
         .entry(PathBuf::from("/srv/x"))

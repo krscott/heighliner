@@ -50,7 +50,8 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .route(EVENTS, get(events::<T>))
         .route("/ui/style.css", get(style))
         .route("/ui/live.js", get(script))
-        .with_state(api)
+        .with_state(api.clone())
+        .merge(actions::router(api))
 }
 
 /// The path of `item`'s page.
@@ -339,6 +340,81 @@ fn reach(now: Timestamp, node: &NodeStatus) -> Markup {
     }
 }
 
+/// A button that posts `fields` to `action`, one of [`actions`]' paths.
+fn button(action: &str, fields: &[(&str, &str)], label: &str) -> Markup {
+    html! {
+        form.inline method="post" action=(action) {
+            @for (name, value) in fields { input type="hidden" name=(name) value=(value); }
+            button { (label) }
+        }
+    }
+}
+
+/// An action that takes a second step: opening `summary` shows what it
+/// does and its button.
+fn confirmed(summary: &str, explanation: &str, button: Markup) -> Markup {
+    html! {
+        details.confirm {
+            summary { (summary) }
+            p.note { (explanation) }
+            (button)
+        }
+    }
+}
+
+/// A choice of the Nodes something can be placed on, this one first.
+fn node_select(status: &Status) -> Markup {
+    html! {
+        select name="node" {
+            @for node in &status.nodes {
+                @if !node.departed && !matches!(node.reach, Reach::Incompatible { .. }) {
+                    option value=(node.node) selected[node.reach == Reach::Here] {
+                        (node_name(status, &node.node))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Pausing or resuming, posted to `action`, and coming `back`.
+fn pause_button(action: &str, paused: bool, back: &str) -> Markup {
+    let (value, label) = if paused {
+        ("false", "Resume")
+    } else {
+        ("true", "Pause")
+    };
+    button(action, &[("paused", value), ("back", back)], label)
+}
+
+fn track_form(status: &Status) -> Markup {
+    html! {
+        details.form {
+            summary { "Track a directory" }
+            form.stack method="post" action=(actions::TRACK) {
+                label { "Node " (node_select(status)) }
+                label {
+                    "Path "
+                    input name="path" required placeholder="/srv/photos, or ~/docs on this Node";
+                }
+                label { "Name " input name="name" placeholder="the path's last part"; }
+                label.check { input type="checkbox" name="one_way"; " One-way, from this replica" }
+                label {
+                    "Excludes, one per line "
+                    textarea name="excludes" rows="2" {}
+                }
+                label {
+                    "Keep displaced versions for "
+                    input name="retention_days" type="number" min="1" placeholder="the Retention Window";
+                    " days"
+                }
+                p.note { "The files already at the path become the item's." }
+                button { "Track" }
+            }
+        }
+    }
+}
+
 async fn fleet<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let status = api.status().await;
     let conflicts = api.list_conflicts().await;
@@ -368,8 +444,9 @@ async fn fleet<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
         section {
             h2 { "Items" }
             @if status.items.is_empty() {
-                p.note { "No items are tracked. Track a directory with " code { "heighliner track <path>" } "." }
+                p.note { "No items are tracked." }
             }
+            (track_form(&status))
             ul.cards {
                 @for item in &status.items {
                     li.card {
@@ -405,12 +482,43 @@ async fn fleet<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
                             }
                         }
                         p { (reach(now, node)) }
+                        @if node.reach == Reach::Here && !node.departed {
+                            details.confirm {
+                                summary { "Leave the Fleet" }
+                                p.note {
+                                    "No Node will sync with this one any more, and it can't rejoin. "
+                                    "Its replicas' files stay where they are."
+                                }
+                                form method="post" action=(actions::LEAVE) {
+                                    label.check {
+                                        input type="checkbox" name="confirm" required;
+                                        " I understand this can't be undone"
+                                    }
+                                    button { "Leave" }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     };
     page(&status, "Fleet", StatusCode::OK, main)
+}
+
+/// Pausing, resuming and removing `replica` of `item`, coming `back`.
+fn replica_actions(item: &ItemStatus, replica: &ReplicaStatus, back: &str) -> Markup {
+    let node = replica.node.as_str();
+    html! {
+        div.actions {
+            (pause_button(&actions::replica_paused(item.id, node), replica.paused, back))
+            (confirmed(
+                "Remove",
+                "It stops syncing. Its files stay where they are.",
+                button(&actions::remove(item.id, node), &[], "Remove this replica"),
+            ))
+        }
+    }
 }
 
 /// The Item `id` names in `status`.
@@ -440,6 +548,14 @@ async fn item<T: LocalApi + Clone>(State(api): State<Api<T>>, Path(id): Path<Str
             }
         }
         p { (replication(now, &item.replication)) }
+        div.actions {
+            (pause_button(&actions::item_paused(item.id), item.paused, &item_href(item.id)))
+            (confirmed(
+                "Untrack",
+                "Every replica stops syncing. Their files stay where they are.",
+                button(&actions::untrack(item.id), &[], &format!("Untrack {}", item.name)),
+            ))
+        }
         dl {
             dt { "ID" } dd { code { (item.id) } }
             dt { "Direction" } dd { (direction(&status, item)) }
@@ -469,7 +585,25 @@ async fn item<T: LocalApi + Clone>(State(api): State<Api<T>>, Path(id): Path<Str
                     }
                     p.path { code { (replica.path) } }
                     p { (state(now, &status, replica)) }
+                    (replica_actions(item, replica, &item_href(item.id)))
                 }
+            }
+        }
+        details.form {
+            summary { "Add a replica" }
+            form.stack method="post" action=(actions::replicas(item.id)) {
+                label { "Node " (node_select(&status)) }
+                label {
+                    "Path "
+                    input name="path" required placeholder="/srv/photos, or ~/docs on this Node";
+                }
+                label.check { input type="checkbox" name="mirror"; " Mirror: receives only" }
+                label.check {
+                    input type="checkbox" name="adopt";
+                    " Adopt the files already at the path, merging them with the item's"
+                }
+                p.note { "Without adopting, the path must be empty or not exist yet." }
+                button { "Add" }
             }
         }
     };
@@ -508,6 +642,7 @@ async fn replica<T: LocalApi + Clone>(
     let main = html! {
         h1 { a href=(item_href(item.id)) { (item.name) } " on " (name) }
         p { (state(now, &status, replica)) }
+        (replica_actions(item, replica, &replica_href(item.id, replica)))
         dl {
             dt { "Node" }
             dd {
@@ -530,7 +665,7 @@ async fn replica<T: LocalApi + Clone>(
         }
         h2 { "Data conflicts" }
         @match &conflicts {
-            Some(listed) => (conflict_list(now, listed)),
+            Some(listed) => (conflict_list(now, listed, &replica_href(item.id, replica))),
             None => p.note {
                 "Its data conflicts are kept on its Node. "
                 @if let Some(url) = node.and_then(|node| node_url(node, api.port)) {
@@ -543,7 +678,8 @@ async fn replica<T: LocalApi + Clone>(
     page(&status, &title, StatusCode::OK, main)
 }
 
-fn conflict_list(now: Timestamp, listed: &api::Conflicts) -> Markup {
+/// This Node's Data Conflicts, to keep or swap, coming `back`.
+fn conflict_list(now: Timestamp, listed: &api::Conflicts, back: &str) -> Markup {
     html! {
         @if listed.conflicts.is_empty() && listed.errors.is_empty() {
             p.note { "None." }
@@ -564,6 +700,12 @@ fn conflict_list(now: Timestamp, listed: &api::Conflicts) -> Markup {
                         "."
                     }
                     p.note { "Version " code { (conflict.version) } }
+                    @let item = conflict.item.to_string();
+                    @let fields = [("item", item.as_str()), ("version", conflict.version.as_str()), ("back", back)];
+                    div.actions {
+                        (button(actions::KEEP, &fields, "Keep the file"))
+                        (button(actions::SWAP, &fields, "Swap in the other change"))
+                    }
                 }
             }
         }
@@ -589,7 +731,12 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
             "When two replicas change a file at once, Syncthing keeps one change as the file. "
             "The other is kept here, out of the item, until it expires."
         }
-        (conflict_list(now, &listed))
+        p.note {
+            "Keeping leaves the file as it is. Swapping makes the other change the file's "
+            "content again, and Syncthing sends it to the other replicas. Either way, the "
+            "side that isn't the file is kept until it expires."
+        }
+        (conflict_list(now, &listed, "/conflicts"))
         @if !others.is_empty() {
             h2 { "On other Nodes" }
             ul {
@@ -601,6 +748,8 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     };
     page(&status, "Data conflicts", StatusCode::OK, main)
 }
+
+mod actions;
 
 #[cfg(test)]
 mod tests;

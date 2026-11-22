@@ -159,3 +159,186 @@ async fn the_fleet_page_says_when_conflicts_cant_be_read() {
         "{body}"
     );
 }
+
+/// Posts `form` to `path` from `origin`, if any, as a browser would, and
+/// returns the status, `Location` and body.
+async fn post_form(
+    daemon: &Daemon<Fake>,
+    path: &str,
+    form: &str,
+    origin: Option<&str>,
+) -> (StatusCode, Option<String>, String) {
+    let mut request = Request::post(path)
+        .header(header::HOST, "127.0.0.1:7130")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(origin) = origin {
+        request = request.header(header::ORIGIN, origin);
+    }
+    let request = request.body(Body::from(form.to_owned())).unwrap();
+    let response = router(daemon.api()).oneshot(request).await.unwrap();
+    let (parts, body) = response.into_parts();
+    let location = parts
+        .headers
+        .get(header::LOCATION)
+        .map(|value| value.to_str().unwrap().to_owned());
+    let body = body.collect().await.unwrap().to_bytes();
+    (
+        parts.status,
+        location,
+        String::from_utf8(body.to_vec()).unwrap(),
+    )
+}
+
+const OURS: Option<&str> = Some("http://127.0.0.1:7130");
+
+#[tokio::test]
+async fn only_the_daemons_own_pages_can_post() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    track(&daemon, "docs");
+    let path = format!("/ui/items/{ITEM}/paused");
+    for origin in [None, Some("http://evil.example"), Some("null")] {
+        let (code, _, _) = post_form(&daemon, &path, "paused=true", origin).await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{origin:?}");
+    }
+    assert!(
+        !daemon.db().lock().unwrap().config().items[&ITEM]
+            .item
+            .paused
+    );
+
+    let (code, location, _) = post_form(&daemon, &path, "paused=true", OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some(format!("/items/{ITEM}").as_str()));
+    assert!(
+        daemon.db().lock().unwrap().config().items[&ITEM]
+            .item
+            .paused
+    );
+}
+
+#[tokio::test]
+async fn a_directory_is_tracked_and_edited_through_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    let form = "node=n-laptop&path=%2Fsrv%2Fphotos&name=&one_way=on&excludes=*.tmp%0D%0A%0D%0Acache&retention_days=7";
+    let (code, location, body) = post_form(&daemon, actions::TRACK, form, OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER, "{body}");
+    let config = daemon.db().lock().unwrap().config();
+    let (id, entry) = config.items.iter().next().unwrap();
+    assert_eq!(location, Some(item_href(*id)));
+    assert_eq!(entry.item.name, "photos");
+    assert!(matches!(entry.item.direction, Direction::OneWay { .. }));
+    let excludes: Vec<&str> = entry.item.excludes.iter().map(|p| p.as_str()).collect();
+    assert_eq!(excludes, ["*.tmp", "cache"]);
+    assert_eq!(entry.item.retention_days.map(|days| days.get()), Some(7));
+    let id = *id;
+
+    // A replica elsewhere, paused, then removed, coming back to the page
+    // the button was on.
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .add_replica(
+            Timestamp::now(),
+            id,
+            &crate::model::NodeId::new("n-nas").unwrap(),
+            Replica::new(AbsPath::new("/srv/nas").unwrap()),
+        )
+        .unwrap();
+    let back = format!("/items/{id}/replicas/n-nas");
+    let (code, location, _) = post_form(
+        &daemon,
+        &actions::replica_paused(id, "n-nas"),
+        &format!("paused=true&back={}", percent_encode(&back)),
+        OURS,
+    )
+    .await;
+    assert_eq!(
+        (code, location.as_deref()),
+        (StatusCode::SEE_OTHER, Some(back.as_str()))
+    );
+    let paused = |daemon: &Daemon<Fake>| {
+        let config = daemon.db().lock().unwrap().config();
+        config.items[&id]
+            .replicas
+            .get(&crate::model::NodeId::new("n-nas").unwrap())
+            .map(|replica| replica.paused)
+    };
+    assert_eq!(paused(&daemon), Some(true));
+    let (code, _, _) = post_form(&daemon, &actions::remove(id, "n-nas"), "", OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER);
+    assert_eq!(paused(&daemon), None);
+
+    let (code, location, _) = post_form(&daemon, &actions::untrack(id), "", OURS).await;
+    assert_eq!(
+        (code, location.as_deref()),
+        (StatusCode::SEE_OTHER, Some("/"))
+    );
+    assert!(daemon.db().lock().unwrap().config().items.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_action_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    let (code, _, body) =
+        post_form(&daemon, actions::TRACK, "node=n-laptop&path=relative", OURS).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Couldn't track it"), "{body}");
+    assert!(
+        body.contains("isn&#39;t absolute") || body.contains("isn't absolute"),
+        "{body}"
+    );
+
+    let (code, _, body) = post_form(&daemon, actions::TRACK, "node=n-laptop", OURS).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+
+    // Leaving needs its box checked.
+    let (code, _, body) = post_form(&daemon, actions::LEAVE, "", OURS).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(body.contains("confirm it"), "{body}");
+}
+
+#[tokio::test]
+async fn coming_back_stays_on_the_daemons_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    track(&daemon, "docs");
+    let path = format!("/ui/items/{ITEM}/paused");
+    for back in [
+        "%2F%2Fevil.example",
+        "https%3A%2F%2Fevil.example",
+        "%2F%5Cevil.example",
+    ] {
+        let form = format!("paused=false&back={back}");
+        let (_, location, _) = post_form(&daemon, &path, &form, OURS).await;
+        assert_eq!(location, Some(format!("/items/{ITEM}")), "{back}");
+    }
+}
+
+#[tokio::test]
+async fn pages_offer_their_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    track(&daemon, "docs");
+    let (_, _, fleet) = get_page(&daemon, "/").await;
+    assert!(
+        fleet.contains(&format!("action=\"{}\"", actions::TRACK)),
+        "{fleet}"
+    );
+    assert!(fleet.contains(&format!("action=\"{}\"", actions::LEAVE)));
+    let (_, _, item) = get_page(&daemon, &format!("/items/{ITEM}")).await;
+    for action in [
+        actions::item_paused(ITEM),
+        actions::untrack(ITEM),
+        actions::replicas(ITEM),
+        actions::remove(ITEM, "n-laptop"),
+    ] {
+        assert!(
+            item.contains(&format!("action=\"{action}\"")),
+            "{action}: {item}"
+        );
+    }
+}

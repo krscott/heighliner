@@ -251,13 +251,43 @@ impl Queue {
     }
 }
 
-/// How long listing one Replica's Data Conflicts may take, including
-/// waiting for an earlier listing of it.
-const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long listing, keeping or swapping a Replica's Data Conflicts may
+/// take, including waiting for earlier work on it.
+const WORK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One gate per Replica path, so that a hung filesystem holds at most one
-/// listing thread per Replica, however often its conflicts are asked for.
-pub(super) type ListGates = Arc<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>;
+/// thread per Replica, however often its conflicts are asked for.
+pub(super) type Gates = Arc<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Runs `work` on the Replica at `path` away from the async runtime, after
+/// any earlier work on it finishes, for at most [`WORK_TIMEOUT`]. Work
+/// that times out still runs to its end, holding the gate.
+async fn gated<R: Send + 'static>(
+    gates: &Gates,
+    path: PathBuf,
+    work: impl FnOnce(&std::path::Path) -> R + Send + 'static,
+) -> Result<R, ActionError> {
+    let gate = {
+        let mut gates = gates.lock().unwrap();
+        // Gates no work holds or waits on are dropped, so they don't pile
+        // up as Replicas move.
+        gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        gates.entry(path.clone()).or_default().clone()
+    };
+    let run = async move {
+        let open = gate.lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let done = work(&path);
+            drop(open);
+            done
+        })
+        .await
+        .expect("conflict work doesn't panic")
+    };
+    tokio::time::timeout(WORK_TIMEOUT, run)
+        .await
+        .map_err(|_| ActionError::Hung)
+}
 
 /// Why a Data Conflict couldn't be listed, kept or swapped.
 #[derive(Debug)]
@@ -270,7 +300,8 @@ pub enum ActionError {
     /// Syncthing couldn't say whether it does.
     Syncthing(syncthing::Error),
     Conflict(conflicts::Error),
-    /// Listing the Replica's conflicts took too long.
+    /// The Replica's filesystem didn't answer in time. A keep or swap may
+    /// still finish.
     Hung,
 }
 
@@ -286,8 +317,8 @@ impl fmt::Display for ActionError {
             Self::Conflict(error) => error.fmt(f),
             Self::Hung => write!(
                 f,
-                "its conflicts weren't listed within {}s; is its filesystem hung?",
-                LIST_TIMEOUT.as_secs()
+                "the replica's filesystem didn't answer within {}s; is it hung? A keep or swap may still finish",
+                WORK_TIMEOUT.as_secs()
             ),
         }
     }
@@ -303,7 +334,7 @@ pub(super) struct Conflicts {
     pub(super) me: NodeId,
     pub(super) driver: Option<Driver>,
     pub(super) changes: Changes,
-    pub(super) gates: ListGates,
+    pub(super) gates: Gates,
 }
 
 impl Conflicts {
@@ -322,36 +353,14 @@ impl Conflicts {
     /// is configured, or why they can't be read.
     pub(super) async fn list(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, ActionError>> {
         let mut listings = tokio::task::JoinSet::new();
-        // Gates no listing holds or waits on are dropped, so they don't
-        // pile up as Replicas move.
-        self.gates
-            .lock()
-            .unwrap()
-            .retain(|_, gate| Arc::strong_count(gate) > 1);
         for root in self.roots() {
-            let gate = self
-                .gates
-                .lock()
-                .unwrap()
-                .entry(root.path.clone())
-                .or_default()
-                .clone();
+            let gates = self.gates.clone();
             listings.spawn(async move {
-                let listing = async move {
-                    let open = gate.lock_owned().await;
-                    tokio::task::spawn_blocking(move || {
-                        let listed = conflicts::list(&root.path);
-                        drop(open);
-                        listed
-                    })
-                    .await
-                    .expect("listing conflicts doesn't panic")
-                };
-                let listed = match tokio::time::timeout(LIST_TIMEOUT, listing).await {
-                    Ok(listed) => listed.map_err(ActionError::Conflict),
-                    Err(_) => Err(ActionError::Hung),
-                };
-                (root.item, listed)
+                let listed = gated(&gates, root.path, conflicts::list).await;
+                (
+                    root.item,
+                    listed.and_then(|listed| listed.map_err(ActionError::Conflict)),
+                )
             });
         }
         listings.join_all().await.into_iter().collect()
@@ -381,10 +390,11 @@ impl Conflicts {
     ) -> Result<DataConflict, ActionError> {
         let root = self.root(item)?;
         let version = version.to_owned();
-        let kept = tokio::task::spawn_blocking(move || conflicts::keep(&root.path, &version))
-            .await
-            .expect("keeping a conflict doesn't panic")
-            .map_err(ActionError::Conflict)?;
+        let kept = gated(&self.gates, root.path, move |path| {
+            conflicts::keep(path, &version)
+        })
+        .await?
+        .map_err(ActionError::Conflict)?;
         signal(&self.changes);
         Ok(kept)
     }
@@ -408,10 +418,11 @@ impl Conflicts {
             return Err(ActionError::DoesntSend(item));
         }
         let version = version.to_owned();
-        let conflict = tokio::task::spawn_blocking(move || conflicts::swap(&root.path, &version))
-            .await
-            .expect("swapping a conflict doesn't panic")
-            .map_err(ActionError::Conflict)?;
+        let conflict = gated(&self.gates, root.path, move |path| {
+            conflicts::swap(path, &version)
+        })
+        .await?
+        .map_err(ActionError::Conflict)?;
         signal(&self.changes);
         // Syncthing would notice on its own, but later. The swap is done
         // whatever the scan takes.
@@ -433,7 +444,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             me: self.db.lock().unwrap().node().clone(),
             driver: self.driver.clone(),
             changes: self.changes.clone(),
-            gates: self.list_gates.clone(),
+            gates: self.conflict_gates.clone(),
         }
     }
 

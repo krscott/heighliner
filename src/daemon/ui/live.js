@@ -6,15 +6,28 @@
   let fetching = false;
   let again = false;
 
-  // Whether the user is selecting or typing in the page, which a swap would
-  // undo; the page is updated at the next change after.
+  // Whether the user is selecting in the page, typing in it, or has a form
+  // open or filled in, which a swap would undo; the page is updated at the
+  // next change after.
   function inUse(main) {
     const selection = document.getSelection();
     const selecting =
       selection &&
       !selection.isCollapsed &&
       (main.contains(selection.anchorNode) || main.contains(selection.focusNode));
-    return selecting || main.contains(document.activeElement);
+    const changed = [...main.querySelectorAll("input, textarea, select")].some((field) =>
+      field.type === "checkbox"
+        ? field.checked !== field.defaultChecked
+        : field instanceof HTMLSelectElement
+          ? [...field.options].some((option) => option.selected !== option.defaultSelected)
+          : field.value !== field.defaultValue,
+    );
+    return (
+      selecting ||
+      changed ||
+      main.contains(document.activeElement) ||
+      main.querySelector("details[open]") !== null
+    );
   }
 
   async function update() {

@@ -84,8 +84,8 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .with_state(api)
 }
 
-/// A refused request.
-struct Refusal(StatusCode, String);
+/// A refused request: its status, and why, as a sentence.
+pub(super) struct Refusal(pub(super) StatusCode, pub(super) String);
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
@@ -494,42 +494,118 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
     Json(api.status().await)
 }
 
+/// The edits the API and the web UI make. Each names its Item by ID or
+/// name and its Node by node ID or machine name, as [`api`] describes.
+impl<T: LocalApi + Clone> Api<T> {
+    pub(super) async fn track(&self, track: Track) -> Result<ItemId, Refusal> {
+        let node = self.node(track.node.as_deref(), true).await?;
+        let path = self.path(&node, &track.path)?;
+        let name = match track.name {
+            Some(name) if name.trim().is_empty() => {
+                return Err(invalid("an item's name can't be blank"));
+            }
+            Some(name) => name,
+            None => path
+                .as_str()
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or("/")
+                .to_owned(),
+        };
+        let direction = if track.one_way {
+            Direction::OneWay {
+                source: node.clone(),
+            }
+        } else {
+            Direction::TwoWay
+        };
+        let mut item = Item::new(name, direction);
+        item.excludes = track
+            .excludes
+            .into_iter()
+            .map(ExcludePattern::new)
+            .collect::<Result<_, _>>()
+            .map_err(invalid)?;
+        item.retention_days = track.retention_days;
+        let id = ItemId::generate();
+        self.edit(|db, now| Ok(db.track(now, id, item, &node, Replica::new(path))?))?;
+        Ok(id)
+    }
+
+    pub(super) async fn add_replica(&self, name: &str, add: AddReplica) -> Result<(), Refusal> {
+        let node = self.node(add.node.as_deref(), true).await?;
+        let mut replica = Replica::new(self.path(&node, &add.path)?);
+        replica.mirror = add.mirror;
+        replica.adopt = add.adopt;
+        self.edit(|db, now| {
+            let id = item(&db.config(), name)?;
+            Ok(db.add_replica(now, id, &node, replica)?)
+        })
+    }
+
+    pub(super) async fn remove_replica(&self, name: &str, node: &str) -> Result<(), Refusal> {
+        let node = self.node(Some(node), false).await?;
+        self.edit(|db, now| {
+            let id = item(&db.config(), name)?;
+            Ok(db.remove_replica(now, id, &node)?)
+        })
+    }
+
+    pub(super) fn untrack(&self, name: &str) -> Result<(), Refusal> {
+        self.edit(|db, now| {
+            let id = item(&db.config(), name)?;
+            Ok(db.untrack(now, id)?)
+        })
+    }
+
+    pub(super) fn pause_item(&self, name: &str, paused: bool) -> Result<(), Refusal> {
+        self.edit(|db, now| {
+            let id = item(&db.config(), name)?;
+            Ok(db.update_item(now, id, |item| item.paused = paused)?)
+        })
+    }
+
+    pub(super) async fn pause_replica(
+        &self,
+        name: &str,
+        node: &str,
+        paused: bool,
+    ) -> Result<(), Refusal> {
+        let node = self.node(Some(node), false).await?;
+        self.edit(|db, now| {
+            let id = item(&db.config(), name)?;
+            Ok(db.update_replica(now, id, &node, |replica| {
+                replica.paused = paused;
+            })?)
+        })
+    }
+
+    pub(super) async fn keep(&self, resolve: &Resolve) -> Result<(), Refusal> {
+        let id = item(&self.db.lock().unwrap().config(), &resolve.item)?;
+        self.conflicts.keep(id, &resolve.version).await?;
+        Ok(())
+    }
+
+    pub(super) async fn swap(&self, resolve: &Resolve) -> Result<(), Refusal> {
+        let id = item(&self.db.lock().unwrap().config(), &resolve.item)?;
+        self.conflicts.swap(id, &resolve.version).await?;
+        Ok(())
+    }
+
+    pub(super) fn leave(&self, leave: &api::Leave) -> Result<(), Refusal> {
+        if !leave.confirm {
+            return Err(invalid("leaving can't be undone; confirm it"));
+        }
+        self.edit(|db, now| Ok(db.leave(now)?))
+    }
+}
+
 async fn track<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     track: Result<Json<Track>, JsonRejection>,
 ) -> Answer<Tracked> {
     let Json(track) = track.map_err(rejected)?;
-    let node = api.node(track.node.as_deref(), true).await?;
-    let path = api.path(&node, &track.path)?;
-    let name = match track.name {
-        Some(name) if name.trim().is_empty() => {
-            return Err(invalid("an item's name can't be blank"));
-        }
-        Some(name) => name,
-        None => path
-            .as_str()
-            .rsplit('/')
-            .find(|part| !part.is_empty())
-            .unwrap_or("/")
-            .to_owned(),
-    };
-    let direction = if track.one_way {
-        Direction::OneWay {
-            source: node.clone(),
-        }
-    } else {
-        Direction::TwoWay
-    };
-    let mut item = Item::new(name, direction);
-    item.excludes = track
-        .excludes
-        .into_iter()
-        .map(ExcludePattern::new)
-        .collect::<Result<_, _>>()
-        .map_err(invalid)?;
-    item.retention_days = track.retention_days;
-    let id = ItemId::generate();
-    api.edit(|db, now| Ok(db.track(now, id, item, &node, Replica::new(path))?))?;
+    let id = api.track(track).await?;
     Ok(Json(Tracked { id }))
 }
 
@@ -539,38 +615,21 @@ async fn add_replica<T: LocalApi + Clone>(
     add: Result<Json<AddReplica>, JsonRejection>,
 ) -> Answer<()> {
     let Json(add) = add.map_err(rejected)?;
-    let node = api.node(add.node.as_deref(), true).await?;
-    let mut replica = Replica::new(api.path(&node, &add.path)?);
-    replica.mirror = add.mirror;
-    replica.adopt = add.adopt;
-    api.edit(|db, now| {
-        let id = item(&db.config(), &name)?;
-        Ok(db.add_replica(now, id, &node, replica)?)
-    })?;
-    Ok(Json(()))
+    Ok(Json(api.add_replica(&name, add).await?))
 }
 
 async fn remove_replica<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path((name, node)): Path<(String, String)>,
 ) -> Answer<()> {
-    let node = api.node(Some(&node), false).await?;
-    api.edit(|db, now| {
-        let id = item(&db.config(), &name)?;
-        Ok(db.remove_replica(now, id, &node)?)
-    })?;
-    Ok(Json(()))
+    Ok(Json(api.remove_replica(&name, &node).await?))
 }
 
 async fn untrack<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path(name): Path<String>,
 ) -> Answer<()> {
-    api.edit(|db, now| {
-        let id = item(&db.config(), &name)?;
-        Ok(db.untrack(now, id)?)
-    })?;
-    Ok(Json(()))
+    Ok(Json(api.untrack(&name)?))
 }
 
 async fn pause_item<T: LocalApi + Clone>(
@@ -579,11 +638,7 @@ async fn pause_item<T: LocalApi + Clone>(
     set: Result<Json<SetPaused>, JsonRejection>,
 ) -> Answer<()> {
     let Json(set) = set.map_err(rejected)?;
-    api.edit(|db, now| {
-        let id = item(&db.config(), &name)?;
-        Ok(db.update_item(now, id, |item| item.paused = set.paused)?)
-    })?;
-    Ok(Json(()))
+    Ok(Json(api.pause_item(&name, set.paused)?))
 }
 
 async fn pause_replica<T: LocalApi + Clone>(
@@ -592,14 +647,7 @@ async fn pause_replica<T: LocalApi + Clone>(
     set: Result<Json<SetPaused>, JsonRejection>,
 ) -> Answer<()> {
     let Json(set) = set.map_err(rejected)?;
-    let node = api.node(Some(&node), false).await?;
-    api.edit(|db, now| {
-        let id = item(&db.config(), &name)?;
-        Ok(db.update_replica(now, id, &node, |replica| {
-            replica.paused = set.paused;
-        })?)
-    })?;
-    Ok(Json(()))
+    Ok(Json(api.pause_replica(&name, &node, set.paused).await?))
 }
 
 /// This Node's Replicas' states, for the other Nodes (Node protocol).
@@ -631,9 +679,7 @@ async fn keep<T: LocalApi + Clone>(
     resolve: Result<Json<Resolve>, JsonRejection>,
 ) -> Answer<()> {
     let Json(resolve) = resolve.map_err(rejected)?;
-    let id = item(&api.db.lock().unwrap().config(), &resolve.item)?;
-    api.conflicts.keep(id, &resolve.version).await?;
-    Ok(Json(()))
+    Ok(Json(api.keep(&resolve).await?))
 }
 
 async fn swap<T: LocalApi + Clone>(
@@ -641,21 +687,13 @@ async fn swap<T: LocalApi + Clone>(
     resolve: Result<Json<Resolve>, JsonRejection>,
 ) -> Answer<()> {
     let Json(resolve) = resolve.map_err(rejected)?;
-    let id = item(&api.db.lock().unwrap().config(), &resolve.item)?;
-    api.conflicts.swap(id, &resolve.version).await?;
-    Ok(Json(()))
+    Ok(Json(api.swap(&resolve).await?))
 }
 
-/// It takes a JSON body, which a web page can't send another site without
-/// asking, so no page can make a Node leave.
 async fn leave<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     leave: Result<Json<api::Leave>, JsonRejection>,
 ) -> Answer<()> {
     let Json(leave) = leave.map_err(rejected)?;
-    if !leave.confirm {
-        return Err(invalid("leaving can't be undone; confirm it"));
-    }
-    api.edit(|db, now| Ok(db.leave(now)?))?;
-    Ok(Json(()))
+    Ok(Json(api.leave(&leave)?))
 }

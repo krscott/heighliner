@@ -1,7 +1,6 @@
 //! The daemon: serves the Node protocol and the API the CLI uses on this
-//! Node's Tailscale addresses,
-//! pulls the other Nodes' records on a timer, and keeps its copy of all
-//! records in a state file. When it drives Syncthing, it configures it each
+//! Node's Tailscale addresses, pulls the other Nodes' records on a timer,
+//! and keeps its copy of all records in a state file. When it drives Syncthing, it configures it each
 //! round and follows its Replicas' states.
 
 use std::cell::Cell;

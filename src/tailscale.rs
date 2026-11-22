@@ -65,6 +65,10 @@ pub struct Device {
     pub user: UserId,
     pub tagged: bool,
     pub ips: Vec<IpAddr>,
+    /// Whether it keeps the tailnet's network map on disk, so that after a
+    /// restart it can reach the other devices before the control server
+    /// answers.
+    pub caches_network_maps: bool,
 }
 
 /// This device, which is owned by a user, and the others on its tailnet.
@@ -342,6 +346,8 @@ struct PeerStatus {
     tags: Option<Vec<String>>,
     #[serde(rename = "TailscaleIPs")]
     tailscale_ips: Option<Vec<IpAddr>>,
+    /// Its node attributes, with their values.
+    cap_map: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 impl PeerStatus {
@@ -353,6 +359,10 @@ impl PeerStatus {
             user: self.user_id,
             tagged: is_tagged(self.tags),
             ips: self.tailscale_ips.unwrap_or_default(),
+            caches_network_maps: self.cap_map.is_some_and(|attributes| {
+                attributes.contains_key("cache-network-maps")
+                    && !attributes.contains_key("disable-cache-network-maps")
+            }),
         }
     }
 }

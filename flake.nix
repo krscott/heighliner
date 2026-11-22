@@ -16,7 +16,10 @@
         "aarch64-linux"
       ];
     in
-    flake-utils.lib.eachSystem supportedSystems (
+    {
+      nixosModules.default = ./nix/module.nix;
+    }
+    // flake-utils.lib.eachSystem supportedSystems (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -30,6 +33,15 @@
         };
 
         checks.package = package;
+
+        # NixOS VM tests, apart from `checks` since they need KVM and take
+        # minutes: `just vm-test`.
+        legacyPackages.vmTests = {
+          egress = import ./nix/tests/egress.nix {
+            inherit pkgs;
+            module = ./nix/module.nix;
+          };
+        };
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ package ];

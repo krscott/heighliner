@@ -26,6 +26,7 @@ rustPlatform.buildRustPackage {
         ./flake.lock
         ./flake.nix
         ./justfile
+        ./nix
       ]
     );
   };

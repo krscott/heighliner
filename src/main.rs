@@ -41,6 +41,10 @@ enum Command {
         /// Seconds between pulls of the other Nodes' records.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         pull_every: u64,
+        /// Days to keep superseded configuration, and the displaced versions
+        /// of items without their own retention.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=36_500))]
+        retention_days: u64,
         /// Syncthing's GUI and REST API socket. Without it, the daemon
         /// doesn't drive Syncthing.
         #[arg(long, requires = "syncthing_api_key_file")]
@@ -153,6 +157,7 @@ fn main() -> ExitCode {
         Command::Daemon {
             state_dir,
             pull_every,
+            retention_days,
             syncthing_socket,
             syncthing_api_key_file,
         } => run_daemon(daemon::Options {
@@ -160,6 +165,7 @@ fn main() -> ExitCode {
             port,
             tailscale_socket,
             pull_every: Duration::from_secs(pull_every),
+            retention: Duration::from_secs(retention_days * 24 * 60 * 60),
             syncthing: syncthing_socket.zip(syncthing_api_key_file).map(
                 |(socket, api_key_file)| daemon::SyncthingOptions {
                     socket,

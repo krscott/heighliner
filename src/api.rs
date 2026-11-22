@@ -11,6 +11,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId, ReplicaState, Role};
 
 /// `path`, absolute, with `.` and empty components dropped. A `..` is
@@ -76,8 +77,15 @@ pub struct ReplicaStatus {
     pub role: Role,
     /// Whether the Replica itself is paused; its Item may be too.
     pub paused: bool,
-    /// Its state, for a Replica on the Node answering.
+    /// Whether its Node left the Fleet.
+    #[serde(default)]
+    pub departed: bool,
+    /// Its state: live for a Replica on the Node answering, and otherwise
+    /// as its Node last said, if it has.
     pub state: Option<ReplicaState>,
+    /// When another Node's state was read.
+    #[serde(default)]
+    pub state_read_at: Option<Timestamp>,
 }
 
 /// Tracks a path as a new Item, with its first Replica there, which adopts
@@ -111,6 +119,57 @@ pub struct AddReplica {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetPaused {
     pub paused: bool,
+}
+
+/// This Node's Data Conflicts: GET lists them.
+pub const CONFLICTS: &str = "/api/v1/conflicts";
+
+/// POST a [`Resolve`] to keep a Data Conflict's winning change.
+pub const KEEP: &str = "/api/v1/conflicts/keep";
+
+/// POST a [`Resolve`] to make a Data Conflict's losing change the file's
+/// content again.
+pub const SWAP: &str = "/api/v1/conflicts/swap";
+
+/// POST to have this Node leave the Fleet.
+pub const LEAVE: &str = "/api/v1/leave";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conflicts {
+    pub conflicts: Vec<Conflict>,
+    /// Replicas whose conflicts can't be read, and why.
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conflict {
+    pub item: ItemId,
+    pub item_name: String,
+    /// The file's path in the Replica.
+    pub path: String,
+    /// When it happened, in Syncthing's local-time format.
+    pub at: String,
+    /// The short ID of the Syncthing device whose change won.
+    pub winner: String,
+    /// What identifies it, to keep or swap it.
+    pub version: String,
+    /// When its losing side expires, unless it is resolved first.
+    pub expires_at: Timestamp,
+}
+
+/// Leaves the Fleet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leave {
+    /// That it can't be undone.
+    pub confirm: bool,
+}
+
+/// Keeps or swaps a Data Conflict.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolve {
+    /// Its Item, by ID or name.
+    pub item: String,
+    pub version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

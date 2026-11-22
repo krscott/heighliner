@@ -1145,3 +1145,25 @@ fn a_path_with_someone_elses_heighliner_directory_is_refused() {
         "the user's"
     );
 }
+
+#[tokio::test]
+async fn a_departed_node_is_left_out() {
+    let mut pair = Pair::start(Direction::TwoWay, false).await;
+    let devices = |config: Value| config["devices"].as_array().unwrap().len();
+    assert_eq!(devices(pair.a.config().await), 2);
+    let mut b = ConfigDb::new(node("b"), pair.db.store().clone());
+    b.leave(Timestamp::now()).unwrap();
+    pair.db.merge(b.store(), Timestamp::now());
+    let (a_report, _) = pair.reconcile().await;
+    // Neither syncs with the other.
+    assert_eq!(devices(pair.a.config().await), 1);
+    assert_eq!(devices(pair.b.config().await), 1);
+    // A doesn't wait for B any more.
+    let config = pair.db.config();
+    let states = pair
+        .a
+        .driver
+        .states(&config, &node("a"), &a_report.replicas)
+        .await;
+    assert_eq!(states[&ITEM], ReplicaState::Current);
+}

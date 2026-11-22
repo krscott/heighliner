@@ -21,10 +21,11 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use super::{Daemon, RETENTION_WINDOW, Replicas};
+use crate::config::ConfigDb;
 use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId};
 use crate::syncthing::conflicts::{self, Collected, DataConflict};
-use crate::syncthing::{self, Finished, Seen};
+use crate::syncthing::{self, Driver, Finished, Seen};
 use crate::tailscale::LocalApi;
 
 /// How often every Replica is swept for conflict copies.
@@ -277,22 +278,32 @@ impl fmt::Display for ActionError {
 
 impl std::error::Error for ActionError {}
 
-impl<T: LocalApi + Clone> Daemon<T> {
+/// This Node's Data Conflicts, as the daemon and its API reach them.
+#[derive(Clone)]
+pub(super) struct Conflicts {
+    pub(super) replicas: Arc<Mutex<Replicas>>,
+    pub(super) db: Arc<Mutex<ConfigDb>>,
+    pub(super) me: NodeId,
+    pub(super) driver: Option<Driver>,
+}
+
+impl Conflicts {
     fn roots(&self) -> Vec<Root> {
-        let me = self.db.lock().unwrap().node().clone();
-        roots(&self.replicas, &me)
+        roots(&self.replicas, &self.me)
     }
 
     /// Sweeps every configured Replica now, moving conflict copies into the
     /// store and expiring old conflicts.
-    pub async fn sweep_conflicts(&self) {
+    pub(super) async fn sweep(&self) {
         let roots = self.roots();
         let _ = tokio::task::spawn_blocking(move || Waiting::swept().run(roots)).await;
     }
 
     /// The Data Conflicts kept on this Node, for each Replica whose folder
     /// is configured, or why they can't be read.
-    pub async fn conflicts(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, conflicts::Error>> {
+    pub(super) async fn list(
+        &self,
+    ) -> BTreeMap<ItemId, Result<Vec<DataConflict>, conflicts::Error>> {
         let roots = self.roots();
         tokio::task::spawn_blocking(move || {
             roots
@@ -304,16 +315,24 @@ impl<T: LocalApi + Clone> Daemon<T> {
         .expect("listing conflicts doesn't panic")
     }
 
+    /// `item`'s configured Replica on this Node, if the records still have
+    /// it there: one removed since the last reconcile is left alone.
     fn root(&self, item: ItemId) -> Result<Root, ActionError> {
+        let config = self.db.lock().unwrap().config();
+        let declared = config
+            .items
+            .get(&item)
+            .and_then(|entry| entry.replicas.get(&self.me))
+            .map(|replica| PathBuf::from(replica.path().as_str()));
         self.roots()
             .into_iter()
-            .find(|root| root.item == item)
+            .find(|root| root.item == item && declared.as_ref() == Some(&root.path))
             .ok_or(ActionError::NoReplica(item))
     }
 
     /// Keeps the winning change of the Data Conflict `version` in `item`'s
     /// Replica.
-    pub async fn keep_conflict(
+    pub(super) async fn keep(
         &self,
         item: ItemId,
         version: &str,
@@ -329,7 +348,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Makes the losing change of the Data Conflict `version` in `item`'s
     /// Replica the file's content again, which Syncthing then sends to the
     /// other Replicas. Its folder must send now, as Syncthing has it.
-    pub async fn swap_conflict(
+    pub(super) async fn swap(
         &self,
         item: ItemId,
         version: &str,
@@ -349,10 +368,58 @@ impl<T: LocalApi + Clone> Daemon<T> {
             .await
             .expect("swapping a conflict doesn't panic")
             .map_err(ActionError::Conflict)?;
-        // Syncthing would notice on its own, but later.
-        if let Err(error) = driver.client().scan_path(item, &conflict.path).await {
-            tracing::warn!(%item, file = %conflict.path, %error, "can't ask Syncthing to scan a swapped file");
-        }
+        // Syncthing would notice on its own, but later. The swap is done
+        // whatever the scan takes.
+        let (client, file) = (driver.client().clone(), conflict.path.clone());
+        tokio::spawn(async move {
+            if let Err(error) = client.scan_path(item, &file).await {
+                tracing::warn!(%item, %file, %error, "can't ask Syncthing to scan a swapped file");
+            }
+        });
         Ok(conflict)
+    }
+}
+
+impl<T: LocalApi + Clone> Daemon<T> {
+    pub(super) fn conflict_ops(&self) -> Conflicts {
+        Conflicts {
+            replicas: self.replicas.clone(),
+            db: self.db.clone(),
+            me: self.db.lock().unwrap().node().clone(),
+            driver: self.driver.clone(),
+        }
+    }
+
+    /// Sweeps every configured Replica now, moving conflict copies into the
+    /// store and expiring old conflicts.
+    pub async fn sweep_conflicts(&self) {
+        self.conflict_ops().sweep().await;
+    }
+
+    /// The Data Conflicts kept on this Node, for each Replica whose folder
+    /// is configured, or why they can't be read.
+    pub async fn conflicts(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, conflicts::Error>> {
+        self.conflict_ops().list().await
+    }
+
+    /// Keeps the winning change of the Data Conflict `version` in `item`'s
+    /// Replica.
+    pub async fn keep_conflict(
+        &self,
+        item: ItemId,
+        version: &str,
+    ) -> Result<DataConflict, ActionError> {
+        self.conflict_ops().keep(item, version).await
+    }
+
+    /// Makes the losing change of the Data Conflict `version` in `item`'s
+    /// Replica the file's content again, which Syncthing then sends to the
+    /// other Replicas.
+    pub async fn swap_conflict(
+        &self,
+        item: ItemId,
+        version: &str,
+    ) -> Result<DataConflict, ActionError> {
+        self.conflict_ops().swap(item, version).await
     }
 }

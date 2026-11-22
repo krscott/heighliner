@@ -600,3 +600,189 @@ async fn the_daemon_collects_keeps_and_swaps_data_conflicts() {
         Err(ActionError::NoReplica(_))
     ));
 }
+
+#[tokio::test]
+async fn status_shows_the_other_nodes_states_as_last_read() {
+    let port = free_port().await;
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tailnet = tailnet("127.0.0.1", &["127.0.0.2"]);
+    let a = Daemon::open(a_tailnet.clone(), a_dir.path(), port)
+        .await
+        .unwrap();
+    let b = Daemon::open(tailnet("127.0.0.2", &["127.0.0.1"]), b_dir.path(), port)
+        .await
+        .unwrap();
+    let _a_servers = a.listen().await.unwrap();
+    let _b_servers = b.listen().await.unwrap();
+    track(&a, "docs");
+    b.pull_round().await.unwrap();
+    {
+        let b_node = b.db().lock().unwrap().node().clone();
+        b.db()
+            .lock()
+            .unwrap()
+            .add_replica(
+                Timestamp::now(),
+                ITEM,
+                &b_node,
+                Replica::new(AbsPath::new("/srv/b").unwrap()),
+            )
+            .unwrap();
+        let mut replicas = b.replicas.lock().unwrap();
+        replicas.states.insert(ITEM, ReplicaState::Current);
+        replicas
+            .read_for
+            .insert(ITEM, AbsPath::new("/srv/b").unwrap());
+    }
+    let before = Timestamp::now();
+    a.pull_round().await.unwrap();
+    let client = crate::cli::Client::connect(&a_tailnet, port, None)
+        .await
+        .unwrap();
+    let status = client.status().await.unwrap();
+    let theirs = status.items[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.path == "/srv/b")
+        .unwrap();
+    assert_eq!(theirs.state, Some(ReplicaState::Current));
+    assert!(theirs.state_read_at.is_some_and(|at| at >= before));
+
+    // B, asked through A's tailnet, says its own state is live.
+    let on_b = crate::cli::Client::connect(&a_tailnet, port, Some("127.0.0.2"))
+        .await
+        .unwrap();
+    let status = on_b.status().await.unwrap();
+    let own = status.items[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.path == "/srv/b")
+        .unwrap();
+    assert_eq!(
+        (own.state.clone(), own.state_read_at),
+        (Some(ReplicaState::Current), None)
+    );
+}
+
+#[tokio::test]
+async fn a_node_leaves_through_the_api() {
+    let port = free_port().await;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = tailnet("127.0.0.1", &[]);
+    let daemon = Daemon::open(fake.clone(), dir.path(), port).await.unwrap();
+    let _servers = daemon.listen().await.unwrap();
+    track(&daemon, "docs");
+    let client = crate::cli::Client::connect(&fake, port, None)
+        .await
+        .unwrap();
+    // Not without a JSON confirmation, which a web page can't send.
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let request = hyper::Request::post(crate::api::LEAVE)
+        .header(hyper::header::CONTENT_TYPE, "text/plain")
+        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+        .unwrap();
+    let (status, _) = crate::http::send(stream, &format!("127.0.0.1:{port}"), request)
+        .await
+        .unwrap();
+    assert_eq!(status, hyper::StatusCode::BAD_REQUEST);
+    let refused = client.leave().await;
+    assert!(
+        matches!(&refused, Err(crate::cli::Error::Refused { message, .. }) if message.contains("joined")),
+        "{refused:?}"
+    );
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .set_device_id(
+            Timestamp::now(),
+            crate::model::DeviceId::new(
+                "MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    client.leave().await.unwrap();
+    let status = client.status().await.unwrap();
+    assert!(status.items[0].replicas[0].departed);
+    // Nothing new goes on a Node that has left.
+    let track = crate::api::Track {
+        node: None,
+        path: "/srv/more".into(),
+        name: None,
+        one_way: false,
+        excludes: Vec::new(),
+        retention_days: None,
+    };
+    let refused = client.track(&track).await;
+    assert!(
+        matches!(&refused, Err(crate::cli::Error::Refused { message, .. }) if message.contains("left")),
+        "{refused:?}"
+    );
+    assert!(crate::cli::format_status(&status).contains("departed"));
+}
+
+#[tokio::test]
+async fn conflicts_are_listed_and_kept_through_the_api() {
+    let port = crate::syncthing::test_instance::free_port();
+    let syncthing = crate::syncthing::test_instance::Syncthing::start("127.0.0.1", port).await;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = tailnet("127.0.0.1", &[]);
+    let api_port = free_port().await;
+    let daemon = Daemon::open(fake.clone(), dir.path(), api_port)
+        .await
+        .unwrap()
+        .with_driver(syncthing.driver.clone());
+    let _servers = daemon.listen().await.unwrap();
+    let at = syncthing.dir("docs");
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let me = db.node().clone();
+        db.track(
+            Timestamp::now(),
+            ITEM,
+            Item::new("docs", Direction::TwoWay),
+            &me,
+            Replica::new(at.clone()),
+        )
+        .unwrap();
+    }
+    daemon.pull_round().await.unwrap();
+    let now = Timestamp::now().to_string();
+    let stamp: String = now[..19].chars().filter(char::is_ascii_digit).collect();
+    let copy = format!(
+        "notes.sync-conflict-{}-{}-ABCDEFG.txt",
+        &stamp[..8],
+        &stamp[8..]
+    );
+    let root = std::path::Path::new(at.as_str());
+    fs::write(root.join("notes.txt"), "won").unwrap();
+    fs::write(root.join(&copy), "lost").unwrap();
+    daemon.sweep_conflicts().await;
+
+    let client = crate::cli::Client::connect(&fake, api_port, None)
+        .await
+        .unwrap();
+    let listed = client.conflicts().await.unwrap();
+    let [conflict] = &listed.conflicts[..] else {
+        panic!("{listed:?}");
+    };
+    assert_eq!(
+        (conflict.item_name.as_str(), conflict.path.as_str()),
+        ("docs", "notes.txt")
+    );
+    assert!(crate::cli::format_conflicts(&listed).contains("docs notes.txt"));
+    let resolve = crate::api::Resolve {
+        item: "docs".into(),
+        version: conflict.version.clone(),
+    };
+    client.keep(&resolve).await.unwrap();
+    assert!(client.conflicts().await.unwrap().conflicts.is_empty());
+    let again = client.keep(&resolve).await;
+    assert!(
+        matches!(&again, Err(crate::cli::Error::Refused { status, .. }) if *status == hyper::StatusCode::NOT_FOUND),
+        "{again:?}"
+    );
+}

@@ -11,13 +11,17 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use tokio::sync::Notify;
 
-use super::{Replicas, StateFile};
+use super::conflicts::{ActionError, Conflicts};
+use super::{RETENTION_WINDOW, RemoteStates, Replicas, StateFile};
 use crate::api::{
-    self, AddReplica, ItemStatus, Refused, ReplicaStatus, SetPaused, Status, Track, Tracked,
+    self, AddReplica, Conflict, ItemStatus, Refused, ReplicaStatus, Resolve, SetPaused, Status,
+    Track, Tracked,
 };
 use crate::config::{Config, ConfigDb, EditError};
 use crate::hlc::Timestamp;
 use crate::model::{AbsPath, Direction, ExcludePattern, Item, ItemId, NodeId, Replica};
+use crate::protocol::{self, NodeState, NodeStates};
+use crate::syncthing::conflicts::DataConflict;
 use crate::tailscale::LocalApi;
 
 /// What the API's handlers share.
@@ -28,6 +32,8 @@ pub(super) struct Api<T> {
     /// Notified after each edit, so that it is applied without waiting
     /// for the next round.
     pub(super) edited: Arc<Notify>,
+    pub(super) remote: RemoteStates,
+    pub(super) conflicts: Conflicts,
     pub(super) state: Arc<StateFile>,
     /// The daemon's user's home, which `~` stands for.
     pub(super) home: Option<PathBuf>,
@@ -40,6 +46,8 @@ impl<T: Clone> Clone for Api<T> {
             replicas: self.replicas.clone(),
             tailscale: self.tailscale.clone(),
             edited: self.edited.clone(),
+            remote: self.remote.clone(),
+            conflicts: self.conflicts.clone(),
             state: self.state.clone(),
             home: self.home.clone(),
         }
@@ -59,6 +67,11 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
             "/api/v1/items/{item}/replicas/{node}",
             patch(pause_replica::<T>).delete(remove_replica::<T>),
         )
+        .route(api::CONFLICTS, get(conflicts::<T>))
+        .route(api::KEEP, post(keep::<T>))
+        .route(api::SWAP, post(swap::<T>))
+        .route(api::LEAVE, post(leave::<T>))
+        .route(protocol::STATES_PATH, get(node_states::<T>))
         .with_state(api)
 }
 
@@ -68,6 +81,21 @@ struct Refusal(StatusCode, String);
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
         (self.0, Json(Refused { error: self.1 })).into_response()
+    }
+}
+
+impl From<ActionError> for Refusal {
+    fn from(error: ActionError) -> Self {
+        let status = match &error {
+            ActionError::NoReplica(_) => StatusCode::NOT_FOUND,
+            ActionError::DoesntSend(_) => StatusCode::CONFLICT,
+            ActionError::Syncthing(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ActionError::Conflict(crate::syncthing::conflicts::Error::NotFound(_)) => {
+                StatusCode::NOT_FOUND
+            }
+            ActionError::Conflict(_) => StatusCode::CONFLICT,
+        };
+        Self(status, error.to_string())
     }
 }
 
@@ -99,6 +127,17 @@ impl<T: LocalApi + Clone> Api<T> {
     /// named; one being `placing` must be on one of the owner's devices on
     /// the tailnet now.
     async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
+        let node = self.find_node(name, placing).await?;
+        if placing && self.db.lock().unwrap().config().departed.contains(&node) {
+            return Err(Refusal(
+                StatusCode::CONFLICT,
+                format!("{node} has left the Fleet, so nothing can be added there"),
+            ));
+        }
+        Ok(node)
+    }
+
+    async fn find_node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
         let me = self.me();
         let Some(name) = name else {
             return Ok(me);
@@ -229,6 +268,7 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
         let replicas = api.replicas.lock().unwrap();
         (replicas.states.clone(), replicas.read_for.clone())
     };
+    let remote = api.remote.lock().unwrap().clone();
     // Names are a convenience; without Tailscale, IDs do.
     let names: Vec<(NodeId, String)> = match api.tailscale.status().await {
         Ok(tailnet) => std::iter::once(tailnet.me())
@@ -264,17 +304,33 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
             replicas: entry
                 .replicas
                 .iter()
-                .map(|(node, replica)| ReplicaStatus {
-                    node: node.clone(),
-                    node_name: name_of(node),
-                    path: replica.path().as_str().to_owned(),
-                    role: entry.item.direction.role(node, replica.mirror),
-                    paused: replica.paused,
+                .map(|(node, replica)| {
                     // Only for the path it was read for: one added again
                     // elsewhere starts afresh.
-                    state: (*node == me && read_for.get(id) == Some(replica.path()))
-                        .then(|| states.get(id).cloned())
-                        .flatten(),
+                    let (state, state_read_at) = if *node == me {
+                        let state = (read_for.get(id) == Some(replica.path()))
+                            .then(|| states.get(id).cloned())
+                            .flatten();
+                        (state, None)
+                    } else {
+                        remote.get(node).map_or((None, None), |(read_at, states)| {
+                            let state = states
+                                .get(id)
+                                .filter(|state| state.path == replica.path().as_str())
+                                .map(|state| state.state.clone());
+                            (state, Some(*read_at))
+                        })
+                    };
+                    ReplicaStatus {
+                        node: node.clone(),
+                        node_name: name_of(node),
+                        path: replica.path().as_str().to_owned(),
+                        role: entry.item.direction.role(node, replica.mirror),
+                        paused: replica.paused,
+                        departed: config.departed.contains(node),
+                        state,
+                        state_read_at,
+                    }
                 })
                 .collect(),
         })
@@ -392,5 +448,95 @@ async fn pause_replica<T: LocalApi + Clone>(
             replica.paused = set.paused;
         })?)
     })?;
+    Ok(Json(()))
+}
+
+/// This Node's Replicas' states, for the other Nodes (Node protocol).
+async fn node_states<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<NodeStates> {
+    let replicas = api.replicas.lock().unwrap();
+    let states = replicas
+        .states
+        .iter()
+        .filter_map(|(item, state)| {
+            let path = replicas.read_for.get(item)?.as_str().to_owned();
+            let state = state.clone();
+            Some((*item, NodeState { path, state }))
+        })
+        .collect();
+    Json(NodeStates { states })
+}
+
+async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<api::Conflicts> {
+    let config = api.db.lock().unwrap().config();
+    let mut listed = api::Conflicts {
+        conflicts: Vec::new(),
+        errors: Vec::new(),
+    };
+    for (item, found) in api.conflicts.list().await {
+        let entry = config.items.get(&item);
+        let item_name = entry.map_or_else(String::new, |entry| entry.item.name.clone());
+        match found {
+            Ok(found) => {
+                let retention = entry
+                    .and_then(|entry| entry.item.retention_days)
+                    .map_or(RETENTION_WINDOW, |days| {
+                        std::time::Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
+                    });
+                listed.conflicts.extend(found.into_iter().map(|conflict| {
+                    let DataConflict {
+                        path,
+                        at,
+                        winner,
+                        version,
+                        moved_at,
+                    } = conflict;
+                    Conflict {
+                        item,
+                        item_name: item_name.clone(),
+                        path,
+                        at,
+                        winner,
+                        version,
+                        expires_at: moved_at.saturating_add(retention),
+                    }
+                }));
+            }
+            Err(error) => listed.errors.push(format!("{item_name} ({item}): {error}")),
+        }
+    }
+    Json(listed)
+}
+
+async fn keep<T: LocalApi + Clone>(
+    State(api): State<Api<T>>,
+    resolve: Result<Json<Resolve>, JsonRejection>,
+) -> Answer<()> {
+    let Json(resolve) = resolve.map_err(rejected)?;
+    let id = item(&api.db.lock().unwrap().config(), &resolve.item)?;
+    api.conflicts.keep(id, &resolve.version).await?;
+    Ok(Json(()))
+}
+
+async fn swap<T: LocalApi + Clone>(
+    State(api): State<Api<T>>,
+    resolve: Result<Json<Resolve>, JsonRejection>,
+) -> Answer<()> {
+    let Json(resolve) = resolve.map_err(rejected)?;
+    let id = item(&api.db.lock().unwrap().config(), &resolve.item)?;
+    api.conflicts.swap(id, &resolve.version).await?;
+    Ok(Json(()))
+}
+
+/// It takes a JSON body, which a web page can't send another site without
+/// asking, so no page can make a Node leave.
+async fn leave<T: LocalApi + Clone>(
+    State(api): State<Api<T>>,
+    leave: Result<Json<api::Leave>, JsonRejection>,
+) -> Answer<()> {
+    let Json(leave) = leave.map_err(rejected)?;
+    if !leave.confirm {
+        return Err(invalid("leaving can't be undone; confirm it"));
+    }
+    api.edit(|db, now| Ok(db.leave(now)?))?;
     Ok(Json(()))
 }

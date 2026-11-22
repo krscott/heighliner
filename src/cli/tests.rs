@@ -13,7 +13,7 @@ const OWNER: UserId = UserId::new(1);
 #[test]
 fn node_paths_split() {
     let cwd = PathBuf::from("/home/me/work");
-    let split = |argument| node_path(argument, &cwd, &["laptop"]);
+    let split = |argument| node_path(argument, Some(&cwd), &["laptop"]);
     assert_eq!(
         split("nas:/srv/docs"),
         (Some("nas".into()), "/srv/docs".into())
@@ -32,6 +32,13 @@ fn node_paths_split() {
     assert_eq!(split("docs//sub"), (None, "/home/me/work/docs/sub".into()));
     // This Node, named.
     assert_eq!(split("laptop:docs"), (None, "/home/me/work/docs".into()));
+    // Another Node's daemon, asked with --on, gets relative paths as they
+    // are, to refuse.
+    assert_eq!(node_path("docs", None, &["nas"]), (None, "docs".into()));
+    assert_eq!(
+        node_path("nas:/srv/x/", None, &["nas"]),
+        (None, "/srv/x".into())
+    );
 }
 
 fn track(path: &str) -> Track {
@@ -60,7 +67,7 @@ async fn the_cli_edits_through_the_daemon() {
         .await
         .unwrap();
     let _servers = daemon.listen().await.unwrap();
-    let client = Client::connect(&fake, port).await.unwrap();
+    let client = Client::connect(&fake, port, None).await.unwrap();
 
     let docs = tempfile::tempdir().unwrap();
     let docs = docs.path().join("docs");
@@ -150,7 +157,7 @@ async fn a_tilde_is_the_daemons_users_home() {
         .await
         .unwrap();
     let _servers = daemon.listen().await.unwrap();
-    let client = Client::connect(&fake, port).await.unwrap();
+    let client = Client::connect(&fake, port, None).await.unwrap();
     client.track(&track("~/notes")).await.unwrap();
     let status = client.status().await.unwrap();
     let expected = format!("{}/notes", home.to_str().unwrap());
@@ -174,7 +181,7 @@ async fn edits_are_saved_and_ids_are_only_ids() {
         .await
         .unwrap();
     let _servers = daemon.listen().await.unwrap();
-    let client = Client::connect(&fake, port).await.unwrap();
+    let client = Client::connect(&fake, port, None).await.unwrap();
 
     let docs = tempfile::tempdir().unwrap();
     let first = client
@@ -223,6 +230,6 @@ fn parents_are_resolved_through_symlinks() {
     std::fs::create_dir_all(root.join("disk/work")).unwrap();
     std::fs::create_dir_all(root.join("project")).unwrap();
     std::os::unix::fs::symlink(root.join("disk/work"), root.join("project/link")).unwrap();
-    let (_, path) = node_path("link/../docs", &root.join("project"), &[]);
+    let (_, path) = node_path("link/../docs", Some(&root.join("project")), &[]);
     assert_eq!(path, root.join("disk/docs").to_str().unwrap());
 }

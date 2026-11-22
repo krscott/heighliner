@@ -24,6 +24,9 @@ use crate::record::{Content, Record, RecordKey, Store};
 pub const ITEM_KIND: &str = "item";
 pub const REPLICA_KIND: &str = "replica";
 pub const NODE_KIND: &str = "node";
+/// A Node's departure from the Fleet. Nothing deletes it, so a later write,
+/// such as a reinstalled Node publishing its record afresh, can't undo it.
+pub const DEPARTURE_KIND: &str = "departure";
 
 /// The record schema version this version of heighliner reads and writes.
 ///
@@ -47,6 +50,13 @@ fn item_key(item: ItemId) -> RecordKey {
 fn node_key(node: &NodeId) -> RecordKey {
     RecordKey {
         kind: NODE_KIND.to_owned(),
+        id: node.to_string(),
+    }
+}
+
+fn departure_key(node: &NodeId) -> RecordKey {
+    RecordKey {
+        kind: DEPARTURE_KIND.to_owned(),
         id: node.to_string(),
     }
 }
@@ -240,6 +250,8 @@ pub struct Config {
     pub items: BTreeMap<ItemId, ItemEntry>,
     /// What each Node has published about itself.
     pub nodes: BTreeMap<NodeId, NodeInfo>,
+    /// Departed Nodes, which have left the Fleet; none syncs with them.
+    pub departed: BTreeSet<NodeId>,
     pub problems: Vec<Problem>,
     /// Replicas whose record is a tombstone, and Items untracked.
     removed: BTreeSet<(ItemId, NodeId)>,
@@ -327,6 +339,13 @@ impl Config {
                         None => {}
                     }
                 }
+                DEPARTURE_KIND => match NodeId::new(key.id.clone()) {
+                    Ok(node) if matches!(record.latest().1, Content::Live { .. }) => {
+                        config.departed.insert(node);
+                    }
+                    Ok(_) => {}
+                    Err(e) => config.problems.push(unreadable(e.to_string())),
+                },
                 // Kinds from newer versions are kept in the store and ignored.
                 _ => {}
             }
@@ -431,6 +450,9 @@ pub enum EditError {
     Unreadable(RecordKey),
     /// The edit would cause a Problem that wasn't there before.
     WouldCause(Problem),
+    /// This Node hasn't published its record, which it does once it runs
+    /// Syncthing, so it isn't part of the Fleet to leave.
+    NotJoined,
 }
 
 impl fmt::Display for EditError {
@@ -454,6 +476,9 @@ impl fmt::Display for EditError {
                 key.kind, key.id
             ),
             Self::WouldCause(problem) => write!(f, "refused, because {problem}"),
+            Self::NotJoined => f.write_str(
+                "this Node hasn't joined the Fleet yet: it joins once its daemon drives Syncthing",
+            ),
         }
     }
 }
@@ -510,7 +535,7 @@ impl ConfigDb {
             .records()
             .any(|(key, _)| match key.kind.as_str() {
                 REPLICA_KIND => key.id.ends_with(&suffix),
-                NODE_KIND => key.id == node.as_str(),
+                NODE_KIND | DEPARTURE_KIND => key.id == node.as_str(),
                 _ => false,
             })
     }
@@ -692,6 +717,21 @@ impl ConfigDb {
             None => {}
         }
         self.edit(|db| db.write(now, key, &info))
+    }
+
+    /// Records that this Node leaves the Fleet, so that no Node syncs with
+    /// it any more. Its Replicas stay until they are removed. It needs the
+    /// Node's record, which it publishes once it runs Syncthing.
+    pub fn leave(&mut self, now: Timestamp) -> Result<(), EditError> {
+        let config = self.config();
+        if config.departed.contains(self.node()) {
+            return Ok(());
+        }
+        if !config.nodes.contains_key(self.node()) {
+            return Err(EditError::NotJoined);
+        }
+        let key = departure_key(self.node());
+        self.edit(|db| db.write(now, key, &serde_json::Map::new()))
     }
 
     fn item(&self, id: ItemId) -> Result<ItemEntry, EditError> {

@@ -253,6 +253,7 @@ pub struct Daemon<T> {
     replicas: Arc<Mutex<Replicas>>,
     /// Notified after each edit through the API.
     edited: Arc<Notify>,
+    remote: RemoteStates,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -294,6 +295,10 @@ struct Reconciled {
     config: Config,
     outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
 }
+
+/// The other Nodes' Replicas' states, as last read in a round, and when.
+type RemoteStates =
+    Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, protocol::NodeState>)>>>;
 
 /// This Node's Replicas, as last seen in Syncthing.
 struct Replicas {
@@ -370,6 +375,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             driver: None,
             replicas,
             edited: Arc::default(),
+            remote: Arc::default(),
         })
     }
 
@@ -432,6 +438,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 replicas: self.replicas.clone(),
                 tailscale: self.api.clone(),
                 edited: self.edited.clone(),
+                remote: self.remote.clone(),
+                conflicts: self.conflict_ops(),
                 state: self.state.clone(),
                 home: std::env::var_os("HOME").map(PathBuf::from),
             };
@@ -483,8 +491,18 @@ impl<T: LocalApi + Clone> Daemon<T> {
         {
             match hello {
                 Ok(hello) if hello.protocol == protocol::MAJOR => {
+                    let remote = self.remote.clone();
                     pulls.spawn(async move {
                         let pulled = protocol::pull(addr, &hello, PULL_TIMEOUT).await;
+                        // Only shown, so a Node that can't answer keeps its
+                        // last-known states.
+                        if let Ok(read) = protocol::states(addr, PULL_TIMEOUT).await {
+                            let read_at = Timestamp::now();
+                            remote
+                                .lock()
+                                .unwrap()
+                                .insert(device.id.clone(), (read_at, read.states));
+                        }
                         (device, pulled)
                     });
                 }

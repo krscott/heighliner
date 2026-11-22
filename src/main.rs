@@ -22,6 +22,11 @@ struct Cli {
     /// tailscaled's local API socket.
     #[arg(long, global = true, default_value = DEFAULT_SOCKET)]
     tailscale_socket: PathBuf,
+    /// Ask another Node's daemon, by machine name or node ID, rather than
+    /// this one's. Paths without a Node are then that Node's, and must be
+    /// absolute or start with ~.
+    #[arg(long, global = true, value_name = "NODE")]
+    on: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -94,8 +99,35 @@ enum Command {
         /// A replica's Node, to resume only it.
         node: Option<String>,
     },
-    /// Show the items, their replicas, and this Node's replicas' states.
+    /// Show the items and their replicas, with this Node's replicas'
+    /// states and the other Nodes' as last read.
     Status,
+    /// List this Node's data conflicts, or keep or swap one.
+    Conflicts {
+        #[command(subcommand)]
+        action: Option<ConflictAction>,
+    },
+    /// Leave the Fleet: no Node syncs with this one any more. Its replicas
+    /// stay until they're removed, and nothing is deleted.
+    Leave {
+        /// Confirm it; a Node that leaves isn't expected back.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConflictAction {
+    /// Keep the change that won; the other is kept until it expires.
+    Keep {
+        /// The conflict's item, by name or ID.
+        item: String,
+        /// The conflict's version, as listed.
+        version: String,
+    },
+    /// Make the change that lost the file's content again; the other is
+    /// kept until it expires.
+    Swap { item: String, version: String },
 }
 
 fn main() -> ExitCode {
@@ -113,7 +145,7 @@ fn main() -> ExitCode {
         logs.without_time().init();
     }
     let cli = Cli::parse();
-    let (port, tailscale_socket) = (cli.port, cli.tailscale_socket);
+    let (port, tailscale_socket, on) = (cli.port, cli.tailscale_socket, cli.on);
     let daemon = matches!(cli.command, Command::Daemon { .. });
     let result = match cli.command {
         Command::Daemon {
@@ -134,7 +166,7 @@ fn main() -> ExitCode {
             ),
         })
         .map_err(|error| error.to_string()),
-        command => runtime().block_on(run_command(command, port, tailscale_socket)),
+        command => runtime().block_on(run_command(command, port, tailscale_socket, on)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -157,13 +189,26 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// Runs a command against this Node's daemon.
-async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> Result<(), String> {
+async fn run_command(
+    command: Command,
+    port: u16,
+    tailscale_socket: PathBuf,
+    on: Option<String>,
+) -> Result<(), String> {
+    let on = on.as_deref();
     let tailscale = tailscale::Client::new(tailscale_socket);
-    let client = cli::Client::connect(&tailscale, port)
+    let client = cli::Client::connect(&tailscale, port, on)
         .await
         .map_err(|error| error.to_string())?;
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("can't tell the current directory: {error}"))?;
+    // A relative path is this machine's only when asking its own daemon.
+    let cwd = if client.is_here() {
+        Some(
+            std::env::current_dir()
+                .map_err(|error| format!("can't tell the current directory: {error}"))?,
+        )
+    } else {
+        None
+    };
     let me = client.me().as_str().to_owned();
     let local = [me.as_str(), client.name()];
     let done = match command {
@@ -175,7 +220,7 @@ async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> 
             excludes,
             retention_days,
         } => {
-            let (node, path) = cli::node_path(&path, &cwd, &local);
+            let (node, path) = cli::node_path(&path, cwd.as_deref(), &local);
             let track = api::Track {
                 node,
                 path,
@@ -194,7 +239,7 @@ async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> 
             mirror,
             adopt,
         } => {
-            let (node, path) = cli::node_path(&path, &cwd, &local);
+            let (node, path) = cli::node_path(&path, cwd.as_deref(), &local);
             let add = api::AddReplica {
                 node,
                 path,
@@ -221,6 +266,21 @@ async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> 
         } => client.pause_replica(&item, &node, false).await,
         Command::Status => client.status().await.map(|status| {
             print!("{}", cli::format_status(&status));
+        }),
+        Command::Conflicts { action: None } => client.conflicts().await.map(|listed| {
+            print!("{}", cli::format_conflicts(&listed));
+        }),
+        Command::Conflicts {
+            action: Some(ConflictAction::Keep { item, version }),
+        } => client.keep(&api::Resolve { item, version }).await,
+        Command::Conflicts {
+            action: Some(ConflictAction::Swap { item, version }),
+        } => client.swap(&api::Resolve { item, version }).await,
+        Command::Leave { yes: false } => {
+            return Err("leaving can't be undone: no Node will sync with this one any more; run it again with --yes to leave".into());
+        }
+        Command::Leave { yes: true } => client.leave().await.map(|()| {
+            println!("{} has left the Fleet.", client.name());
         }),
     };
     done.map_err(|error| error.to_string())

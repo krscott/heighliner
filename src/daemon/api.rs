@@ -143,14 +143,7 @@ impl<T: LocalApi + Clone> Api<T> {
             return Ok(me);
         };
         if let Ok(id) = NodeId::new(name) {
-            let config = self.db.lock().unwrap().config();
-            let known = id == me
-                || (!placing
-                    && (config.nodes.contains_key(&id)
-                        || config
-                            .items
-                            .values()
-                            .any(|entry| entry.replicas.contains_key(&id))));
+            let known = id == me || (!placing && self.db.lock().unwrap().knows_node(&id));
             if known {
                 return Ok(id);
             }
@@ -201,7 +194,13 @@ impl<T: LocalApi + Clone> Api<T> {
         } else {
             path.to_owned()
         };
-        AbsPath::new(api::normalize(&path)).map_err(invalid)
+        let path = api::normalize(&path);
+        if path.split('/').any(|part| part == "..") {
+            return Err(invalid(format!(
+                "{path} has a .. in it, which only its Node can resolve; give the path without it"
+            )));
+        }
+        AbsPath::new(path).map_err(invalid)
     }
 
     /// Applies `edit` to the records, saves them, and has it applied to
@@ -510,8 +509,9 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<api::
 
 async fn keep<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
-    Json(resolve): Json<Resolve>,
+    resolve: Result<Json<Resolve>, JsonRejection>,
 ) -> Answer<()> {
+    let Json(resolve) = resolve.map_err(rejected)?;
     let id = item(&api.db.lock().unwrap().config(), &resolve.item)?;
     api.conflicts.keep(id, &resolve.version).await?;
     Ok(Json(()))
@@ -519,14 +519,24 @@ async fn keep<T: LocalApi + Clone>(
 
 async fn swap<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
-    Json(resolve): Json<Resolve>,
+    resolve: Result<Json<Resolve>, JsonRejection>,
 ) -> Answer<()> {
+    let Json(resolve) = resolve.map_err(rejected)?;
     let id = item(&api.db.lock().unwrap().config(), &resolve.item)?;
     api.conflicts.swap(id, &resolve.version).await?;
     Ok(Json(()))
 }
 
-async fn leave<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Answer<()> {
+/// It takes a JSON body, which a web page can't send another site without
+/// asking, so no page can make a Node leave.
+async fn leave<T: LocalApi + Clone>(
+    State(api): State<Api<T>>,
+    leave: Result<Json<api::Leave>, JsonRejection>,
+) -> Answer<()> {
+    let Json(leave) = leave.map_err(rejected)?;
+    if !leave.confirm {
+        return Err(invalid("leaving can't be undone; confirm it"));
+    }
     api.edit(|db, now| Ok(db.leave(now)?))?;
     Ok(Json(()))
 }

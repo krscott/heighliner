@@ -1154,8 +1154,16 @@ async fn a_departed_node_is_left_out() {
     let mut b = ConfigDb::new(node("b"), pair.db.store().clone());
     b.leave(Timestamp::now()).unwrap();
     pair.db.merge(b.store(), Timestamp::now());
-    pair.reconcile().await;
+    let (a_report, _) = pair.reconcile().await;
     // Neither syncs with the other.
     assert_eq!(devices(pair.a.config().await), 1);
     assert_eq!(devices(pair.b.config().await), 1);
+    // A doesn't wait for B any more.
+    let config = pair.db.config();
+    let states = pair
+        .a
+        .driver
+        .states(&config, &node("a"), &a_report.replicas)
+        .await;
+    assert_eq!(states[&ITEM], ReplicaState::Current);
 }

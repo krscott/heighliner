@@ -675,6 +675,18 @@ async fn a_node_leaves_through_the_api() {
     let client = crate::cli::Client::connect(&fake, port, None)
         .await
         .unwrap();
+    // Not without a JSON confirmation, which a web page can't send.
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let request = hyper::Request::post(crate::api::LEAVE)
+        .header(hyper::header::CONTENT_TYPE, "text/plain")
+        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
+        .unwrap();
+    let (status, _) = crate::http::send(stream, &format!("127.0.0.1:{port}"), request)
+        .await
+        .unwrap();
+    assert_eq!(status, hyper::StatusCode::BAD_REQUEST);
     let refused = client.leave().await;
     assert!(
         matches!(&refused, Err(crate::cli::Error::Refused { message, .. }) if message.contains("joined")),

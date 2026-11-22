@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use super::{Daemon, RETENTION_WINDOW, Replicas};
+use crate::config::ConfigDb;
 use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId};
 use crate::syncthing::conflicts::{self, Collected, DataConflict};
@@ -281,6 +282,7 @@ impl std::error::Error for ActionError {}
 #[derive(Clone)]
 pub(super) struct Conflicts {
     pub(super) replicas: Arc<Mutex<Replicas>>,
+    pub(super) db: Arc<Mutex<ConfigDb>>,
     pub(super) me: NodeId,
     pub(super) driver: Option<Driver>,
 }
@@ -313,10 +315,18 @@ impl Conflicts {
         .expect("listing conflicts doesn't panic")
     }
 
+    /// `item`'s configured Replica on this Node, if the records still have
+    /// it there: one removed since the last reconcile is left alone.
     fn root(&self, item: ItemId) -> Result<Root, ActionError> {
+        let config = self.db.lock().unwrap().config();
+        let declared = config
+            .items
+            .get(&item)
+            .and_then(|entry| entry.replicas.get(&self.me))
+            .map(|replica| PathBuf::from(replica.path().as_str()));
         self.roots()
             .into_iter()
-            .find(|root| root.item == item)
+            .find(|root| root.item == item && declared.as_ref() == Some(&root.path))
             .ok_or(ActionError::NoReplica(item))
     }
 
@@ -358,10 +368,14 @@ impl Conflicts {
             .await
             .expect("swapping a conflict doesn't panic")
             .map_err(ActionError::Conflict)?;
-        // Syncthing would notice on its own, but later.
-        if let Err(error) = driver.client().scan_path(item, &conflict.path).await {
-            tracing::warn!(%item, file = %conflict.path, %error, "can't ask Syncthing to scan a swapped file");
-        }
+        // Syncthing would notice on its own, but later. The swap is done
+        // whatever the scan takes.
+        let (client, file) = (driver.client().clone(), conflict.path.clone());
+        tokio::spawn(async move {
+            if let Err(error) = client.scan_path(item, &file).await {
+                tracing::warn!(%item, %file, %error, "can't ask Syncthing to scan a swapped file");
+            }
+        });
         Ok(conflict)
     }
 }
@@ -370,6 +384,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
     pub(super) fn conflict_ops(&self) -> Conflicts {
         Conflicts {
             replicas: self.replicas.clone(),
+            db: self.db.clone(),
             me: self.db.lock().unwrap().node().clone(),
             driver: self.driver.clone(),
         }

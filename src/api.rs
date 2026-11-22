@@ -14,19 +14,14 @@ use serde::{Deserialize, Serialize};
 use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId, ReplicaState, Role};
 
-/// `path`, absolute, with `.` and empty components dropped and `..`
-/// resolved by its name alone, as a Replica's path is written.
+/// `path`, absolute, with `.` and empty components dropped. A `..` is
+/// kept, since resolving it by name alone would be wrong after a symlink;
+/// only the Node the path is on can resolve it.
 pub fn normalize(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            part => parts.push(part),
-        }
-    }
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
     format!("/{}", parts.join("/"))
 }
 
@@ -83,11 +78,13 @@ pub struct ReplicaStatus {
     /// Whether the Replica itself is paused; its Item may be too.
     pub paused: bool,
     /// Whether its Node left the Fleet.
+    #[serde(default)]
     pub departed: bool,
     /// Its state: live for a Replica on the Node answering, and otherwise
     /// as its Node last said, if it has.
     pub state: Option<ReplicaState>,
     /// When another Node's state was read.
+    #[serde(default)]
     pub state_read_at: Option<Timestamp>,
 }
 
@@ -158,6 +155,13 @@ pub struct Conflict {
     pub version: String,
     /// When its losing side expires, unless it is resolved first.
     pub expires_at: Timestamp,
+}
+
+/// Leaves the Fleet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Leave {
+    /// That it can't be undone.
+    pub confirm: bool,
 }
 
 /// Keeps or swaps a Data Conflict.

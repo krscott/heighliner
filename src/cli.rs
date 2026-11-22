@@ -6,7 +6,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -161,7 +161,8 @@ impl Client {
     }
 
     pub async fn leave(&self) -> Result<(), Error> {
-        self.call(Method::POST, api::LEAVE, None::<&()>).await
+        let leave = api::Leave { confirm: true };
+        self.call(Method::POST, api::LEAVE, Some(&leave)).await
     }
 
     async fn call<R: DeserializeOwned>(
@@ -255,13 +256,13 @@ impl Client {
 
 /// A `[node:]path` argument, split. A path on the daemon's Node, which
 /// `local` names (by machine name or node ID) or which has no node, is
-/// made absolute from `cwd`, if this is that Node, when it is relative;
-/// `~` is left for the daemon.
+/// made absolute from `cwd`, if this is that Node, when it is relative,
+/// with each `..` resolved on this machine; `~` is left for the daemon.
 pub fn node_path(argument: &str, cwd: Option<&Path>, local: &[&str]) -> (Option<String>, String) {
     let here = |path: &str| match cwd {
         _ if path == "~" || path.starts_with("~/") => path.to_owned(),
-        _ if path.starts_with('/') => api::normalize(path),
-        Some(cwd) => api::normalize(&cwd.join(path).to_string_lossy()),
+        Some(cwd) => api::normalize(&resolve_parents(&cwd.join(path)).to_string_lossy()),
+        None if path.starts_with('/') => api::normalize(path),
         None => path.to_owned(),
     };
     match argument.split_once(':') {
@@ -278,6 +279,24 @@ pub fn node_path(argument: &str, cwd: Option<&Path>, local: &[&str]) -> (Option<
         }
         _ => (None, here(argument)),
     }
+}
+
+/// `path` with each `..` resolved as the filesystem does, after following
+/// the symlinks before it, as far as the path exists.
+fn resolve_parents(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if let Ok(real) = std::fs::canonicalize(&resolved) {
+                    resolved = real;
+                }
+                resolved.pop();
+            }
+            component => resolved.push(component),
+        }
+    }
+    resolved
 }
 
 /// `status` as text, one Item and its Replicas after another.

@@ -28,6 +28,7 @@ fn node_paths_split() {
     assert_eq!(split("./a:b"), (None, "/home/me/work/a:b".into()));
     assert_eq!(split("docs/"), (None, "/home/me/work/docs".into()));
     assert_eq!(split("../x"), (None, "/home/me/x".into()));
+    assert_eq!(split("/srv/a/../b"), (None, "/srv/b".into()));
     assert_eq!(split("docs//sub"), (None, "/home/me/work/docs/sub".into()));
     // This Node, named.
     assert_eq!(split("laptop:docs"), (None, "/home/me/work/docs".into()));
@@ -220,4 +221,15 @@ async fn edits_are_saved_and_ids_are_only_ids() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let refused: crate::api::Refused = serde_json::from_slice(&body).unwrap();
     assert!(!refused.error.is_empty());
+}
+
+#[test]
+fn parents_are_resolved_through_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(root.join("disk/work")).unwrap();
+    std::fs::create_dir_all(root.join("project")).unwrap();
+    std::os::unix::fs::symlink(root.join("disk/work"), root.join("project/link")).unwrap();
+    let (_, path) = node_path("link/../docs", Some(&root.join("project")), &[]);
+    assert_eq!(path, root.join("disk/docs").to_str().unwrap());
 }

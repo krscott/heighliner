@@ -528,6 +528,18 @@ impl ConfigDb {
         &self.store
     }
 
+    /// Whether any record names `node`, even one this version can't read.
+    pub fn knows_node(&self, node: &NodeId) -> bool {
+        let suffix = format!("/{node}");
+        self.store
+            .records()
+            .any(|(key, _)| match key.kind.as_str() {
+                REPLICA_KIND => key.id.ends_with(&suffix),
+                NODE_KIND | DEPARTURE_KIND => key.id == node.as_str(),
+                _ => false,
+            })
+    }
+
     pub fn config(&self) -> Config {
         Config::new(&self.store)
     }

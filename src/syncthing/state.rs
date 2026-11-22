@@ -84,8 +84,11 @@ impl Driver {
             .entry
             .replicas
             .iter()
+            // A Departed Node no longer sends to anyone.
             .filter(|(node, replica)| {
-                *node != me && direction.role(node, replica.mirror) != Role::Mirror
+                *node != me
+                    && direction.role(node, replica.mirror) != Role::Mirror
+                    && !config.departed.contains(*node)
             })
             .map(|(node, _)| node);
         let mut senders = Senders::None;

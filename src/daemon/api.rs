@@ -86,16 +86,24 @@ impl<T: LocalApi + Clone> Api<T> {
     }
 
     /// The Node `name` names, by node ID or machine name; this one if
-    /// none.
+    /// none. Node IDs the records know need no Tailscale, so a Replica on a
+    /// device that has left the tailnet can still be named.
     async fn node(&self, name: Option<&str>) -> Result<NodeId, Refusal> {
         let me = self.me();
         let Some(name) = name else {
             return Ok(me);
         };
-        if let Ok(id) = NodeId::new(name)
-            && (id == me || self.db.lock().unwrap().config().nodes.contains_key(&id))
-        {
-            return Ok(id);
+        if let Ok(id) = NodeId::new(name) {
+            let config = self.db.lock().unwrap().config();
+            let known = id == me
+                || config.nodes.contains_key(&id)
+                || config
+                    .items
+                    .values()
+                    .any(|entry| entry.replicas.contains_key(&id));
+            if known {
+                return Ok(id);
+            }
         }
         let tailnet = self.tailscale.status().await.map_err(|error| {
             Refusal(
@@ -122,7 +130,7 @@ impl<T: LocalApi + Clone> Api<T> {
     }
 
     /// `path` on `node`, where `~` stands for the daemon's user's home on
-    /// this Node.
+    /// this Node, written as a Replica's path is.
     fn path(&self, node: &NodeId, path: &str) -> Result<AbsPath, Refusal> {
         let path = if *node == self.me()
             && let Some(rest) = path.strip_prefix('~')
@@ -136,14 +144,14 @@ impl<T: LocalApi + Clone> Api<T> {
                     invalid("this Node's daemon doesn't know its user's home, so ~ can't be used")
                 })?;
             format!("{home}{rest}")
-        } else if *node != self.me() && !path.starts_with('/') {
+        } else if !path.starts_with('/') {
             return Err(invalid(format!(
-                "{path} isn't absolute; a path on another Node must be"
+                "{path} isn't absolute; only a path on this Node may start with ~ instead"
             )));
         } else {
             path.to_owned()
         };
-        AbsPath::new(path).map_err(invalid)
+        AbsPath::new(api::normalize(&path)).map_err(invalid)
     }
 
     /// Applies `edit` to the records, and has it applied to Syncthing.
@@ -257,6 +265,9 @@ async fn track<T: LocalApi + Clone>(
     let node = api.node(track.node.as_deref()).await?;
     let path = api.path(&node, &track.path)?;
     let name = match track.name {
+        Some(name) if name.trim().is_empty() => {
+            return Err(invalid("an item's name can't be blank"));
+        }
         Some(name) => name,
         None => path
             .as_str()

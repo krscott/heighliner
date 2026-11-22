@@ -165,6 +165,7 @@ async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> 
     let cwd = std::env::current_dir()
         .map_err(|error| format!("can't tell the current directory: {error}"))?;
     let me = client.me().as_str().to_owned();
+    let local = [me.as_str(), client.name()];
     let done = match command {
         Command::Daemon { .. } => unreachable!("run apart"),
         Command::Track {
@@ -174,7 +175,7 @@ async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> 
             excludes,
             retention_days,
         } => {
-            let (node, path) = cli::node_path(&path, &cwd);
+            let (node, path) = cli::node_path(&path, &cwd, &local);
             let track = api::Track {
                 node,
                 path,
@@ -193,7 +194,7 @@ async fn run_command(command: Command, port: u16, tailscale_socket: PathBuf) -> 
             mirror,
             adopt,
         } => {
-            let (node, path) = cli::node_path(&path, &cwd);
+            let (node, path) = cli::node_path(&path, &cwd, &local);
             let add = api::AddReplica {
                 node,
                 path,

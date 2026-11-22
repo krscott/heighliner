@@ -75,6 +75,7 @@ impl std::error::Error for Error {}
 pub struct Client {
     addr: SocketAddr,
     me: NodeId,
+    name: String,
 }
 
 impl Client {
@@ -85,12 +86,18 @@ impl Client {
         Ok(Self {
             addr: SocketAddr::new(ip, port),
             me: me.id,
+            name: me.name,
         })
     }
 
     /// This Node.
     pub fn me(&self) -> &NodeId {
         &self.me
+    }
+
+    /// This Node's machine name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     async fn call<R: DeserializeOwned>(
@@ -121,10 +128,13 @@ impl Client {
             .await
             .map_err(|_| Error::Timeout { addr })??;
         if !status.is_success() {
-            let message = serde_json::from_slice::<Refused>(&body).map_or_else(
-                |_| format!("the daemon refused: {status}"),
-                |refused| refused.error,
-            );
+            let message = match serde_json::from_slice::<Refused>(&body) {
+                Ok(refused) => refused.error,
+                Err(_) => match String::from_utf8_lossy(&body).trim() {
+                    "" => format!("the daemon refused: {status}"),
+                    text => format!("the daemon refused: {text}"),
+                },
+            };
             return Err(Error::Refused { status, message });
         }
         serde_json::from_slice(&body).map_err(|source| Error::Decode { source })
@@ -165,14 +175,17 @@ impl Client {
     }
 }
 
-/// A `[node:]path` argument, split. A path on this Node that is relative
-/// is made absolute from `cwd`; `~` is left for the daemon.
-pub fn node_path(argument: &str, cwd: &Path) -> (Option<String>, String) {
-    let local = |path: &str| {
-        if path.starts_with('/') || path == "~" || path.starts_with("~/") {
+/// A `[node:]path` argument, split. A path on this Node, which `local`
+/// names (by machine name or node ID) or which has no node, is made
+/// absolute from `cwd` if it is relative; `~` is left for the daemon.
+pub fn node_path(argument: &str, cwd: &Path, local: &[&str]) -> (Option<String>, String) {
+    let here = |path: &str| {
+        if path == "~" || path.starts_with("~/") {
             path.to_owned()
+        } else if path.starts_with('/') {
+            api::normalize(path)
         } else {
-            cwd.join(path).to_string_lossy().into_owned()
+            api::normalize(&cwd.join(path).to_string_lossy())
         }
     };
     match argument.split_once(':') {
@@ -181,9 +194,13 @@ pub fn node_path(argument: &str, cwd: &Path) -> (Option<String>, String) {
                 && !node.contains('/')
                 && !argument.starts_with(['/', '~', '.']) =>
         {
-            (Some(node.to_owned()), path.to_owned())
+            if local.contains(&node) {
+                (None, here(path))
+            } else {
+                (Some(node.to_owned()), path.to_owned())
+            }
         }
-        _ => (None, local(argument)),
+        _ => (None, here(argument)),
     }
 }
 

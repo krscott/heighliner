@@ -8,7 +8,7 @@
 //! passes, including other local users and traffic the device forwards;
 //! Nodes are single-user devices.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
@@ -306,6 +306,33 @@ async fn reauthorize<T: LocalApi>(
             next.run(request).await
         }
         Err(denied) => denied.into_response(),
+    }
+}
+
+/// Refuses requests to `router` whose `Host` isn't one of `hosts`, such as
+/// this device's Tailscale addresses with the port. A web page whose
+/// domain was rebound to such an address would otherwise reach it as its
+/// own origin, from the user's own device, which WhoIs accepts.
+pub fn only_for_hosts(router: Router, hosts: BTreeSet<String>) -> Router {
+    router.layer(middleware::from_fn_with_state(Arc::new(hosts), check_host))
+}
+
+async fn check_host(
+    State(hosts): State<Arc<BTreeSet<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|host| host.to_str().ok());
+    match host {
+        Some(host) if hosts.contains(host) => next.run(request).await,
+        _ => (
+            StatusCode::MISDIRECTED_REQUEST,
+            "this server answers only at this device's Tailscale addresses",
+        )
+            .into_response(),
     }
 }
 

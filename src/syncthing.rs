@@ -477,7 +477,7 @@ impl Driver {
             .filter_map(|folder| Some((folder["id"].as_str()?, folder)))
             .collect();
         // A Departed Node isn't synced with, nor does one sync with others.
-        let departed = |node: &NodeId| config.nodes.get(node).is_some_and(|info| info.departed);
+        let departed = |node: &NodeId| config.departed.contains(node);
         let peers: BTreeMap<&NodeId, (&DeviceId, &Device)> = tailnet
             .owned_devices()
             .filter(|device| !device.ips.is_empty() && !departed(&device.id) && !departed(me))

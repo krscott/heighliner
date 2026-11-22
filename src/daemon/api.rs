@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -11,7 +12,7 @@ use axum::{Json, Router};
 use tokio::sync::Notify;
 
 use super::conflicts::{ActionError, Conflicts};
-use super::{RETENTION_WINDOW, RemoteStates, Replicas};
+use super::{RETENTION_WINDOW, RemoteStates, Replicas, StateFile};
 use crate::api::{
     self, AddReplica, Conflict, ItemStatus, Refused, ReplicaStatus, Resolve, SetPaused, Status,
     Track, Tracked,
@@ -19,7 +20,7 @@ use crate::api::{
 use crate::config::{Config, ConfigDb, EditError};
 use crate::hlc::Timestamp;
 use crate::model::{AbsPath, Direction, ExcludePattern, Item, ItemId, NodeId, Replica};
-use crate::protocol::{self, NodeStates};
+use crate::protocol::{self, NodeState, NodeStates};
 use crate::syncthing::conflicts::DataConflict;
 use crate::tailscale::LocalApi;
 
@@ -33,6 +34,7 @@ pub(super) struct Api<T> {
     pub(super) edited: Arc<Notify>,
     pub(super) remote: RemoteStates,
     pub(super) conflicts: Conflicts,
+    pub(super) state: Arc<StateFile>,
     /// The daemon's user's home, which `~` stands for.
     pub(super) home: Option<PathBuf>,
 }
@@ -46,6 +48,7 @@ impl<T: Clone> Clone for Api<T> {
             edited: self.edited.clone(),
             remote: self.remote.clone(),
             conflicts: self.conflicts.clone(),
+            state: self.state.clone(),
             home: self.home.clone(),
         }
     }
@@ -108,15 +111,22 @@ fn invalid(error: impl ToString) -> Refusal {
     Refusal(StatusCode::BAD_REQUEST, error.to_string())
 }
 
+/// A request body that isn't the JSON a route takes.
+fn rejected(rejection: JsonRejection) -> Refusal {
+    invalid(rejection.body_text())
+}
+
 impl<T: LocalApi + Clone> Api<T> {
     fn me(&self) -> NodeId {
         self.db.lock().unwrap().node().clone()
     }
 
     /// The Node `name` names, by node ID or machine name; this one if
-    /// none. Node IDs the records know need no Tailscale, so a Replica on a
-    /// device that has left the tailnet can still be named.
-    async fn node(&self, name: Option<&str>) -> Result<NodeId, Refusal> {
+    /// none. For a Replica that exists, node IDs the records know need no
+    /// Tailscale, so one on a device that has left the tailnet can still be
+    /// named; one being `placing` must be on one of the owner's devices on
+    /// the tailnet now.
+    async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
         let me = self.me();
         let Some(name) = name else {
             return Ok(me);
@@ -124,11 +134,12 @@ impl<T: LocalApi + Clone> Api<T> {
         if let Ok(id) = NodeId::new(name) {
             let config = self.db.lock().unwrap().config();
             let known = id == me
-                || config.nodes.contains_key(&id)
-                || config
-                    .items
-                    .values()
-                    .any(|entry| entry.replicas.contains_key(&id));
+                || (!placing
+                    && (config.nodes.contains_key(&id)
+                        || config
+                            .items
+                            .values()
+                            .any(|entry| entry.replicas.contains_key(&id))));
             if known {
                 return Ok(id);
             }
@@ -148,7 +159,7 @@ impl<T: LocalApi + Clone> Api<T> {
             [node] => Ok(node.clone()),
             [] => Err(Refusal(
                 StatusCode::NOT_FOUND,
-                format!("no Node is named {name}"),
+                format!("no Node of the owner's on the tailnet is named {name}"),
             )),
             _ => Err(Refusal(
                 StatusCode::CONFLICT,
@@ -182,23 +193,35 @@ impl<T: LocalApi + Clone> Api<T> {
         AbsPath::new(api::normalize(&path)).map_err(invalid)
     }
 
-    /// Applies `edit` to the records, and has it applied to Syncthing.
+    /// Applies `edit` to the records, saves them, and has it applied to
+    /// Syncthing. Names in it are resolved under the same lock, so that
+    /// they can't change meaning before it is made.
     fn edit<R>(
         &self,
-        edit: impl FnOnce(&mut ConfigDb, Timestamp) -> Result<R, EditError>,
+        edit: impl FnOnce(&mut ConfigDb, Timestamp) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
         let done = edit(&mut self.db.lock().unwrap(), Timestamp::now())?;
         self.edited.notify_one();
+        self.state.save().map_err(|error| {
+            Refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the edit was made, but saving it failed: {error}"),
+            )
+        })?;
         Ok(done)
     }
 }
 
-/// The Item `name` names, by ID or, when only one has it, by name.
+/// The Item `name` names, by ID or, when only one has it, by name. An ID
+/// is only ever an ID, so retrying an edit by ID can't reach another Item
+/// named with it.
 fn item(config: &Config, name: &str) -> Result<ItemId, Refusal> {
-    if let Ok(id) = name.parse::<ItemId>()
-        && config.items.contains_key(&id)
-    {
-        return Ok(id);
+    if let Ok(id) = name.parse::<ItemId>() {
+        return if config.items.contains_key(&id) {
+            Ok(id)
+        } else {
+            Err(Refusal(StatusCode::NOT_FOUND, format!("no item {id}")))
+        };
     }
     let matching: Vec<ItemId> = config
         .items
@@ -231,7 +254,10 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
         let db = api.db.lock().unwrap();
         (db.config(), db.node().clone())
     };
-    let states = api.replicas.lock().unwrap().states.clone();
+    let (states, read_for) = {
+        let replicas = api.replicas.lock().unwrap();
+        (replicas.states.clone(), replicas.read_for.clone())
+    };
     let remote = api.remote.lock().unwrap().clone();
     // Names are a convenience; without Tailscale, IDs do.
     let names: Vec<(NodeId, String)> = match api.tailscale.status().await {
@@ -269,11 +295,20 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
                 .replicas
                 .iter()
                 .map(|(node, replica)| {
+                    // Only for the path it was read for: one added again
+                    // elsewhere starts afresh.
                     let (state, state_read_at) = if *node == me {
-                        (states.get(id).cloned(), None)
+                        let state = (read_for.get(id) == Some(replica.path()))
+                            .then(|| states.get(id).cloned())
+                            .flatten();
+                        (state, None)
                     } else {
                         remote.get(node).map_or((None, None), |(read_at, states)| {
-                            (states.get(id).cloned(), Some(*read_at))
+                            let state = states
+                                .get(id)
+                                .filter(|state| state.path == replica.path().as_str())
+                                .map(|state| state.state.clone());
+                            (state, Some(*read_at))
                         })
                     };
                     ReplicaStatus {
@@ -282,7 +317,7 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
                         path: replica.path().as_str().to_owned(),
                         role: entry.item.direction.role(node, replica.mirror),
                         paused: replica.paused,
-                        departed: config.nodes.get(node).is_some_and(|info| info.departed),
+                        departed: config.departed.contains(node),
                         state,
                         state_read_at,
                     }
@@ -300,9 +335,10 @@ async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> 
 
 async fn track<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
-    Json(track): Json<Track>,
+    track: Result<Json<Track>, JsonRejection>,
 ) -> Answer<Tracked> {
-    let node = api.node(track.node.as_deref()).await?;
+    let Json(track) = track.map_err(rejected)?;
+    let node = api.node(track.node.as_deref(), true).await?;
     let path = api.path(&node, &track.path)?;
     let name = match track.name {
         Some(name) if name.trim().is_empty() => {
@@ -332,21 +368,24 @@ async fn track<T: LocalApi + Clone>(
         .map_err(invalid)?;
     item.retention_days = track.retention_days;
     let id = ItemId::generate();
-    api.edit(|db, now| db.track(now, id, item, &node, Replica::new(path)))?;
+    api.edit(|db, now| Ok(db.track(now, id, item, &node, Replica::new(path))?))?;
     Ok(Json(Tracked { id }))
 }
 
 async fn add_replica<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path(name): Path<String>,
-    Json(add): Json<AddReplica>,
+    add: Result<Json<AddReplica>, JsonRejection>,
 ) -> Answer<()> {
-    let id = item(&api.db.lock().unwrap().config(), &name)?;
-    let node = api.node(add.node.as_deref()).await?;
+    let Json(add) = add.map_err(rejected)?;
+    let node = api.node(add.node.as_deref(), true).await?;
     let mut replica = Replica::new(api.path(&node, &add.path)?);
     replica.mirror = add.mirror;
     replica.adopt = add.adopt;
-    api.edit(|db, now| db.add_replica(now, id, &node, replica))?;
+    api.edit(|db, now| {
+        let id = item(&db.config(), &name)?;
+        Ok(db.add_replica(now, id, &node, replica)?)
+    })?;
     Ok(Json(()))
 }
 
@@ -354,9 +393,11 @@ async fn remove_replica<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path((name, node)): Path<(String, String)>,
 ) -> Answer<()> {
-    let id = item(&api.db.lock().unwrap().config(), &name)?;
-    let node = api.node(Some(&node)).await?;
-    api.edit(|db, now| db.remove_replica(now, id, &node))?;
+    let node = api.node(Some(&node), false).await?;
+    api.edit(|db, now| {
+        let id = item(&db.config(), &name)?;
+        Ok(db.remove_replica(now, id, &node)?)
+    })?;
     Ok(Json(()))
 }
 
@@ -364,35 +405,54 @@ async fn untrack<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path(name): Path<String>,
 ) -> Answer<()> {
-    let id = item(&api.db.lock().unwrap().config(), &name)?;
-    api.edit(|db, now| db.untrack(now, id))?;
+    api.edit(|db, now| {
+        let id = item(&db.config(), &name)?;
+        Ok(db.untrack(now, id)?)
+    })?;
     Ok(Json(()))
 }
 
 async fn pause_item<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path(name): Path<String>,
-    Json(set): Json<SetPaused>,
+    set: Result<Json<SetPaused>, JsonRejection>,
 ) -> Answer<()> {
-    let id = item(&api.db.lock().unwrap().config(), &name)?;
-    api.edit(|db, now| db.update_item(now, id, |item| item.paused = set.paused))?;
+    let Json(set) = set.map_err(rejected)?;
+    api.edit(|db, now| {
+        let id = item(&db.config(), &name)?;
+        Ok(db.update_item(now, id, |item| item.paused = set.paused)?)
+    })?;
     Ok(Json(()))
 }
 
 async fn pause_replica<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     Path((name, node)): Path<(String, String)>,
-    Json(set): Json<SetPaused>,
+    set: Result<Json<SetPaused>, JsonRejection>,
 ) -> Answer<()> {
-    let id = item(&api.db.lock().unwrap().config(), &name)?;
-    let node = api.node(Some(&node)).await?;
-    api.edit(|db, now| db.update_replica(now, id, &node, |replica| replica.paused = set.paused))?;
+    let Json(set) = set.map_err(rejected)?;
+    let node = api.node(Some(&node), false).await?;
+    api.edit(|db, now| {
+        let id = item(&db.config(), &name)?;
+        Ok(db.update_replica(now, id, &node, |replica| {
+            replica.paused = set.paused;
+        })?)
+    })?;
     Ok(Json(()))
 }
 
 /// This Node's Replicas' states, for the other Nodes (Node protocol).
 async fn node_states<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<NodeStates> {
-    let states = api.replicas.lock().unwrap().states.clone();
+    let replicas = api.replicas.lock().unwrap();
+    let states = replicas
+        .states
+        .iter()
+        .filter_map(|(item, state)| {
+            let path = replicas.read_for.get(item)?.as_str().to_owned();
+            let state = state.clone();
+            Some((*item, NodeState { path, state }))
+        })
+        .collect();
     Json(NodeStates { states })
 }
 
@@ -456,6 +516,6 @@ async fn swap<T: LocalApi + Clone>(
 }
 
 async fn leave<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Answer<()> {
-    api.edit(|db, now| db.leave(now))?;
+    api.edit(|db, now| Ok(db.leave(now)?))?;
     Ok(Json(()))
 }

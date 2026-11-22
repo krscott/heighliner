@@ -43,7 +43,15 @@ pub const STATES_PATH: &str = "/node/v1/states";
 /// Replicas, as it last read them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeStates {
-    pub states: BTreeMap<ItemId, ReplicaState>,
+    pub states: BTreeMap<ItemId, NodeState>,
+}
+
+/// A Replica's state, with the path it was read for, since a Replica added
+/// again elsewhere starts afresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeState {
+    pub path: String,
+    pub state: ReplicaState,
 }
 
 /// The answer to `GET /node/hello`.

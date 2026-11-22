@@ -506,9 +506,6 @@ impl fmt::Display for DeviceId {
 pub struct NodeInfo {
     /// The device ID of the Node's Syncthing instance.
     pub device_id: DeviceId,
-    /// Whether it left the Fleet: a Departed Node, which isn't synced with.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub departed: bool,
     #[serde(flatten)]
     unknown_fields: UnknownFields,
 }
@@ -517,15 +514,12 @@ impl NodeInfo {
     pub fn new(device_id: DeviceId) -> Self {
         Self {
             device_id,
-            departed: false,
             unknown_fields: UnknownFields::new(),
         }
     }
 
-    /// Carries over what only the Node itself changes, and the fields of
-    /// `original` that this version doesn't know.
-    pub(crate) fn keep_fields(&mut self, original: Self) {
-        self.departed = original.departed;
+    /// Carries over the fields of `original` that this version doesn't know.
+    pub(crate) fn keep_unknown_fields(&mut self, original: Self) {
         self.unknown_fields = original.unknown_fields;
     }
 }

@@ -195,17 +195,19 @@ async fn run_command(
     tailscale_socket: PathBuf,
     on: Option<String>,
 ) -> Result<(), String> {
+    let on = on.as_deref();
     let tailscale = tailscale::Client::new(tailscale_socket);
-    let client = cli::Client::connect(&tailscale, port, on.as_deref())
+    let client = cli::Client::connect(&tailscale, port, on)
         .await
         .map_err(|error| error.to_string())?;
     // A relative path is this machine's only when asking its own daemon.
-    let cwd = match on {
-        Some(_) => None,
-        None => Some(
+    let cwd = if client.is_here() {
+        Some(
             std::env::current_dir()
                 .map_err(|error| format!("can't tell the current directory: {error}"))?,
-        ),
+        )
+    } else {
+        None
     };
     let me = client.me().as_str().to_owned();
     let local = [me.as_str(), client.name()];

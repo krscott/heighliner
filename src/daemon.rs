@@ -245,18 +245,47 @@ pub struct Daemon<T> {
     port: u16,
     /// The status when the daemon last listened.
     tailnet: Tailnet,
-    state_file: PathBuf,
     /// Held for the daemon's lifetime; see [`LOCK_FILE`].
     _lock: File,
     db: Arc<Mutex<ConfigDb>>,
-    /// What was last written to the state file, to skip unchanged writes.
-    /// Held while saving, so saves happen one at a time and in order.
-    saved: Mutex<Vec<u8>>,
+    state: Arc<StateFile>,
     driver: Option<Driver>,
     replicas: Arc<Mutex<Replicas>>,
     /// Notified after each edit through the API.
     edited: Arc<Notify>,
     remote: RemoteStates,
+}
+
+/// The state file, which the daemon and its API's edits save to.
+struct StateFile {
+    path: PathBuf,
+    owner: Owner,
+    db: Arc<Mutex<ConfigDb>>,
+    replicas: Arc<Mutex<Replicas>>,
+    /// What was last written, to skip unchanged writes. Held while saving,
+    /// so saves happen one at a time and in order.
+    saved: Mutex<Vec<u8>>,
+}
+
+impl StateFile {
+    /// Writes the records and clock, if they changed.
+    fn save(&self) -> Result<(), Error> {
+        let mut saved = self.saved.lock().unwrap();
+        let bytes = snapshot(
+            &self.db.lock().unwrap(),
+            self.owner,
+            &self.replicas.lock().unwrap().last_current,
+        );
+        if *saved == bytes {
+            return Ok(());
+        }
+        write_atomically(&self.path, &bytes).map_err(|source| Error::State {
+            path: self.path.clone(),
+            source,
+        })?;
+        *saved = bytes;
+        Ok(())
+    }
 }
 
 /// A reconcile: the configuration it applied, and its outcome for each
@@ -268,13 +297,17 @@ struct Reconciled {
 }
 
 /// The other Nodes' Replicas' states, as last read in a round, and when.
-type RemoteStates = Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, ReplicaState>)>>>;
+type RemoteStates =
+    Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, protocol::NodeState>)>>>;
 
 /// This Node's Replicas, as last seen in Syncthing.
 struct Replicas {
     /// The last reconcile, if one has run.
     reconciled: Option<Arc<Reconciled>>,
     states: BTreeMap<ItemId, ReplicaState>,
+    /// The path each state was read for, since a Replica added again
+    /// elsewhere starts afresh.
+    read_for: BTreeMap<ItemId, AbsPath>,
     /// How many refreshes have started, and which of them `states` are
     /// from, so that one overtaken by a later one is dropped.
     started: u64,
@@ -314,24 +347,33 @@ impl<T: LocalApi + Clone> Daemon<T> {
         // Count the state as it was opened as saved, so nothing is written
         // until it changes; a daemon that changed nothing writes no file.
         let saved = Mutex::new(snapshot(&db, tailnet.owner(), &last_current));
+        let db = Arc::new(Mutex::new(db));
+        let replicas = Arc::new(Mutex::new(Replicas {
+            reconciled: None,
+            states: BTreeMap::new(),
+            read_for: BTreeMap::new(),
+            started: 0,
+            applied: 0,
+            current: BTreeMap::new(),
+            last_current,
+            logged: BTreeMap::new(),
+        }));
+        let state = Arc::new(StateFile {
+            path: state_file,
+            owner: tailnet.owner(),
+            db: db.clone(),
+            replicas: replicas.clone(),
+            saved,
+        });
         Ok(Self {
             api,
             port,
             tailnet,
-            state_file,
             _lock: lock,
-            db: Arc::new(Mutex::new(db)),
-            saved,
+            db,
+            state,
             driver: None,
-            replicas: Arc::new(Mutex::new(Replicas {
-                reconciled: None,
-                states: BTreeMap::new(),
-                started: 0,
-                applied: 0,
-                current: BTreeMap::new(),
-                last_current,
-                logged: BTreeMap::new(),
-            })),
+            replicas,
             edited: Arc::default(),
             remote: Arc::default(),
         })
@@ -398,6 +440,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 edited: self.edited.clone(),
                 remote: self.remote.clone(),
                 conflicts: self.conflict_ops(),
+                state: self.state.clone(),
                 home: std::env::var_os("HOME").map(PathBuf::from),
             };
             let hosts = self
@@ -602,6 +645,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         replicas.applied = number;
         let Replicas {
             states: before,
+            read_for,
             current,
             last_current,
             logged,
@@ -672,6 +716,10 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
         });
         logged.retain(|item, _| states.contains_key(item));
+        *read_for = states
+            .keys()
+            .filter_map(|item| Some((*item, path_of(item)?.clone())))
+            .collect();
         *before = states;
     }
 
@@ -693,21 +741,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
 
     /// Writes the records and clock to the state file, if they changed.
     pub fn save(&self) -> Result<(), Error> {
-        let mut saved = self.saved.lock().unwrap();
-        let bytes = snapshot(
-            &self.db.lock().unwrap(),
-            self.tailnet.owner(),
-            &self.replicas.lock().unwrap().last_current,
-        );
-        if *saved == bytes {
-            return Ok(());
-        }
-        write_atomically(&self.state_file, &bytes).map_err(|source| Error::State {
-            path: self.state_file.clone(),
-            source,
-        })?;
-        *saved = bytes;
-        Ok(())
+        self.state.save()
     }
 }
 
@@ -920,6 +954,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                     // port is free on addresses that stay.
                     servers.shutdown().await;
                     servers = daemon.relisten().await?;
+                    // The round stopped before applying anything.
+                    pulls.reset_immediately();
                 }
                 Err(error @ Error::IdentityChanged) => return Err(error),
                 Err(error) => tracing::warn!(%error, "pulling records failed"),

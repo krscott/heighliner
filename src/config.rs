@@ -24,6 +24,9 @@ use crate::record::{Content, Record, RecordKey, Store};
 pub const ITEM_KIND: &str = "item";
 pub const REPLICA_KIND: &str = "replica";
 pub const NODE_KIND: &str = "node";
+/// A Node's departure from the Fleet. Nothing deletes it, so a later write,
+/// such as a reinstalled Node publishing its record afresh, can't undo it.
+pub const DEPARTURE_KIND: &str = "departure";
 
 /// The record schema version this version of heighliner reads and writes.
 ///
@@ -47,6 +50,13 @@ fn item_key(item: ItemId) -> RecordKey {
 fn node_key(node: &NodeId) -> RecordKey {
     RecordKey {
         kind: NODE_KIND.to_owned(),
+        id: node.to_string(),
+    }
+}
+
+fn departure_key(node: &NodeId) -> RecordKey {
+    RecordKey {
+        kind: DEPARTURE_KIND.to_owned(),
         id: node.to_string(),
     }
 }
@@ -240,6 +250,8 @@ pub struct Config {
     pub items: BTreeMap<ItemId, ItemEntry>,
     /// What each Node has published about itself.
     pub nodes: BTreeMap<NodeId, NodeInfo>,
+    /// Departed Nodes, which have left the Fleet; none syncs with them.
+    pub departed: BTreeSet<NodeId>,
     pub problems: Vec<Problem>,
     /// Replicas whose record is a tombstone, and Items untracked.
     removed: BTreeSet<(ItemId, NodeId)>,
@@ -327,6 +339,13 @@ impl Config {
                         None => {}
                     }
                 }
+                DEPARTURE_KIND => match NodeId::new(key.id.clone()) {
+                    Ok(node) if matches!(record.latest().1, Content::Live { .. }) => {
+                        config.departed.insert(node);
+                    }
+                    Ok(_) => {}
+                    Err(e) => config.problems.push(unreadable(e.to_string())),
+                },
                 // Kinds from newer versions are kept in the store and ignored.
                 _ => {}
             }
@@ -681,7 +700,7 @@ impl ConfigDb {
         let mut info = NodeInfo::new(device_id);
         match self.config().nodes.remove(self.node()) {
             Some(original) if original.device_id == info.device_id => return Ok(()),
-            Some(original) => info.keep_fields(original),
+            Some(original) => info.keep_unknown_fields(original),
             None if is_live(self.store.get(&key)) => return Err(EditError::Unreadable(key)),
             None => {}
         }
@@ -692,15 +711,15 @@ impl ConfigDb {
     /// it any more. Its Replicas stay until they are removed. It needs the
     /// Node's record, which it publishes once it runs Syncthing.
     pub fn leave(&mut self, now: Timestamp) -> Result<(), EditError> {
-        let key = node_key(self.node());
-        let mut info = match self.config().nodes.remove(self.node()) {
-            Some(info) if info.departed => return Ok(()),
-            Some(info) => info,
-            None if is_live(self.store.get(&key)) => return Err(EditError::Unreadable(key)),
-            None => return Err(EditError::NotJoined),
-        };
-        info.departed = true;
-        self.edit(|db| db.write(now, key, &info))
+        let config = self.config();
+        if config.departed.contains(self.node()) {
+            return Ok(());
+        }
+        if !config.nodes.contains_key(self.node()) {
+            return Err(EditError::NotJoined);
+        }
+        let key = departure_key(self.node());
+        self.edit(|db| db.write(now, key, &serde_json::Map::new()))
     }
 
     fn item(&self, id: ItemId) -> Result<ItemEntry, EditError> {

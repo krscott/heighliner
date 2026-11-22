@@ -628,11 +628,11 @@ async fn status_shows_the_other_nodes_states_as_last_read() {
                 Replica::new(AbsPath::new("/srv/b").unwrap()),
             )
             .unwrap();
-        b.replicas
-            .lock()
-            .unwrap()
-            .states
-            .insert(ITEM, ReplicaState::Current);
+        let mut replicas = b.replicas.lock().unwrap();
+        replicas.states.insert(ITEM, ReplicaState::Current);
+        replicas
+            .read_for
+            .insert(ITEM, AbsPath::new("/srv/b").unwrap());
     }
     let before = Timestamp::now();
     a.pull_round().await.unwrap();

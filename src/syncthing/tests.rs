@@ -838,10 +838,11 @@ async fn replica_states_follow_syncthing() {
         })
         .unwrap();
     assert_eq!(pair.b_state(current).await, ReplicaState::Current);
-    assert!(pair.b_observed().await.every_sender);
+    let only_a = BTreeSet::from([node("a")]);
+    assert_eq!(pair.b_observed().await.connected, only_a);
 
-    // A third peer, which isn't running: B is still current with A, but
-    // no longer known to have what every sender has.
+    // A third peer, which isn't running: B is still current with A, and
+    // connected to A alone.
     let mut x = ConfigDb::new(node("x"), Store::default());
     x.set_device_id(Timestamp::now(), DeviceId::new(SOME_ID).unwrap())
         .unwrap();
@@ -855,7 +856,7 @@ async fn replica_states_follow_syncthing() {
         )
         .unwrap();
     assert_eq!(pair.b_state(current).await, ReplicaState::Current);
-    assert!(!pair.b_observed().await.every_sender);
+    assert_eq!(pair.b_observed().await.connected, only_a);
     pair.db
         .remove_replica(Timestamp::now(), ITEM, &node("x"))
         .unwrap();

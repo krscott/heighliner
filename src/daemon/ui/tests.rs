@@ -139,3 +139,23 @@ fn ages_and_sizes_read_at_a_glance() {
     assert_eq!(size(1536), "1.5 KiB");
     assert_eq!(size(300 * 1024 * 1024), "300 MiB");
 }
+
+#[tokio::test]
+async fn the_fleet_page_says_when_conflicts_cant_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    track(&daemon, "docs");
+    // Configured, but its path isn't there, so its conflicts can't be read.
+    let config = daemon.db().lock().unwrap().config();
+    let outcomes = [(ITEM, crate::syncthing::Outcome::Configured)].into();
+    daemon.replicas.lock().unwrap().reconciled =
+        Some(std::sync::Arc::new(crate::daemon::Reconciled {
+            config,
+            outcomes: Ok(outcomes),
+        }));
+    let (_, _, body) = get_page(&daemon, "/").await;
+    assert!(
+        body.contains("Some of this Node's data conflicts can't be read"),
+        "{body}"
+    );
+}

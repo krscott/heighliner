@@ -322,6 +322,12 @@ impl Conflicts {
     /// is configured, or why they can't be read.
     pub(super) async fn list(&self) -> BTreeMap<ItemId, Result<Vec<DataConflict>, ActionError>> {
         let mut listings = tokio::task::JoinSet::new();
+        // Gates no listing holds or waits on are dropped, so they don't
+        // pile up as Replicas move.
+        self.gates
+            .lock()
+            .unwrap()
+            .retain(|_, gate| Arc::strong_count(gate) > 1);
         for root in self.roots() {
             let gate = self
                 .gates

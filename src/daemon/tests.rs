@@ -788,14 +788,19 @@ async fn conflicts_are_listed_and_kept_through_the_api() {
 }
 
 /// Marks `daemon`'s Replica of [`ITEM`] at `path` current, confirmed so at
-/// `at`, as a refresh would.
+/// `at` and connected to every sender it has, as a refresh would.
 fn confirm_current(daemon: &Daemon<Fake>, path: &str, at: Timestamp) {
     let path = AbsPath::new(path).unwrap();
+    let senders = {
+        let db = daemon.db().lock().unwrap();
+        let config = db.config();
+        config.senders_to(&config.items[&ITEM], db.node())
+    };
     let mut replicas = daemon.replicas.lock().unwrap();
     replicas.states.insert(ITEM, ReplicaState::Current);
     replicas.read_for.insert(ITEM, path.clone());
     replicas.current.insert(ITEM, Confirmed { path, at });
-    replicas.every_sender.insert(ITEM);
+    replicas.connected.insert(ITEM, senders);
 }
 
 #[tokio::test]
@@ -842,13 +847,62 @@ async fn an_item_is_fully_replicated_only_while_every_replica_is_seen_current() 
     assert_eq!(status.items[0].replication, Replication::Full);
 
     // Current, but not connected to every sender, isn't enough.
-    a.replicas.lock().unwrap().every_sender.clear();
+    let a_senders = a.replicas.lock().unwrap().connected[&ITEM].clone();
+    a.replicas
+        .lock()
+        .unwrap()
+        .connected
+        .insert(ITEM, BTreeSet::new());
     let status = a.api().status().await;
     assert_eq!(
         status.items[0].replication,
         Replication::Unconfirmed { oldest: Some(b_at) }
     );
-    a.replicas.lock().unwrap().every_sender.insert(ITEM);
+    a.replicas
+        .lock()
+        .unwrap()
+        .connected
+        .insert(ITEM, a_senders.clone());
+
+    // Nor is having been connected to every sender before another was
+    // added: B was read before C was.
+    let c_node = NodeId::new("n-127.0.0.9").unwrap();
+    a.db()
+        .lock()
+        .unwrap()
+        .add_replica(
+            Timestamp::now(),
+            ITEM,
+            &c_node,
+            Replica::new(AbsPath::new("/srv/c").unwrap()),
+        )
+        .unwrap();
+    let mut with_c = a_senders;
+    with_c.insert(c_node.clone());
+    a.replicas.lock().unwrap().connected.insert(ITEM, with_c);
+    let status = a.api().status().await;
+    let ours = status.items[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.path == "/srv/x")
+        .unwrap();
+    let theirs = status.items[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.path == "/srv/b")
+        .unwrap();
+    assert!(ours.every_sender && !theirs.every_sender);
+    assert!(matches!(
+        status.items[0].replication,
+        Replication::Unconfirmed { .. }
+    ));
+    a.db()
+        .lock()
+        .unwrap()
+        .remove_replica(Timestamp::now(), ITEM, &c_node)
+        .unwrap();
+    let status = a.api().status().await;
+    assert_eq!(status.items[0].replication, Replication::Full);
     let reaches: Vec<_> = status
         .nodes
         .iter()

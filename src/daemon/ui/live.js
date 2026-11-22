@@ -11,7 +11,9 @@
   function inUse(main) {
     const selection = document.getSelection();
     const selecting =
-      selection && !selection.isCollapsed && main.contains(selection.anchorNode);
+      selection &&
+      !selection.isCollapsed &&
+      (main.contains(selection.anchorNode) || main.contains(selection.focusNode));
     return selecting || main.contains(document.activeElement);
   }
 

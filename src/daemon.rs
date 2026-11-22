@@ -339,9 +339,8 @@ struct Replicas {
     last_current: BTreeMap<ItemId, Confirmed>,
     /// The state last logged for each Replica, to log changes only.
     logged: BTreeMap<ItemId, ReplicaState>,
-    /// The Replicas connected to every one of their senders when their
-    /// states were read.
-    every_sender: BTreeSet<ItemId>,
+    /// The senders each Replica was connected to when its state was read.
+    connected: BTreeMap<ItemId, BTreeSet<NodeId>>,
 }
 
 impl Replicas {
@@ -391,7 +390,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             current: BTreeMap::new(),
             last_current,
             logged: BTreeMap::new(),
-            every_sender: BTreeSet::new(),
+            connected: BTreeMap::new(),
         }));
         let state = Arc::new(StateFile {
             path: state_file,
@@ -681,10 +680,9 @@ impl<T: LocalApi + Clone> Daemon<T> {
             Ok(outcomes) => driver.observe_all(config, &me, outcomes).await,
             Err(_) => BTreeMap::new(),
         };
-        let every_sender: BTreeSet<ItemId> = observed
+        let connected: BTreeMap<ItemId, BTreeSet<NodeId>> = observed
             .iter()
-            .filter(|(_, observed)| observed.every_sender)
-            .map(|(item, _)| *item)
+            .map(|(item, observed)| (*item, observed.connected.clone()))
             .collect();
         let mut states: BTreeMap<ItemId, ReplicaState> = match &reconciled.outcomes {
             Ok(_) => observed
@@ -704,7 +702,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         if number < replicas.applied {
             return;
         }
-        replicas.every_sender = every_sender;
+        replicas.connected = connected;
         replicas.applied = number;
         let Replicas {
             states: before,

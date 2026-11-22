@@ -4,7 +4,7 @@
 //! event stream (see `events`) only says when to look again, so a missed
 //! event delays a state but never makes it wrong.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -29,18 +29,15 @@ enum Senders {
     /// mirror with none is an error.)
     None,
     Unreachable,
-    /// Some are connected; `all` if every one is.
-    Connected {
-        all: bool,
-    },
+    Connected,
 }
 
-/// A Replica's state, and whether it is connected to every one of its
-/// senders, so that being current means it has what they all have.
+/// A Replica's state, and the senders it was connected to, so that being
+/// current can be told to mean it has what all of a set of senders have.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed {
     pub state: ReplicaState,
-    pub every_sender: bool,
+    pub connected: BTreeSet<NodeId>,
 }
 
 impl Driver {
@@ -60,7 +57,7 @@ impl Driver {
             .collect()
     }
 
-    /// [`Self::states`], with whether each Replica reaches every sender.
+    /// [`Self::states`], with the senders each Replica was connected to.
     pub async fn observe_all(
         &self,
         config: &Config,
@@ -75,7 +72,7 @@ impl Driver {
         let mut states = BTreeMap::new();
         let unseen = |state| Observed {
             state,
-            every_sender: false,
+            connected: BTreeSet::new(),
         };
         for (item, outcome) in outcomes {
             let observed = match locals.get(item) {
@@ -110,33 +107,20 @@ impl Driver {
     ) -> Result<Observed, Error> {
         let client = &self.client;
         let item = local.item_id;
-        let direction = &local.entry.item.direction;
-        let sending = local
-            .entry
-            .replicas
-            .iter()
-            // A Departed Node no longer sends to anyone.
-            .filter(|(node, replica)| {
-                *node != me
-                    && direction.role(node, replica.mirror) != Role::Mirror
-                    && !config.departed.contains(*node)
-            })
-            .map(|(node, _)| node);
-        let (mut count, mut connected) = (0, 0);
-        for node in sending {
-            count += 1;
+        // A Departed Node no longer sends to anyone.
+        let sending = config.senders_to(local.entry, me);
+        let mut connected = BTreeSet::new();
+        for node in &sending {
             if let Some(info) = config.nodes.get(node)
                 && client.shares_now(item, info.device_id.as_str()).await?
             {
-                connected += 1;
+                connected.insert(node.clone());
             }
         }
-        let senders = match (count, connected) {
-            (0, _) => Senders::None,
-            (_, 0) => Senders::Unreachable,
-            _ => Senders::Connected {
-                all: connected == count,
-            },
+        let senders = match (sending.is_empty(), connected.is_empty()) {
+            (true, _) => Senders::None,
+            (false, true) => Senders::Unreachable,
+            (false, false) => Senders::Connected,
         };
         if senders == Senders::None && local.role == Role::Mirror {
             return Ok(Observed {
@@ -145,7 +129,7 @@ impl Driver {
                         "can't be synced: it's a mirror, and no other replica of its item sends"
                             .into(),
                 },
-                every_sender: false,
+                connected,
             });
         }
         // Read after the senders, so that it includes what Syncthing knows
@@ -155,7 +139,7 @@ impl Driver {
             .await?;
         Ok(Observed {
             state: state_of(&status, senders),
-            every_sender: matches!(senders, Senders::None | Senders::Connected { all: true }),
+            connected,
         })
     }
 }
@@ -186,10 +170,10 @@ fn state_of(status: &Value, senders: Senders) -> ReplicaState {
     match senders {
         Senders::None => ReplicaState::Current,
         Senders::Unreachable => ReplicaState::Behind { last_current: None },
-        Senders::Connected { .. } if status["state"] == "idle" && count("needTotalItems") == 0 => {
+        Senders::Connected if status["state"] == "idle" && count("needTotalItems") == 0 => {
             ReplicaState::Current
         }
-        Senders::Connected { .. } => ReplicaState::Syncing {
+        Senders::Connected => ReplicaState::Syncing {
             files_left: count("needTotalItems"),
             bytes_left: count("needBytes"),
         },
@@ -209,10 +193,7 @@ mod tests {
     #[test]
     fn a_folder_with_nothing_to_receive_is_current() {
         assert_eq!(state_of(&idle(), Senders::None), ReplicaState::Current);
-        assert_eq!(
-            state_of(&idle(), Senders::Connected { all: true }),
-            ReplicaState::Current
-        );
+        assert_eq!(state_of(&idle(), Senders::Connected), ReplicaState::Current);
     }
 
     #[test]
@@ -229,7 +210,7 @@ mod tests {
         status["needTotalItems"] = json!(3);
         status["needBytes"] = json!(1024);
         assert_eq!(
-            state_of(&status, Senders::Connected { all: true }),
+            state_of(&status, Senders::Connected),
             ReplicaState::Syncing {
                 files_left: 3,
                 bytes_left: 1024
@@ -239,7 +220,7 @@ mod tests {
         let mut status = idle();
         status["state"] = json!("syncing");
         assert!(matches!(
-            state_of(&status, Senders::Connected { all: true }),
+            state_of(&status, Senders::Connected),
             ReplicaState::Syncing { .. }
         ));
     }
@@ -250,7 +231,7 @@ mod tests {
         status["state"] = json!("error");
         status["error"] = json!("folder marker missing");
         assert!(matches!(
-            state_of(&status, Senders::Connected { all: true }),
+            state_of(&status, Senders::Connected),
             ReplicaState::Error { message } if message.contains("folder marker missing")
         ));
         let mut status = idle();
@@ -262,7 +243,7 @@ mod tests {
         let mut status = idle();
         status["receiveOnlyTotalItems"] = json!(1);
         assert!(matches!(
-            state_of(&status, Senders::Connected { all: true }),
+            state_of(&status, Senders::Connected),
             ReplicaState::Error { .. }
         ));
     }

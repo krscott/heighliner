@@ -152,8 +152,8 @@ pub struct ReplicaStatus {
     #[serde(default)]
     pub confirmed_at: Option<Timestamp>,
     /// Whether, when its state was read, it was connected to every Replica
-    /// that sends to it, so that being current means it has what they all
-    /// have.
+    /// that sends to it now, so that being current means it has what they
+    /// all have.
     #[serde(default)]
     pub every_sender: bool,
 }

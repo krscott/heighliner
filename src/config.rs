@@ -136,6 +136,21 @@ impl ItemEntry {
 }
 
 impl Config {
+    /// The Nodes whose Replicas of `entry` send to its Replica on `node`:
+    /// the others that aren't mirrors, on Nodes still in the Fleet.
+    pub fn senders_to(&self, entry: &ItemEntry, node: &NodeId) -> BTreeSet<NodeId> {
+        entry
+            .replicas
+            .keys()
+            .filter(|other| {
+                *other != node
+                    && entry.role(other) != Some(Role::Mirror)
+                    && !self.departed.contains(*other)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Whether the Replica of `item` on `node` was removed, or the Item
     /// untracked, as far as the records still show.
     pub fn was_removed(&self, item: ItemId, node: &NodeId) -> bool {

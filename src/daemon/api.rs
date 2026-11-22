@@ -168,12 +168,17 @@ impl<T: LocalApi + Clone> Api<T> {
                         let path = replica.path();
                         // Only for the path it was read for: one added again
                         // elsewhere starts afresh.
+                        // Against the senders it has now, which may have
+                        // changed since it was read.
+                        let senders = config.senders_to(entry, node);
+                        let reaches_all =
+                            |connected: &BTreeSet<NodeId>| senders.is_subset(connected);
                         let (state, state_read_at, confirmed_at, every_sender, live) =
                             if *node == me {
                                 let read = replicas.read_for.get(id) == Some(path);
                                 let state =
                                     read.then(|| replicas.states.get(id).cloned()).flatten();
-                                let every_sender = read && replicas.every_sender.contains(id);
+                                let every_sender = read && replicas.connected.get(id).is_some_and(reaches_all);
                                 (state, None, replicas.confirmed(id, path), every_sender, true)
                             } else {
                                 match remote.states.get(node) {
@@ -185,7 +190,7 @@ impl<T: LocalApi + Clone> Api<T> {
                                             read.map(|read| read.state.clone()),
                                             Some(*read_at),
                                             read.and_then(|read| read.confirmed_at),
-                                            read.is_some_and(|read| read.every_sender),
+                                            read.is_some_and(|read| reaches_all(&read.connected)),
                                             remote.live.contains(node),
                                         )
                                     }
@@ -609,7 +614,7 @@ async fn node_states<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Nod
                 path: path.as_str().to_owned(),
                 state: state.clone(),
                 confirmed_at: replicas.confirmed(item, path),
-                every_sender: replicas.every_sender.contains(item),
+                connected: replicas.connected.get(item).cloned().unwrap_or_default(),
             };
             Some((*item, read))
         })

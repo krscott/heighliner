@@ -358,6 +358,13 @@ async fn fleet<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
                 }
             }
         }
+        @if !conflicts.errors.is_empty() {
+            p.callout {
+                a href="/conflicts" {
+                    "Some of this Node's data conflicts can't be read"
+                }
+            }
+        }
         section {
             h2 { "Items" }
             @if status.items.is_empty() {

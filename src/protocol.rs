@@ -26,6 +26,7 @@ use tokio::net::TcpStream;
 use std::collections::BTreeMap;
 
 use crate::config::ConfigDb;
+use crate::hlc::Timestamp;
 use crate::http::{self, BoxError};
 use crate::model::{ItemId, ReplicaState};
 use crate::record::Store;
@@ -52,6 +53,9 @@ pub struct NodeStates {
 pub struct NodeState {
     pub path: String,
     pub state: ReplicaState,
+    /// When its Node last confirmed it current, if ever.
+    #[serde(default)]
+    pub confirmed_at: Option<Timestamp>,
 }
 
 /// The answer to `GET /node/hello`.

@@ -786,3 +786,156 @@ async fn conflicts_are_listed_and_kept_through_the_api() {
         "{again:?}"
     );
 }
+
+/// Marks `daemon`'s Replica of [`ITEM`] at `path` current, confirmed so at
+/// `at`, as a refresh would.
+fn confirm_current(daemon: &Daemon<Fake>, path: &str, at: Timestamp) {
+    let path = AbsPath::new(path).unwrap();
+    let mut replicas = daemon.replicas.lock().unwrap();
+    replicas.states.insert(ITEM, ReplicaState::Current);
+    replicas.read_for.insert(ITEM, path.clone());
+    replicas.current.insert(ITEM, Confirmed { path, at });
+}
+
+#[tokio::test]
+async fn an_item_is_fully_replicated_only_while_every_replica_is_seen_current() {
+    use crate::api::{Reach, Replication};
+
+    let port = free_port().await;
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = Daemon::open(tailnet("127.0.0.1", &["127.0.0.2"]), a_dir.path(), port)
+        .await
+        .unwrap();
+    let b = Daemon::open(tailnet("127.0.0.2", &["127.0.0.1"]), b_dir.path(), port)
+        .await
+        .unwrap();
+    let _a_servers = a.listen().await.unwrap();
+    let b_servers = b.listen().await.unwrap();
+    track(&a, "docs");
+    b.pull_round().await.unwrap();
+    let b_node = b.db().lock().unwrap().node().clone();
+    b.db()
+        .lock()
+        .unwrap()
+        .add_replica(
+            Timestamp::now(),
+            ITEM,
+            &b_node,
+            Replica::new(AbsPath::new("/srv/b").unwrap()),
+        )
+        .unwrap();
+    a.pull_round().await.unwrap();
+
+    // B's Replica was never read current.
+    let status = a.api().status().await;
+    assert_eq!(
+        status.items[0].replication,
+        Replication::Unconfirmed { oldest: None }
+    );
+
+    let (a_at, b_at) = (Timestamp::from_millis(2_000), Timestamp::from_millis(1_000));
+    confirm_current(&a, "/srv/x", a_at);
+    confirm_current(&b, "/srv/b", b_at);
+    a.pull_round().await.unwrap();
+    let status = a.api().status().await;
+    assert_eq!(status.items[0].replication, Replication::Full);
+    let reaches: Vec<_> = status
+        .nodes
+        .iter()
+        .map(|node| (node.node.as_str(), &node.reach))
+        .collect();
+    assert!(matches!(
+        &reaches[..],
+        [
+            ("n-127.0.0.1", Reach::Here),
+            ("n-127.0.0.2", Reach::Live { .. })
+        ]
+    ));
+
+    // Once B can't be reached, its state is only as last read.
+    drop(b_servers);
+    a.pull_round().await.unwrap();
+    let status = a.api().status().await;
+    assert_eq!(
+        status.items[0].replication,
+        Replication::Unconfirmed { oldest: Some(b_at) }
+    );
+    assert!(matches!(
+        status.nodes[1].reach,
+        Reach::Unreachable { read_at: Some(_) }
+    ));
+    let theirs = &status.items[0].replicas[1];
+    assert_eq!(
+        (theirs.state.clone(), theirs.confirmed_at),
+        (Some(ReplicaState::Current), Some(b_at))
+    );
+}
+
+#[tokio::test]
+async fn status_flags_shared_names_and_names_nodes_to_upgrade() {
+    use crate::api::Reach;
+
+    let port = free_port().await;
+    let newer = Router::new().route(
+        protocol::HELLO_PATH,
+        get(|| async {
+            axum::Json(Hello {
+                protocol: protocol::MAJOR + 1,
+                heighliner: "9.0.0".into(),
+            })
+        }),
+    );
+    let listener = TcpListener::bind(("127.0.0.3", port)).await.unwrap();
+    tokio::spawn(async move { axum::serve(listener, newer).await });
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.2", &["127.0.0.3"]), dir.path(), port)
+        .await
+        .unwrap();
+    track(&daemon, "docs");
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let node = db.node().clone();
+        db.track(
+            Timestamp::now(),
+            ItemId::from_u128(2),
+            Item::new("docs", Direction::TwoWay),
+            &node,
+            Replica::new(AbsPath::new("/srv/y").unwrap()),
+        )
+        .unwrap();
+    }
+    daemon.pull_round().await.unwrap();
+    let status = daemon.api().status().await;
+    assert!(status.items.iter().all(|item| item.duplicate_name));
+    let newer = status
+        .nodes
+        .iter()
+        .find(|node| node.node.as_str() == "n-127.0.0.3")
+        .unwrap();
+    assert_eq!(
+        newer.reach,
+        Reach::Incompatible {
+            protocol: protocol::MAJOR + 1
+        }
+    );
+}
+
+#[test]
+fn requests_may_name_the_daemon_by_address_or_magicdns_name() {
+    let mut me = device("laptop", OWNER, "100.64.0.1");
+    me.ips.push("fd7a:115c:a1e0::1".parse().unwrap());
+    me.dns_name = "Laptop.tail.ts.net".into();
+    let expected: BTreeSet<String> = [
+        "100.64.0.1:7130",
+        "[fd7a:115c:a1e0::1]:7130",
+        "laptop.tail.ts.net:7130",
+        "laptop:7130",
+    ]
+    .map(String::from)
+    .into();
+    assert_eq!(hosts(&me, 7130), expected);
+
+    // Without MagicDNS, only by address.
+    me.dns_name.clear();
+    assert_eq!(hosts(&me, 7130).len(), 2);
+}

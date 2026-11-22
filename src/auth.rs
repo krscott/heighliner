@@ -309,8 +309,9 @@ async fn reauthorize<T: LocalApi>(
     }
 }
 
-/// Refuses requests to `router` whose `Host` isn't one of `hosts`, such as
-/// this device's Tailscale addresses with the port. A web page whose
+/// Refuses requests to `router` whose `Host` isn't one of `hosts`, in
+/// lowercase, such as this device's Tailscale addresses with the port. A
+/// web page whose
 /// domain was rebound to such an address would otherwise reach it as its
 /// own origin, from the user's own device, which WhoIs accepts.
 pub fn only_for_hosts(router: Router, hosts: BTreeSet<String>) -> Router {
@@ -325,9 +326,10 @@ async fn check_host(
     let host = request
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|host| host.to_str().ok());
+        .and_then(|host| host.to_str().ok())
+        .map(str::to_ascii_lowercase);
     match host {
-        Some(host) if hosts.contains(host) => next.run(request).await,
+        Some(host) if hosts.contains(&host) => next.run(request).await,
         _ => (
             StatusCode::MISDIRECTED_REQUEST,
             "this server answers only at this device's Tailscale addresses",

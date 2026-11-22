@@ -17,7 +17,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
 
-use crate::api::{self, AddReplica, Refused, SetPaused, Status, Track, Tracked};
+use crate::api::{
+    self, AddReplica, Reach, Refused, Replication, SetPaused, Status, Track, Tracked,
+};
 use crate::http::{self, BoxError};
 use crate::model::NodeId;
 use crate::tailscale::{self, LocalApi};
@@ -146,6 +148,11 @@ impl Client {
     /// Whether the daemon is this device's, whose paths are this machine's.
     pub fn is_here(&self) -> bool {
         self.here
+    }
+
+    /// The daemon's web UI, at the address that last connected.
+    pub fn url(&self) -> String {
+        format!("http://{}/", self.addrs[self.last.load(Ordering::Relaxed)])
     }
 
     pub async fn conflicts(&self) -> Result<api::Conflicts, Error> {
@@ -318,11 +325,29 @@ pub fn format_status(status: &Status) -> String {
             }
             None => "two-way".to_owned(),
         };
-        let paused = if item.paused { ", paused" } else { "" };
+        let mut flags = String::new();
+        for (set, flag) in [
+            (item.paused, ", paused"),
+            (item.resurrected, ", resurrected"),
+            (item.duplicate_name, ", name shared"),
+        ] {
+            if set {
+                flags.push_str(flag);
+            }
+        }
         out.push_str(&format!(
-            "{} ({}, {direction}{paused})\n",
+            "{} ({}, {direction}{flags})\n",
             item.name, item.id
         ));
+        match &item.replication {
+            Replication::Full => out.push_str("  fully replicated\n"),
+            Replication::Unconfirmed { oldest: Some(at) } => out.push_str(&format!(
+                "  not confirmed fully replicated; the oldest confirmation is from {at}\n"
+            )),
+            Replication::Unconfirmed { oldest: None } => out.push_str(
+                "  not confirmed fully replicated; a replica was never confirmed current\n",
+            ),
+        }
         if !item.excludes.is_empty() {
             out.push_str(&format!("  excludes {}\n", item.excludes.join(" ")));
         }
@@ -346,6 +371,31 @@ pub fn format_status(status: &Status) -> String {
             out.push_str(&line);
             out.push('\n');
         }
+    }
+    if !status.nodes.is_empty() {
+        out.push_str("Nodes:\n");
+    }
+    for node in &status.nodes {
+        let name = node.name.as_deref().unwrap_or(node.node.as_str());
+        let reach = match &node.reach {
+            Reach::Here => "this Node".to_owned(),
+            Reach::Live { .. } => "reachable".to_owned(),
+            Reach::Unreachable { read_at: Some(at) } => format!("unreachable; last read at {at}"),
+            Reach::Unreachable { read_at: None } => "never reached".to_owned(),
+            Reach::Incompatible { protocol } => {
+                let older = if *protocol < crate::protocol::MAJOR {
+                    "upgrade it"
+                } else {
+                    "upgrade this Node"
+                };
+                format!(
+                    "speaks protocol {protocol}, not {}; {older}",
+                    crate::protocol::MAJOR
+                )
+            }
+        };
+        let departed = if node.departed { ", departed" } else { "" };
+        out.push_str(&format!("  {name}: {reach}{departed}\n"));
     }
     if !status.problems.is_empty() {
         out.push_str("Problems:\n");

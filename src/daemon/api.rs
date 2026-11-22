@@ -1,5 +1,7 @@
 //! Serving the daemon's API (see [`crate::api`]).
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,14 +14,16 @@ use axum::{Json, Router};
 use tokio::sync::Notify;
 
 use super::conflicts::{ActionError, Conflicts};
-use super::{RETENTION_WINDOW, RemoteStates, Replicas, StateFile};
+use super::{Changes, RETENTION_WINDOW, Remote, Replicas, StateFile, signal};
 use crate::api::{
-    self, AddReplica, Conflict, ItemStatus, Refused, ReplicaStatus, Resolve, SetPaused, Status,
-    Track, Tracked,
+    self, AddReplica, Conflict, ItemStatus, NodeStatus, Reach, Refused, ReplicaStatus, Replication,
+    Resolve, SetPaused, Status, Track, Tracked,
 };
-use crate::config::{Config, ConfigDb, EditError};
+use crate::config::{Config, ConfigDb, EditError, Problem};
 use crate::hlc::Timestamp;
-use crate::model::{AbsPath, Direction, ExcludePattern, Item, ItemId, NodeId, Replica};
+use crate::model::{
+    AbsPath, Direction, ExcludePattern, Item, ItemId, NodeId, Replica, ReplicaState,
+};
 use crate::protocol::{self, NodeState, NodeStates};
 use crate::syncthing::conflicts::DataConflict;
 use crate::tailscale::LocalApi;
@@ -32,11 +36,14 @@ pub(super) struct Api<T> {
     /// Notified after each edit, so that it is applied without waiting
     /// for the next round.
     pub(super) edited: Arc<Notify>,
-    pub(super) remote: RemoteStates,
+    pub(super) remote: Arc<Mutex<Remote>>,
     pub(super) conflicts: Conflicts,
     pub(super) state: Arc<StateFile>,
     /// The daemon's user's home, which `~` stands for.
     pub(super) home: Option<PathBuf>,
+    /// The port the daemons serve on.
+    pub(super) port: u16,
+    pub(super) changes: Changes,
 }
 
 impl<T: Clone> Clone for Api<T> {
@@ -50,6 +57,8 @@ impl<T: Clone> Clone for Api<T> {
             conflicts: self.conflicts.clone(),
             state: self.state.clone(),
             home: self.home.clone(),
+            port: self.port,
+            changes: self.changes.clone(),
         }
     }
 }
@@ -119,6 +128,216 @@ fn rejected(rejection: JsonRejection) -> Refusal {
 impl<T: LocalApi + Clone> Api<T> {
     fn me(&self) -> NodeId {
         self.db.lock().unwrap().node().clone()
+    }
+
+    /// This Node's view of the Fleet.
+    pub(super) async fn status(&self) -> Status {
+        // Names are a convenience; without Tailscale, IDs do.
+        let devices: BTreeMap<NodeId, (String, Option<IpAddr>)> =
+            match self.tailscale.status().await {
+                Ok(tailnet) => std::iter::once(tailnet.me())
+                    .chain(tailnet.owned_devices())
+                    .map(|device| {
+                        let ip = device
+                            .ips
+                            .iter()
+                            .find(|ip| ip.is_ipv4())
+                            .or(device.ips.first())
+                            .copied();
+                        (device.id.clone(), (device.name.clone(), ip))
+                    })
+                    .collect(),
+                Err(_) => BTreeMap::new(),
+            };
+        let name_of = |node: &NodeId| devices.get(node).map(|(name, _)| name.clone());
+        let (config, me) = {
+            let db = self.db.lock().unwrap();
+            (db.config(), db.node().clone())
+        };
+        let remote = self.remote.lock().unwrap().clone();
+        let replicas = self.replicas.lock().unwrap();
+        let mut items: Vec<ItemStatus> = config
+            .items
+            .iter()
+            .map(|(id, entry)| {
+                let shown: Vec<(ReplicaStatus, bool)> = entry
+                    .replicas
+                    .iter()
+                    .map(|(node, replica)| {
+                        let path = replica.path();
+                        // Only for the path it was read for: one added again
+                        // elsewhere starts afresh.
+                        let (state, state_read_at, confirmed_at, live) = if *node == me {
+                            let state = (replicas.read_for.get(id) == Some(path))
+                                .then(|| replicas.states.get(id).cloned())
+                                .flatten();
+                            (state, None, replicas.confirmed(id, path), true)
+                        } else {
+                            match remote.states.get(node) {
+                                Some((read_at, states)) => {
+                                    let read = states
+                                        .get(id)
+                                        .filter(|state| state.path == path.as_str());
+                                    (
+                                        read.map(|read| read.state.clone()),
+                                        Some(*read_at),
+                                        read.and_then(|read| read.confirmed_at),
+                                        remote.live.contains(node),
+                                    )
+                                }
+                                None => (None, None, None, false),
+                            }
+                        };
+                        let current_now = live && state == Some(ReplicaState::Current);
+                        let status = ReplicaStatus {
+                            node: node.clone(),
+                            node_name: name_of(node),
+                            path: path.as_str().to_owned(),
+                            role: entry.item.direction.role(node, replica.mirror),
+                            paused: replica.paused,
+                            departed: config.departed.contains(node),
+                            state,
+                            state_read_at,
+                            confirmed_at,
+                        };
+                        (status, current_now)
+                    })
+                    .collect();
+                let counted: Vec<&(ReplicaStatus, bool)> =
+                    shown.iter().filter(|(replica, _)| !replica.departed).collect();
+                let replication = if !counted.is_empty() && counted.iter().all(|(_, now)| *now) {
+                    Replication::Full
+                } else {
+                    let confirmed: Option<Vec<Timestamp>> = counted
+                        .iter()
+                        .map(|(replica, _)| replica.confirmed_at)
+                        .collect();
+                    let oldest = confirmed.and_then(|times| times.into_iter().min());
+                    Replication::Unconfirmed { oldest }
+                };
+                ItemStatus {
+                    id: *id,
+                    name: entry.item.name.clone(),
+                    source: match &entry.item.direction {
+                        Direction::OneWay { source } => Some(source.clone()),
+                        Direction::TwoWay => None,
+                    },
+                    excludes: entry
+                        .item
+                        .excludes
+                        .iter()
+                        .map(|pattern| pattern.as_str().to_owned())
+                        .collect(),
+                    paused: entry.item.paused,
+                    retention_days: entry.item.retention_days,
+                    resurrected: config.problems.iter().any(|problem| {
+                        matches!(problem, Problem::Resurrected { item } if item == id)
+                    }),
+                    duplicate_name: config.problems.iter().any(|problem| {
+                        matches!(problem, Problem::DuplicateName { items, .. } if items.contains(id))
+                    }),
+                    replication,
+                    replicas: shown.into_iter().map(|(replica, _)| replica).collect(),
+                }
+            })
+            .collect();
+        drop(replicas);
+        items.sort_by(|a, b| (&a.name, a.id).cmp(&(&b.name, b.id)));
+        let named: BTreeSet<&NodeId> = config
+            .nodes
+            .keys()
+            .chain(
+                config
+                    .items
+                    .values()
+                    .flat_map(|entry| entry.replicas.keys()),
+            )
+            .chain(&config.departed)
+            .chain(remote.incompatible.keys())
+            .chain([&me])
+            .collect();
+        let mut nodes: Vec<NodeStatus> = named
+            .into_iter()
+            .map(|node| {
+                let read_at = remote.states.get(node).map(|(read_at, _)| *read_at);
+                let reach = if *node == me {
+                    Reach::Here
+                } else if let Some(protocol) = remote.incompatible.get(node) {
+                    Reach::Incompatible {
+                        protocol: *protocol,
+                    }
+                } else if let (true, Some(read_at)) = (remote.live.contains(node), read_at) {
+                    Reach::Live { read_at }
+                } else {
+                    Reach::Unreachable { read_at }
+                };
+                NodeStatus {
+                    node: node.clone(),
+                    name: name_of(node),
+                    ip: devices.get(node).and_then(|(_, ip)| *ip),
+                    departed: config.departed.contains(node),
+                    reach,
+                }
+            })
+            .collect();
+        nodes.sort_by(|a, b| {
+            let key = |node: &NodeStatus| {
+                (
+                    node.reach != Reach::Here,
+                    node.name.clone(),
+                    node.node.clone(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
+        Status {
+            node: me,
+            nodes,
+            items,
+            problems: config.problems.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// This Node's Data Conflicts.
+    pub(super) async fn list_conflicts(&self) -> api::Conflicts {
+        let config = self.db.lock().unwrap().config();
+        let mut listed = api::Conflicts {
+            conflicts: Vec::new(),
+            errors: Vec::new(),
+        };
+        for (item, found) in self.conflicts.list().await {
+            let entry = config.items.get(&item);
+            let item_name = entry.map_or_else(String::new, |entry| entry.item.name.clone());
+            match found {
+                Ok(found) => {
+                    let retention = entry
+                        .and_then(|entry| entry.item.retention_days)
+                        .map_or(RETENTION_WINDOW, |days| {
+                            std::time::Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
+                        });
+                    listed.conflicts.extend(found.into_iter().map(|conflict| {
+                        let DataConflict {
+                            path,
+                            at,
+                            winner,
+                            version,
+                            moved_at,
+                        } = conflict;
+                        Conflict {
+                            item,
+                            item_name: item_name.clone(),
+                            path,
+                            at,
+                            winner,
+                            version,
+                            expires_at: moved_at.saturating_add(retention),
+                        }
+                    }));
+                }
+                Err(error) => listed.errors.push(format!("{item_name} ({item}): {error}")),
+            }
+        }
+        listed
     }
 
     /// The Node `name` names, by node ID or machine name; this one if
@@ -212,6 +431,7 @@ impl<T: LocalApi + Clone> Api<T> {
     ) -> Result<R, Refusal> {
         let done = edit(&mut self.db.lock().unwrap(), Timestamp::now())?;
         self.edited.notify_one();
+        signal(&self.changes);
         self.state.save().map_err(|error| {
             Refusal(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -260,87 +480,7 @@ fn item(config: &Config, name: &str) -> Result<ItemId, Refusal> {
 }
 
 async fn status<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Status> {
-    let (config, me) = {
-        let db = api.db.lock().unwrap();
-        (db.config(), db.node().clone())
-    };
-    let (states, read_for) = {
-        let replicas = api.replicas.lock().unwrap();
-        (replicas.states.clone(), replicas.read_for.clone())
-    };
-    let remote = api.remote.lock().unwrap().clone();
-    // Names are a convenience; without Tailscale, IDs do.
-    let names: Vec<(NodeId, String)> = match api.tailscale.status().await {
-        Ok(tailnet) => std::iter::once(tailnet.me())
-            .chain(tailnet.owned_devices())
-            .map(|device| (device.id.clone(), device.name.clone()))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    let name_of = |node: &NodeId| {
-        names
-            .iter()
-            .find(|(id, _)| id == node)
-            .map(|(_, name)| name.clone())
-    };
-    let mut items: Vec<ItemStatus> = config
-        .items
-        .iter()
-        .map(|(id, entry)| ItemStatus {
-            id: *id,
-            name: entry.item.name.clone(),
-            source: match &entry.item.direction {
-                Direction::OneWay { source } => Some(source.clone()),
-                Direction::TwoWay => None,
-            },
-            excludes: entry
-                .item
-                .excludes
-                .iter()
-                .map(|pattern| pattern.as_str().to_owned())
-                .collect(),
-            paused: entry.item.paused,
-            retention_days: entry.item.retention_days,
-            replicas: entry
-                .replicas
-                .iter()
-                .map(|(node, replica)| {
-                    // Only for the path it was read for: one added again
-                    // elsewhere starts afresh.
-                    let (state, state_read_at) = if *node == me {
-                        let state = (read_for.get(id) == Some(replica.path()))
-                            .then(|| states.get(id).cloned())
-                            .flatten();
-                        (state, None)
-                    } else {
-                        remote.get(node).map_or((None, None), |(read_at, states)| {
-                            let state = states
-                                .get(id)
-                                .filter(|state| state.path == replica.path().as_str())
-                                .map(|state| state.state.clone());
-                            (state, Some(*read_at))
-                        })
-                    };
-                    ReplicaStatus {
-                        node: node.clone(),
-                        node_name: name_of(node),
-                        path: replica.path().as_str().to_owned(),
-                        role: entry.item.direction.role(node, replica.mirror),
-                        paused: replica.paused,
-                        departed: config.departed.contains(node),
-                        state,
-                        state_read_at,
-                    }
-                })
-                .collect(),
-        })
-        .collect();
-    items.sort_by(|a, b| (&a.name, a.id).cmp(&(&b.name, b.id)));
-    Json(Status {
-        node: me,
-        items,
-        problems: config.problems.iter().map(ToString::to_string).collect(),
-    })
+    Json(api.status().await)
 }
 
 async fn track<T: LocalApi + Clone>(
@@ -458,53 +598,20 @@ async fn node_states<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Nod
         .states
         .iter()
         .filter_map(|(item, state)| {
-            let path = replicas.read_for.get(item)?.as_str().to_owned();
-            let state = state.clone();
-            Some((*item, NodeState { path, state }))
+            let path = replicas.read_for.get(item)?;
+            let read = NodeState {
+                path: path.as_str().to_owned(),
+                state: state.clone(),
+                confirmed_at: replicas.confirmed(item, path),
+            };
+            Some((*item, read))
         })
         .collect();
     Json(NodeStates { states })
 }
 
 async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<api::Conflicts> {
-    let config = api.db.lock().unwrap().config();
-    let mut listed = api::Conflicts {
-        conflicts: Vec::new(),
-        errors: Vec::new(),
-    };
-    for (item, found) in api.conflicts.list().await {
-        let entry = config.items.get(&item);
-        let item_name = entry.map_or_else(String::new, |entry| entry.item.name.clone());
-        match found {
-            Ok(found) => {
-                let retention = entry
-                    .and_then(|entry| entry.item.retention_days)
-                    .map_or(RETENTION_WINDOW, |days| {
-                        std::time::Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
-                    });
-                listed.conflicts.extend(found.into_iter().map(|conflict| {
-                    let DataConflict {
-                        path,
-                        at,
-                        winner,
-                        version,
-                        moved_at,
-                    } = conflict;
-                    Conflict {
-                        item,
-                        item_name: item_name.clone(),
-                        path,
-                        at,
-                        winner,
-                        version,
-                        expires_at: moved_at.saturating_add(retention),
-                    }
-                }));
-            }
-            Err(error) => listed.errors.push(format!("{item_name} ({item}): {error}")),
-        }
-    }
-    Json(listed)
+    Json(api.list_conflicts().await)
 }
 
 async fn keep<T: LocalApi + Clone>(

@@ -60,6 +60,8 @@ pub struct Device {
     pub id: NodeId,
     /// The machine name: the first label of its MagicDNS name.
     pub name: String,
+    /// Its MagicDNS name, without the trailing dot; empty if it has none.
+    pub dns_name: String,
     pub user: UserId,
     pub tagged: bool,
     pub ips: Vec<IpAddr>,
@@ -346,6 +348,7 @@ impl PeerStatus {
     fn into_device(self) -> Device {
         Device {
             name: machine_name(&self.dns_name),
+            dns_name: self.dns_name.trim_end_matches('.').to_owned(),
             id: self.id,
             user: self.user_id,
             tagged: is_tagged(self.tags),

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use super::{Daemon, RETENTION_WINDOW, Replicas};
+use super::{Changes, Daemon, RETENTION_WINDOW, Replicas, signal};
 use crate::config::ConfigDb;
 use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId};
@@ -210,8 +210,9 @@ impl Queue {
     }
 
     /// Runs the waiting work as it arrives, in `me`'s configured Replicas
-    /// as `replicas` has them then. Runs until it is dropped.
-    pub(super) async fn work(&self, replicas: Arc<Mutex<Replicas>>, me: NodeId) {
+    /// as `replicas` has them then, signalling `changes` after each run.
+    /// Runs until it is dropped.
+    pub(super) async fn work(&self, replicas: Arc<Mutex<Replicas>>, me: NodeId, changes: Changes) {
         loop {
             self.ready.notified().await;
             let waiting = self.take();
@@ -239,6 +240,7 @@ impl Queue {
             // Each move is one rename, so work cut short by the daemon
             // stopping leaves no file half moved.
             let _ = tokio::task::spawn_blocking(move || waiting.run(roots)).await;
+            signal(&changes);
         }
     }
 
@@ -285,6 +287,7 @@ pub(super) struct Conflicts {
     pub(super) db: Arc<Mutex<ConfigDb>>,
     pub(super) me: NodeId,
     pub(super) driver: Option<Driver>,
+    pub(super) changes: Changes,
 }
 
 impl Conflicts {
@@ -339,10 +342,12 @@ impl Conflicts {
     ) -> Result<DataConflict, ActionError> {
         let root = self.root(item)?;
         let version = version.to_owned();
-        tokio::task::spawn_blocking(move || conflicts::keep(&root.path, &version))
+        let kept = tokio::task::spawn_blocking(move || conflicts::keep(&root.path, &version))
             .await
             .expect("keeping a conflict doesn't panic")
-            .map_err(ActionError::Conflict)
+            .map_err(ActionError::Conflict)?;
+        signal(&self.changes);
+        Ok(kept)
     }
 
     /// Makes the losing change of the Data Conflict `version` in `item`'s
@@ -368,6 +373,7 @@ impl Conflicts {
             .await
             .expect("swapping a conflict doesn't panic")
             .map_err(ActionError::Conflict)?;
+        signal(&self.changes);
         // Syncthing would notice on its own, but later. The swap is done
         // whatever the scan takes.
         let (client, file) = (driver.client().clone(), conflict.path.clone());
@@ -387,6 +393,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             db: self.db.clone(),
             me: self.db.lock().unwrap().node().clone(),
             driver: self.driver.clone(),
+            changes: self.changes.clone(),
         }
     }
 

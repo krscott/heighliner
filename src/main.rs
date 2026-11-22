@@ -107,6 +107,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<ConflictAction>,
     },
+    /// Open this Node's web UI, or another's with --on, in a browser.
+    Ui,
     /// Leave the Fleet: no Node syncs with this one any more. Its replicas
     /// stay until they're removed, and nothing is deleted.
     Leave {
@@ -276,6 +278,16 @@ async fn run_command(
         Command::Conflicts {
             action: Some(ConflictAction::Swap { item, version }),
         } => client.swap(&api::Resolve { item, version }).await,
+        Command::Ui => match client.status().await {
+            Ok(_) => {
+                let url = client.url();
+                if !open_browser(&url) {
+                    println!("Open {url} in a browser.");
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
         Command::Leave { yes: false } => {
             return Err("leaving can't be undone: no Node will sync with this one any more; run it again with --yes to leave".into());
         }
@@ -284,6 +296,19 @@ async fn run_command(
         }),
     };
     done.map_err(|error| error.to_string())
+}
+
+/// Opens `url` in the desktop's browser, and says whether that worked.
+fn open_browser(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn run_daemon(options: daemon::Options) -> Result<(), daemon::Error> {

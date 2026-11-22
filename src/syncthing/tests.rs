@@ -401,6 +401,17 @@ impl Pair {
 
     /// Reconciles, then waits up to 60s for B's state to satisfy `done`,
     /// and returns it.
+    /// B's Replica as Syncthing has it now.
+    async fn b_observed(&self) -> super::Observed {
+        let (_, report) = self.reconcile().await;
+        let mut observed = self
+            .b
+            .driver
+            .observe_all(&self.db.config(), &node("b"), &report.replicas)
+            .await;
+        observed.remove(&ITEM).unwrap()
+    }
+
     async fn b_state(&self, done: impl Fn(&ReplicaState) -> bool) -> ReplicaState {
         let (_, report) = self.reconcile().await;
         state_of(&self.b, &self.db.config(), "b", &report, done).await
@@ -827,6 +838,28 @@ async fn replica_states_follow_syncthing() {
         })
         .unwrap();
     assert_eq!(pair.b_state(current).await, ReplicaState::Current);
+    let only_a = BTreeSet::from([node("a")]);
+    assert_eq!(pair.b_observed().await.connected, only_a);
+
+    // A third peer, which isn't running: B is still current with A, and
+    // connected to A alone.
+    let mut x = ConfigDb::new(node("x"), Store::default());
+    x.set_device_id(Timestamp::now(), DeviceId::new(SOME_ID).unwrap())
+        .unwrap();
+    pair.db.merge(x.store(), Timestamp::now());
+    pair.db
+        .add_replica(
+            Timestamp::now(),
+            ITEM,
+            &node("x"),
+            Replica::new(AbsPath::new("/srv/x").unwrap()),
+        )
+        .unwrap();
+    assert_eq!(pair.b_state(current).await, ReplicaState::Current);
+    assert_eq!(pair.b_observed().await.connected, only_a);
+    pair.db
+        .remove_replica(Timestamp::now(), ITEM, &node("x"))
+        .unwrap();
 
     // Its only sender goes away.
     let Pair { a, b, db, .. } = pair;
@@ -915,13 +948,12 @@ async fn syncthing_takes_the_event_filter() {
     syncthing
         .reconcile(&tracked("a", &syncthing.dir("docs")).config(), &alone())
         .await;
+    // Read first: more events may come while the others are read.
+    let latest = client.latest_event().await.unwrap();
+    assert!(latest > 0);
     let events = client.events(0, Duration::from_secs(1)).await.unwrap();
     let ids: Vec<u64> = events.iter().map(|event| event.id).collect();
-    assert!(!ids.is_empty());
-    assert_eq!(
-        ids.iter().max().copied(),
-        Some(client.latest_event().await.unwrap())
-    );
+    assert!(ids.contains(&latest), "{ids:?} has {latest}");
 }
 
 #[tokio::test]

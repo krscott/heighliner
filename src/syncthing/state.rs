@@ -4,7 +4,7 @@
 //! event stream (see `events`) only says when to look again, so a missed
 //! event delays a state but never makes it wrong.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -32,6 +32,14 @@ enum Senders {
     Connected,
 }
 
+/// A Replica's state, and the senders it was connected to, so that being
+/// current can be told to mean it has what all of a set of senders have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observed {
+    pub state: ReplicaState,
+    pub connected: BTreeSet<NodeId>,
+}
+
 impl Driver {
     /// The states of the Replicas in `outcomes`, the last reconcile's, as
     /// Syncthing has them now, for the Node `me`. A Replica that is behind
@@ -42,31 +50,51 @@ impl Driver {
         me: &NodeId,
         outcomes: &BTreeMap<ItemId, Outcome>,
     ) -> BTreeMap<ItemId, ReplicaState> {
+        self.observe_all(config, me, outcomes)
+            .await
+            .into_iter()
+            .map(|(item, observed)| (item, observed.state))
+            .collect()
+    }
+
+    /// [`Self::states`], with the senders each Replica was connected to.
+    pub async fn observe_all(
+        &self,
+        config: &Config,
+        me: &NodeId,
+        outcomes: &BTreeMap<ItemId, Outcome>,
+    ) -> BTreeMap<ItemId, Observed> {
         let locals: BTreeMap<ItemId, LocalReplica<'_>> = config
             .replicas_on(me)
             .into_iter()
             .map(|local| (local.item_id, local))
             .collect();
         let mut states = BTreeMap::new();
+        let unseen = |state| Observed {
+            state,
+            connected: BTreeSet::new(),
+        };
         for (item, outcome) in outcomes {
-            let state = match locals.get(item) {
+            let observed = match locals.get(item) {
                 // Removed since the reconcile.
                 None if outcome.is_configured() => continue,
-                None => ReplicaState::Error {
+                None => unseen(ReplicaState::Error {
                     message: outcome.to_string(),
-                },
-                Some(local) if local.paused => ReplicaState::Paused,
-                Some(_) if *outcome != Outcome::Configured => ReplicaState::Error {
+                }),
+                Some(local) if local.paused => unseen(ReplicaState::Paused),
+                Some(_) if *outcome != Outcome::Configured => unseen(ReplicaState::Error {
                     message: outcome.to_string(),
-                },
+                }),
                 Some(local) => self
                     .observe(config, me, local)
                     .await
-                    .unwrap_or_else(|error| ReplicaState::Error {
-                        message: format!("can't be read from Syncthing: {error}"),
+                    .unwrap_or_else(|error| {
+                        unseen(ReplicaState::Error {
+                            message: format!("can't be read from Syncthing: {error}"),
+                        })
                     }),
             };
-            states.insert(*item, state);
+            states.insert(*item, observed);
         }
         states
     }
@@ -76,35 +104,32 @@ impl Driver {
         config: &Config,
         me: &NodeId,
         local: &LocalReplica<'_>,
-    ) -> Result<ReplicaState, Error> {
+    ) -> Result<Observed, Error> {
         let client = &self.client;
         let item = local.item_id;
-        let direction = &local.entry.item.direction;
-        let sending = local
-            .entry
-            .replicas
-            .iter()
-            // A Departed Node no longer sends to anyone.
-            .filter(|(node, replica)| {
-                *node != me
-                    && direction.role(node, replica.mirror) != Role::Mirror
-                    && !config.departed.contains(*node)
-            })
-            .map(|(node, _)| node);
-        let mut senders = Senders::None;
-        for node in sending {
-            senders = Senders::Unreachable;
+        // A Departed Node no longer sends to anyone.
+        let sending = config.senders_to(local.entry, me);
+        let mut connected = BTreeSet::new();
+        for node in &sending {
             if let Some(info) = config.nodes.get(node)
                 && client.shares_now(item, info.device_id.as_str()).await?
             {
-                senders = Senders::Connected;
-                break;
+                connected.insert(node.clone());
             }
         }
+        let senders = match (sending.is_empty(), connected.is_empty()) {
+            (true, _) => Senders::None,
+            (false, true) => Senders::Unreachable,
+            (false, false) => Senders::Connected,
+        };
         if senders == Senders::None && local.role == Role::Mirror {
-            return Ok(ReplicaState::Error {
-                message: "can't be synced: it's a mirror, and no other replica of its item sends"
-                    .into(),
+            return Ok(Observed {
+                state: ReplicaState::Error {
+                    message:
+                        "can't be synced: it's a mirror, and no other replica of its item sends"
+                            .into(),
+                },
+                connected,
             });
         }
         // Read after the senders, so that it includes what Syncthing knows
@@ -112,7 +137,10 @@ impl Driver {
         let status: Value = client
             .get(&format!("/rest/db/status?folder={item}"))
             .await?;
-        Ok(state_of(&status, senders))
+        Ok(Observed {
+            state: state_of(&status, senders),
+            connected,
+        })
     }
 }
 

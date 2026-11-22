@@ -786,3 +786,249 @@ async fn conflicts_are_listed_and_kept_through_the_api() {
         "{again:?}"
     );
 }
+
+/// Marks `daemon`'s Replica of [`ITEM`] at `path` current, confirmed so at
+/// `at` and connected to every sender it has, as a refresh would.
+fn confirm_current(daemon: &Daemon<Fake>, path: &str, at: Timestamp) {
+    let path = AbsPath::new(path).unwrap();
+    let senders = {
+        let db = daemon.db().lock().unwrap();
+        let config = db.config();
+        config.senders_to(&config.items[&ITEM], db.node())
+    };
+    let mut replicas = daemon.replicas.lock().unwrap();
+    replicas.states.insert(ITEM, ReplicaState::Current);
+    replicas.read_for.insert(ITEM, path.clone());
+    replicas.current.insert(ITEM, Confirmed { path, at });
+    replicas.connected.insert(ITEM, senders);
+}
+
+#[tokio::test]
+async fn an_item_is_fully_replicated_only_while_every_replica_is_seen_current() {
+    use crate::api::{Reach, Replication};
+
+    let port = free_port().await;
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = Daemon::open(tailnet("127.0.0.1", &["127.0.0.2"]), a_dir.path(), port)
+        .await
+        .unwrap();
+    let b = Daemon::open(tailnet("127.0.0.2", &["127.0.0.1"]), b_dir.path(), port)
+        .await
+        .unwrap();
+    let _a_servers = a.listen().await.unwrap();
+    let b_servers = b.listen().await.unwrap();
+    track(&a, "docs");
+    b.pull_round().await.unwrap();
+    let b_node = b.db().lock().unwrap().node().clone();
+    b.db()
+        .lock()
+        .unwrap()
+        .add_replica(
+            Timestamp::now(),
+            ITEM,
+            &b_node,
+            Replica::new(AbsPath::new("/srv/b").unwrap()),
+        )
+        .unwrap();
+    a.pull_round().await.unwrap();
+
+    // B's Replica was never read current.
+    let status = a.api().status().await;
+    assert_eq!(
+        status.items[0].replication,
+        Replication::Unconfirmed { oldest: None }
+    );
+
+    let (a_at, b_at) = (Timestamp::from_millis(2_000), Timestamp::from_millis(1_000));
+    confirm_current(&a, "/srv/x", a_at);
+    confirm_current(&b, "/srv/b", b_at);
+    a.pull_round().await.unwrap();
+    let status = a.api().status().await;
+    assert_eq!(status.items[0].replication, Replication::Full);
+
+    // Current, but not connected to every sender, isn't enough.
+    let a_senders = a.replicas.lock().unwrap().connected[&ITEM].clone();
+    a.replicas
+        .lock()
+        .unwrap()
+        .connected
+        .insert(ITEM, BTreeSet::new());
+    let status = a.api().status().await;
+    assert_eq!(
+        status.items[0].replication,
+        Replication::Unconfirmed { oldest: Some(b_at) }
+    );
+    a.replicas
+        .lock()
+        .unwrap()
+        .connected
+        .insert(ITEM, a_senders.clone());
+
+    // Nor is having been connected to every sender before another was
+    // added: B was read before C was.
+    let c_node = NodeId::new("n-127.0.0.9").unwrap();
+    a.db()
+        .lock()
+        .unwrap()
+        .add_replica(
+            Timestamp::now(),
+            ITEM,
+            &c_node,
+            Replica::new(AbsPath::new("/srv/c").unwrap()),
+        )
+        .unwrap();
+    let mut with_c = a_senders;
+    with_c.insert(c_node.clone());
+    a.replicas.lock().unwrap().connected.insert(ITEM, with_c);
+    let status = a.api().status().await;
+    let ours = status.items[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.path == "/srv/x")
+        .unwrap();
+    let theirs = status.items[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.path == "/srv/b")
+        .unwrap();
+    assert!(ours.every_sender && !theirs.every_sender);
+    assert!(matches!(
+        status.items[0].replication,
+        Replication::Unconfirmed { .. }
+    ));
+    a.db()
+        .lock()
+        .unwrap()
+        .remove_replica(Timestamp::now(), ITEM, &c_node)
+        .unwrap();
+    let status = a.api().status().await;
+    assert_eq!(status.items[0].replication, Replication::Full);
+    let reaches: Vec<_> = status
+        .nodes
+        .iter()
+        .map(|node| (node.node.as_str(), &node.reach))
+        .collect();
+    assert!(matches!(
+        &reaches[..],
+        [
+            ("n-127.0.0.1", Reach::Here),
+            ("n-127.0.0.2", Reach::Live { .. })
+        ]
+    ));
+
+    // Once B can't be reached, its state is only as last read.
+    drop(b_servers);
+    a.pull_round().await.unwrap();
+    let status = a.api().status().await;
+    assert_eq!(
+        status.items[0].replication,
+        Replication::Unconfirmed { oldest: Some(b_at) }
+    );
+    assert!(matches!(
+        status.nodes[1].reach,
+        Reach::Unreachable { read_at: Some(_) }
+    ));
+    let theirs = &status.items[0].replicas[1];
+    assert_eq!(
+        (theirs.state.clone(), theirs.confirmed_at),
+        (Some(ReplicaState::Current), Some(b_at))
+    );
+}
+
+#[tokio::test]
+async fn status_flags_shared_names_and_names_nodes_to_upgrade() {
+    use crate::api::Reach;
+
+    let port = free_port().await;
+    let newer = Router::new().route(
+        protocol::HELLO_PATH,
+        get(|| async {
+            axum::Json(Hello {
+                protocol: protocol::MAJOR + 1,
+                heighliner: "9.0.0".into(),
+            })
+        }),
+    );
+    let listener = TcpListener::bind(("127.0.0.3", port)).await.unwrap();
+    tokio::spawn(async move { axum::serve(listener, newer).await });
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.2", &["127.0.0.3"]), dir.path(), port)
+        .await
+        .unwrap();
+    track(&daemon, "docs");
+    {
+        let mut db = daemon.db().lock().unwrap();
+        let node = db.node().clone();
+        db.track(
+            Timestamp::now(),
+            ItemId::from_u128(2),
+            Item::new("docs", Direction::TwoWay),
+            &node,
+            Replica::new(AbsPath::new("/srv/y").unwrap()),
+        )
+        .unwrap();
+    }
+    daemon.pull_round().await.unwrap();
+    let status = daemon.api().status().await;
+    assert!(status.items.iter().all(|item| item.duplicate_name));
+    let newer = status
+        .nodes
+        .iter()
+        .find(|node| node.node.as_str() == "n-127.0.0.3")
+        .unwrap();
+    assert_eq!(
+        newer.reach,
+        Reach::Incompatible {
+            protocol: protocol::MAJOR + 1
+        }
+    );
+}
+
+#[test]
+fn requests_may_name_the_daemon_by_address_or_magicdns_name() {
+    let mut me = device("laptop", OWNER, "100.64.0.1");
+    me.ips.push("fd7a:115c:a1e0::1".parse().unwrap());
+    me.dns_name = "Laptop.tail.ts.net".into();
+    let expected: BTreeSet<String> = [
+        "100.64.0.1:7130",
+        "[fd7a:115c:a1e0::1]:7130",
+        "laptop.tail.ts.net:7130",
+    ]
+    .map(String::from)
+    .into();
+    assert_eq!(hosts(&me, 7130), expected);
+
+    // Without MagicDNS, only by address.
+    me.dns_name.clear();
+    assert_eq!(hosts(&me, 7130).len(), 2);
+}
+
+#[tokio::test]
+async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(tailnet("127.0.0.1", &[]), dir.path(), 1)
+        .await
+        .unwrap();
+    track(&daemon, "docs");
+    let config = daemon.db().lock().unwrap().config();
+    let outcomes = BTreeMap::from([(ITEM, Outcome::Configured)]);
+    daemon.replicas.lock().unwrap().reconciled = Some(Arc::new(Reconciled {
+        config,
+        outcomes: Ok(outcomes),
+    }));
+    // As if an earlier listing were stuck on the Replica's filesystem.
+    let gate: Arc<tokio::sync::Mutex<()>> = daemon
+        .list_gates
+        .lock()
+        .unwrap()
+        .entry(PathBuf::from("/srv/x"))
+        .or_default()
+        .clone();
+    let stuck = gate.lock().await;
+    let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
+    assert!(matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+
+    drop(stuck);
+    let listed = daemon.conflicts().await.remove(&ITEM).unwrap();
+    assert!(!matches!(listed, Err(ActionError::Hung)), "{listed:?}");
+}

@@ -23,11 +23,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::ConfigDb;
+use crate::hlc::Timestamp;
 use crate::http::{self, BoxError};
-use crate::model::{ItemId, ReplicaState};
+use crate::model::{ItemId, NodeId, ReplicaState};
 use crate::record::Store;
 
 /// The major version of the protocol this build speaks.
@@ -52,6 +53,12 @@ pub struct NodeStates {
 pub struct NodeState {
     pub path: String,
     pub state: ReplicaState,
+    /// When its Node last confirmed it current, if ever.
+    #[serde(default)]
+    pub confirmed_at: Option<Timestamp>,
+    /// The Nodes whose Replicas send to it that it was connected to.
+    #[serde(default)]
+    pub connected: BTreeSet<NodeId>,
 }
 
 /// The answer to `GET /node/hello`.

@@ -233,3 +233,71 @@ fn parents_are_resolved_through_symlinks() {
     let (_, path) = node_path("link/../docs", Some(&root.join("project")), &[]);
     assert_eq!(path, root.join("disk/docs").to_str().unwrap());
 }
+
+#[test]
+fn status_names_flags_replication_and_nodes() {
+    use crate::api::{ItemStatus, NodeStatus, ReplicaStatus};
+    use crate::model::{ItemId, ReplicaState, Role};
+
+    let node = |id: &str, name: &str, reach| NodeStatus {
+        node: NodeId::new(id).unwrap(),
+        name: Some(name.to_owned()),
+        ip: None,
+        departed: false,
+        reach,
+    };
+    let at = crate::hlc::Timestamp::from_millis(0);
+    let status = Status {
+        node: NodeId::new("n-a").unwrap(),
+        nodes: vec![
+            node("n-a", "laptop", Reach::Here),
+            node("n-b", "nas", Reach::Unreachable { read_at: Some(at) }),
+            node(
+                "n-c",
+                "old",
+                Reach::Incompatible {
+                    protocol: crate::protocol::MAJOR - 1,
+                },
+            ),
+        ],
+        items: vec![ItemStatus {
+            id: ItemId::from_u128(1),
+            name: "docs".into(),
+            source: None,
+            excludes: Vec::new(),
+            paused: false,
+            retention_days: None,
+            resurrected: true,
+            duplicate_name: true,
+            replication: Replication::Unconfirmed { oldest: Some(at) },
+            replicas: vec![ReplicaStatus {
+                node: NodeId::new("n-b").unwrap(),
+                node_name: Some("nas".into()),
+                path: "/srv/docs".into(),
+                role: Role::Peer,
+                paused: false,
+                departed: false,
+                state: Some(ReplicaState::Current),
+                state_read_at: Some(at),
+                confirmed_at: Some(at),
+                every_sender: false,
+            }],
+        }],
+        problems: Vec::new(),
+    };
+    let text = format_status(&status);
+    let expected = format!(
+        "docs ({}, two-way, resurrected, name shared)
+  not confirmed fully replicated; the oldest confirmation is from 1970-01-01T00:00:00Z
+  nas:/srv/docs peer, is current with only the senders it reaches (as of 1970-01-01T00:00:00Z)
+Nodes:
+  laptop: this Node
+  nas: unreachable; last read at 1970-01-01T00:00:00Z
+  old: speaks protocol {}, not {}; upgrade it
+",
+        ItemId::from_u128(1),
+        crate::protocol::MAJOR - 1,
+        crate::protocol::MAJOR
+    );
+    assert_eq!(text, expected);
+}

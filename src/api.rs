@@ -1,4 +1,4 @@
-//! The daemon's API, which the CLI (and later the web UI) use: its paths
+//! The daemon's API, which the CLI uses and the web UI shows: its paths
 //! and the JSON they take and give.
 //!
 //! It is served with the Node protocol on each Node's Tailscale addresses,
@@ -7,6 +7,7 @@
 //! or machine name. A path on this Node may start with `~`, the daemon's
 //! user's home; a path on another Node must be absolute.
 
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
@@ -51,9 +52,61 @@ pub fn replica(item: &str, node: &str) -> String {
 pub struct Status {
     /// The Node answering.
     pub node: NodeId,
+    /// The Nodes the records name, and the ones that speak another major
+    /// version of the Node protocol.
+    #[serde(default)]
+    pub nodes: Vec<NodeStatus>,
     pub items: Vec<ItemStatus>,
     /// The configuration's problems, as sentences.
     pub problems: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub node: NodeId,
+    /// Its machine name, if the Node is on the tailnet.
+    pub name: Option<String>,
+    /// A Tailscale address of it, if it is on the tailnet.
+    pub ip: Option<IpAddr>,
+    /// Whether it left the Fleet.
+    pub departed: bool,
+    pub reach: Reach,
+}
+
+/// Whether the Node answering can reach a Node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reach", rename_all = "kebab-case")]
+pub enum Reach {
+    /// It is the Node answering.
+    Here,
+    /// Its latest round read the Node's states, at `read_at`.
+    Live { read_at: Timestamp },
+    /// Its latest round couldn't read the Node's states; they were last
+    /// read at `read_at`, if ever.
+    Unreachable { read_at: Option<Timestamp> },
+    /// The Node speaks major version `protocol` of the Node protocol, not
+    /// the answering Node's, so the two exchange nothing until the older one
+    /// is upgraded.
+    Incompatible { protocol: u32 },
+}
+
+/// Whether every copy of an Item is known to be current.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "replication", rename_all = "kebab-case")]
+pub enum Replication {
+    /// Every Replica on a Node still in the Fleet is current and connected
+    /// to every Replica that sends to it, live here or as the answering
+    /// Node's latest round read.
+    Full,
+    /// Not every one is confirmed current now. `oldest` is the oldest time
+    /// one of them was last confirmed so, or none if one never was.
+    Unconfirmed { oldest: Option<Timestamp> },
+}
+
+impl Default for Replication {
+    fn default() -> Self {
+        Self::Unconfirmed { oldest: None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +118,15 @@ pub struct ItemStatus {
     pub excludes: Vec<String>,
     pub paused: bool,
     pub retention_days: Option<NonZeroU32>,
+    /// Whether it was untracked, then brought back by an edit made
+    /// without seeing that.
+    #[serde(default)]
+    pub resurrected: bool,
+    /// Whether another Item has its name.
+    #[serde(default)]
+    pub duplicate_name: bool,
+    #[serde(default)]
+    pub replication: Replication,
     pub replicas: Vec<ReplicaStatus>,
 }
 
@@ -86,6 +148,14 @@ pub struct ReplicaStatus {
     /// When another Node's state was read.
     #[serde(default)]
     pub state_read_at: Option<Timestamp>,
+    /// When its Node last confirmed it current, if ever.
+    #[serde(default)]
+    pub confirmed_at: Option<Timestamp>,
+    /// Whether, when its state was read, it was connected to every Replica
+    /// that sends to it now, so that being current means it has what they
+    /// all have.
+    #[serde(default)]
+    pub every_sender: bool,
 }
 
 /// Tracks a path as a new Item, with its first Replica there, which adopts

@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
@@ -126,8 +126,8 @@ pub enum Error {
     /// None of this device's Tailscale addresses could be listened on, for
     /// example because the tailnet interface isn't up yet.
     NoAddress,
-    /// This device's Tailscale addresses changed since the daemon last
-    /// listened.
+    /// This device's Tailscale addresses or MagicDNS name changed since
+    /// the daemon last listened.
     AddressesChanged,
     /// This device's Tailscale node ID or owner changed since the daemon
     /// started, so its records belong to another identity.
@@ -188,7 +188,9 @@ impl fmt::Display for Error {
             Self::NoAddress => {
                 f.write_str("can't listen on any of this device's Tailscale addresses")
             }
-            Self::AddressesChanged => f.write_str("this device's Tailscale addresses changed"),
+            Self::AddressesChanged => {
+                f.write_str("this device's Tailscale addresses or name changed")
+            }
             Self::IdentityChanged => f.write_str(
                 "this device's Tailscale node ID or owner changed since heighliner started, so its records belong to the old identity",
             ),
@@ -253,7 +255,9 @@ pub struct Daemon<T> {
     replicas: Arc<Mutex<Replicas>>,
     /// Notified after each edit through the API.
     edited: Arc<Notify>,
-    remote: RemoteStates,
+    remote: Arc<Mutex<Remote>>,
+    changes: Changes,
+    list_gates: conflicts::ListGates,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -296,9 +300,25 @@ struct Reconciled {
     outcomes: Result<BTreeMap<ItemId, Outcome>, String>,
 }
 
-/// The other Nodes' Replicas' states, as last read in a round, and when.
-type RemoteStates =
-    Arc<Mutex<BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, protocol::NodeState>)>>>;
+/// What the rounds learned of the other Nodes.
+#[derive(Clone, Debug, Default)]
+struct Remote {
+    /// Each Node's Replicas' states, as last read, and when.
+    states: BTreeMap<NodeId, (Timestamp, BTreeMap<ItemId, protocol::NodeState>)>,
+    /// The Nodes whose states the latest round read.
+    live: BTreeSet<NodeId>,
+    /// The Nodes that spoke another major version of the Node protocol in
+    /// the latest round, and theirs.
+    incompatible: BTreeMap<NodeId, u32>,
+}
+
+/// Signalled whenever what the API shows may have changed, so that the web
+/// UI can show it.
+type Changes = Arc<watch::Sender<()>>;
+
+fn signal(changes: &Changes) {
+    changes.send_replace(());
+}
 
 /// This Node's Replicas, as last seen in Syncthing.
 struct Replicas {
@@ -319,6 +339,19 @@ struct Replicas {
     last_current: BTreeMap<ItemId, Confirmed>,
     /// The state last logged for each Replica, to log changes only.
     logged: BTreeMap<ItemId, ReplicaState>,
+    /// The senders each Replica was connected to when its state was read.
+    connected: BTreeMap<ItemId, BTreeSet<NodeId>>,
+}
+
+impl Replicas {
+    /// When `item`'s Replica at `path` was last confirmed current, if ever.
+    fn confirmed(&self, item: &ItemId, path: &AbsPath) -> Option<Timestamp> {
+        self.current
+            .get(item)
+            .or_else(|| self.last_current.get(item))
+            .filter(|confirmed| confirmed.path == *path)
+            .map(|confirmed| confirmed.at)
+    }
 }
 
 impl<T: LocalApi + Clone> Daemon<T> {
@@ -357,6 +390,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             current: BTreeMap::new(),
             last_current,
             logged: BTreeMap::new(),
+            connected: BTreeMap::new(),
         }));
         let state = Arc::new(StateFile {
             path: state_file,
@@ -376,6 +410,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
             replicas,
             edited: Arc::default(),
             remote: Arc::default(),
+            changes: Arc::new(watch::Sender::new(())),
+            list_gates: Arc::default(),
         })
     }
 
@@ -416,6 +452,22 @@ impl<T: LocalApi + Clone> Daemon<T> {
         }
     }
 
+    /// What the API's and the web UI's handlers share.
+    fn api(&self) -> api::Api<T> {
+        api::Api {
+            db: self.db.clone(),
+            replicas: self.replicas.clone(),
+            tailscale: self.api.clone(),
+            edited: self.edited.clone(),
+            remote: self.remote.clone(),
+            conflicts: self.conflict_ops(),
+            state: self.state.clone(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            port: self.port,
+            changes: self.changes.clone(),
+        }
+    }
+
     /// Starts serving the Node protocol on each of this device's Tailscale
     /// addresses. An address that isn't configured on this machine is
     /// skipped, unless none can be used.
@@ -433,27 +485,11 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 Err(source) => return Err(Error::Listen { addr, source }),
             };
             tracing::info!(%addr, "serving the Node protocol and the API");
-            let api = api::Api {
-                db: self.db.clone(),
-                replicas: self.replicas.clone(),
-                tailscale: self.api.clone(),
-                edited: self.edited.clone(),
-                remote: self.remote.clone(),
-                conflicts: self.conflict_ops(),
-                state: self.state.clone(),
-                home: std::env::var_os("HOME").map(PathBuf::from),
-            };
-            let hosts = self
-                .tailnet
-                .me()
-                .ips
-                .iter()
-                .map(|ip| SocketAddr::new(*ip, self.port).to_string())
-                .collect();
-            let router = auth::only_for_hosts(
-                protocol::router(self.db.clone()).merge(api::router(api)),
-                hosts,
-            );
+            let api = self.api();
+            let router = protocol::router(self.db.clone())
+                .merge(api::router(api.clone()))
+                .merge(ui::router(api));
+            let router = auth::only_for_hosts(router, hosts(self.tailnet.me(), self.port));
             servers.spawn(auth::serve(listener, router, authorizer.clone()));
         }
         if servers.is_empty() {
@@ -465,20 +501,20 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Pulls and merges the records of every Node that answers, drops
     /// versions older than the Retention Window, then saves.
     pub async fn pull_round(&self) -> Result<Round, Error> {
-        let tailnet = self.api.status().await?;
+        let tailnet = match self.api.status().await {
+            Ok(tailnet) => tailnet,
+            Err(error) => {
+                // No Node can be reached without Tailscale.
+                self.remote.lock().unwrap().live.clear();
+                signal(&self.changes);
+                return Err(error.into());
+            }
+        };
         let identity = |tailnet: &Tailnet| (tailnet.me().id.clone(), tailnet.owner());
         if identity(&tailnet) != identity(&self.tailnet) {
             return Err(Error::IdentityChanged);
         }
-        let addresses = |tailnet: &Tailnet| {
-            tailnet
-                .me()
-                .ips
-                .iter()
-                .copied()
-                .collect::<BTreeSet<IpAddr>>()
-        };
-        if addresses(&tailnet) != addresses(&self.tailnet) {
+        if hosts(tailnet.me(), self.port) != hosts(self.tailnet.me(), self.port) {
             return Err(Error::AddressesChanged);
         }
         let mut round = Round::default();
@@ -491,19 +527,13 @@ impl<T: LocalApi + Clone> Daemon<T> {
         {
             match hello {
                 Ok(hello) if hello.protocol == protocol::MAJOR => {
-                    let remote = self.remote.clone();
                     pulls.spawn(async move {
                         let pulled = protocol::pull(addr, &hello, PULL_TIMEOUT).await;
-                        // Only shown, so a Node that can't answer keeps its
-                        // last-known states.
-                        if let Ok(read) = protocol::states(addr, PULL_TIMEOUT).await {
-                            let read_at = Timestamp::now();
-                            remote
-                                .lock()
-                                .unwrap()
-                                .insert(device.id.clone(), (read_at, read.states));
-                        }
-                        (device, pulled)
+                        let read = protocol::states(addr, PULL_TIMEOUT)
+                            .await
+                            .ok()
+                            .map(|read| (Timestamp::now(), read.states));
+                        (device, pulled, read)
                     });
                 }
                 Ok(hello) => {
@@ -522,8 +552,12 @@ impl<T: LocalApi + Clone> Daemon<T> {
         }
         // Merge each Node's records as they arrive, so a slow Node doesn't
         // hold up the rest.
+        let mut read = BTreeMap::new();
         while let Some(joined) = pulls.join_next().await {
-            let (device, pulled) = joined.expect("pull tasks don't panic");
+            let (device, pulled, states) = joined.expect("pull tasks don't panic");
+            if let Some(states) = states {
+                read.insert(device.id.clone(), states);
+            }
             match pulled {
                 Ok((store, skipped)) => {
                     if skipped > 0 {
@@ -549,6 +583,20 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 }
             }
         }
+        // Published together, so that what is live is all from this round.
+        // States are only shown, so a Node that can't answer keeps its
+        // last-known ones.
+        {
+            let mut remote = self.remote.lock().unwrap();
+            remote.live = read.keys().cloned().collect();
+            remote.states.extend(read);
+            remote.incompatible = round
+                .incompatible
+                .iter()
+                .map(|(node, hello)| (node.clone(), hello.protocol))
+                .collect();
+        }
+        signal(&self.changes);
         // Keep what was merged even if configuring Syncthing, which can be
         // slow, is interrupted.
         self.save()?;
@@ -565,6 +613,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             "pull round done"
         );
         self.save()?;
+        signal(&self.changes);
         Ok(round)
     }
 
@@ -627,8 +676,19 @@ impl<T: LocalApi + Clone> Daemon<T> {
         // Taken before reading, so that a confirmation is never dated later
         // than it happened.
         let read_at = Timestamp::now();
-        let mut states = match &reconciled.outcomes {
-            Ok(outcomes) => driver.states(config, &me, outcomes).await,
+        let observed = match &reconciled.outcomes {
+            Ok(outcomes) => driver.observe_all(config, &me, outcomes).await,
+            Err(_) => BTreeMap::new(),
+        };
+        let connected: BTreeMap<ItemId, BTreeSet<NodeId>> = observed
+            .iter()
+            .map(|(item, observed)| (*item, observed.connected.clone()))
+            .collect();
+        let mut states: BTreeMap<ItemId, ReplicaState> = match &reconciled.outcomes {
+            Ok(_) => observed
+                .into_iter()
+                .map(|(item, observed)| (item, observed.state))
+                .collect(),
             Err(reason) => config
                 .replicas_on(&me)
                 .into_iter()
@@ -642,6 +702,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         if number < replicas.applied {
             return;
         }
+        replicas.connected = connected;
         replicas.applied = number;
         let Replicas {
             states: before,
@@ -721,6 +782,8 @@ impl<T: LocalApi + Clone> Daemon<T> {
             .filter_map(|item| Some((*item, path_of(item)?.clone())))
             .collect();
         *before = states;
+        drop(replicas);
+        signal(&self.changes);
     }
 
     /// This Node's Replicas' states, as last read.
@@ -743,6 +806,19 @@ impl<T: LocalApi + Clone> Daemon<T> {
     pub fn save(&self) -> Result<(), Error> {
         self.state.save()
     }
+}
+
+/// The `Host`s a request to `device`'s daemon on `port` may name: its
+/// Tailscale addresses and its full MagicDNS name, if it has one. Not its
+/// short name, which whatever network the browser is on may answer for.
+fn hosts(device: &tailscale::Device, port: u16) -> BTreeSet<String> {
+    let addrs = device
+        .ips
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, port).to_string());
+    let name = (!device.dns_name.is_empty())
+        .then(|| format!("{}:{port}", device.dns_name.to_ascii_lowercase()));
+    addrs.chain(name).collect()
 }
 
 /// The state file's contents for `db`, a copy of `owner`'s Fleet.
@@ -899,7 +975,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     {
         let (queue, replicas) = (queue.clone(), daemon.replicas.clone());
         let me = daemon.db.lock().unwrap().node().clone();
-        tasks.spawn(async move { queue.work(replicas, me).await });
+        let changes = daemon.changes.clone();
+        tasks.spawn(async move { queue.work(replicas, me, changes).await });
     }
     if let Some(driver) = daemon.driver.clone() {
         let (changed, queue) = (changed.clone(), queue.clone());
@@ -949,7 +1026,7 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
                 };
                 match round {
                 Err(Error::AddressesChanged) => {
-                    tracing::info!("this device's Tailscale addresses changed; listening on the new ones");
+                    tracing::info!("this device's Tailscale addresses or name changed; listening anew");
                     // Stop the servers and their connections first, so the
                     // port is free on addresses that stay.
                     servers.shutdown().await;
@@ -996,6 +1073,7 @@ async fn open_when_ready(
 
 mod api;
 mod conflicts;
+mod ui;
 
 pub use conflicts::ActionError;
 

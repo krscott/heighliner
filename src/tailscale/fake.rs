@@ -18,6 +18,7 @@ pub(crate) fn device(name: &str, user: UserId, ip: &str) -> Device {
     Device {
         id: NodeId::new(format!("n-{name}")).unwrap(),
         name: name.to_owned(),
+        dns_name: format!("{name}.tail.ts.net"),
         user,
         tagged: false,
         ips: vec![ip.parse().unwrap()],

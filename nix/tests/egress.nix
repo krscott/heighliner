@@ -68,14 +68,17 @@ pkgs.testers.runNixOSTest {
 
     with subtest("The services reach this machine, but nothing outside the tailnet"):
         machine.succeed("curl -sf --max-time 5 http://outside/")
+        outside6 = outside.succeed("ip -6 -o addr show dev eth1 scope global | awk '{print $4}' | cut -d/ -f1").strip()
+        machine.succeed(f"curl -sf --max-time 5 'http://[{outside6}]/'")
         machine.succeed("${pkgs.python3}/bin/python3 -m http.server --bind 127.0.0.1 8000 >/dev/null 2>&1 &")
         machine.wait_for_open_port(8000)
         for unit in ["heighliner-syncthing.service", "heighliner.service"]:
             machine.succeed(f"in-unit {unit} curl -sf --max-time 5 http://127.0.0.1:8000/")
             # The filter drops the packets, so curl times out, where the
             # machine itself reached the same host.
-            code, _ = machine.execute(f"in-unit {unit} curl -sf --max-time 3 http://outside/")
-            assert code == 28, f"{unit}: curl exited {code}"
+            for url in ["http://outside/", f"http://[{outside6}]/"]:
+                code, _ = machine.execute(f"in-unit {unit} curl -gsf --max-time 3 '{url}'")
+                assert code == 28, f"{unit}: curl {url} exited {code}"
 
     with subtest("The ports are open only on Tailscale's interface"):
         rules = machine.succeed("iptables -S nixos-fw")

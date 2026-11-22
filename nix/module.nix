@@ -91,8 +91,8 @@ let
       "AF_INET6"
       "AF_NETLINK"
     ];
+    # Not PrivateTmp: a Replica may be anywhere the user can write.
     NoNewPrivileges = true;
-    PrivateTmp = true;
     PrivateDevices = true;
     ProtectSystem = "full";
     ProtectKernelTunables = true;

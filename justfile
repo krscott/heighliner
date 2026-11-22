@@ -98,7 +98,8 @@ vm-test *names:
     set -euo pipefail
     names=("$@")
     if (($# == 0)); then
-        read -ra names < <(nix eval --raw .#vmTests --apply 'tests: toString (builtins.attrNames tests)')
+        all=$(nix eval --raw .#vmTests --apply 'tests: toString (builtins.attrNames tests)')
+        read -ra names <<<"$all"
     fi
     for name in "${names[@]}"; do
         nix build -L --no-link --no-update-lock-file ".#vmTests.$name"

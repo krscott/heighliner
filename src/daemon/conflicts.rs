@@ -2,18 +2,18 @@
 //! swapping them.
 //!
 //! Conflict copies are moved into the store by a worker, away from the
-//! async runtime, so a slow or hung filesystem holds up only the worker.
-//! It looks in the directory of each item Syncthing finishes syncing,
-//! which is where Syncthing leaves a conflict's copy. It also sweeps every
-//! Replica, expiring old conflicts too, after the daemon's first round,
-//! daily, and whenever events may have been missed. Waiting work names
-//! Items, not paths, so each run uses the Replicas' current paths and
-//! Retention Windows; it is merged, and when there is too much it becomes
-//! one sweep, so it stays bounded.
+//! async runtime. It runs at most one job at a time in each Replica, and
+//! Replicas' jobs run side by side, so a slow or hung filesystem holds up
+//! only its own Replicas. It looks in the directory of each item Syncthing
+//! finishes syncing, which is where Syncthing leaves a conflict's copy. It
+//! also sweeps every Replica, expiring old conflicts too, after the
+//! daemon's first round, daily, and whenever events may have been missed.
+//! Waiting work names Items, not paths, so each job uses its Replica's
+//! current path and Retention Window; it is merged, and when there is too
+//! much it becomes one sweep, so it stays bounded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -72,44 +72,40 @@ fn roots(replicas: &Mutex<Replicas>, me: &NodeId, retention: Duration) -> Vec<Ro
         .collect()
 }
 
-/// Work waiting for the conflict worker.
-#[derive(Debug, Default)]
-struct Waiting {
-    dirs: BTreeMap<ItemId, BTreeSet<String>>,
-    count: usize,
-    sweep: bool,
+/// The Items with a Replica on this Node (`me`) in the last reconcile's
+/// records, configured or not, if there was one.
+fn declared(replicas: &Mutex<Replicas>, me: &NodeId) -> Option<BTreeSet<ItemId>> {
+    let reconciled = replicas.lock().unwrap().reconciled.clone()?;
+    Some(
+        reconciled
+            .config
+            .replicas_on(me)
+            .into_iter()
+            .map(|local| local.item_id)
+            .collect(),
+    )
 }
 
-impl Waiting {
-    fn is_empty(&self) -> bool {
-        !self.sweep && self.dirs.is_empty()
-    }
+/// A job for the conflict worker in one Replica.
+#[derive(Debug, PartialEq, Eq)]
+enum Work {
+    /// Look in these directories.
+    Dirs(BTreeSet<String>),
+    /// Look everywhere, and expire old conflicts.
+    Sweep,
+}
 
-    fn swept() -> Self {
-        Self {
-            sweep: true,
-            ..Self::default()
-        }
-    }
-
-    fn add(&mut self, item: ItemId, dir: String) {
-        // A sweep looks everywhere anyway.
-        if self.sweep {
-            return;
-        }
-        if self.dirs.entry(item).or_default().insert(dir) {
-            self.count += 1;
-        }
-        if self.count > MAX_WAITING_DIRS {
-            *self = Self::swept();
-        }
-    }
-
-    fn run(self, roots: Vec<Root>) {
-        for root in roots {
-            if self.sweep {
-                report(&root, conflicts::sweep(&root.path));
-                let Root { item, name, .. } = &root;
+impl Work {
+    fn run(self, root: &Root) {
+        match self {
+            Self::Dirs(dirs) => {
+                for dir in dirs {
+                    report(root, conflicts::collect(&root.path, &dir));
+                }
+            }
+            Self::Sweep => {
+                report(root, conflicts::sweep(&root.path));
+                let Root { item, name, .. } = root;
                 match conflicts::expire(&root.path, root.retention, Timestamp::now()) {
                     Ok(0) | Err(conflicts::Error::NotMounted) => {}
                     Ok(removed) => {
@@ -119,12 +115,90 @@ impl Waiting {
                         tracing::warn!(%item, %name, %error, "can't expire data conflicts")
                     }
                 }
-            } else if let Some(dirs) = self.dirs.get(&root.item) {
-                for dir in dirs {
-                    report(&root, conflicts::collect(&root.path, dir));
+            }
+        }
+    }
+}
+
+/// Work waiting for the conflict worker.
+#[derive(Debug, Default)]
+struct Waiting {
+    /// Each Item's job, for its Replica on this Node. Only Items with one
+    /// are kept, so there are at most as many as there are Items.
+    items: BTreeMap<ItemId, Work>,
+    /// How many directories `items` names, at most [`MAX_WAITING_DIRS`].
+    dirs: usize,
+    /// Every configured Replica is to be swept, whatever `items` says.
+    sweep: bool,
+}
+
+impl Waiting {
+    /// Sweeps every Replica configured when the work is taken.
+    fn sweep_all(&mut self) {
+        self.sweep = true;
+    }
+
+    fn add(&mut self, item: ItemId, dir: String) {
+        let work = self
+            .items
+            .entry(item)
+            .or_insert_with(|| Work::Dirs(BTreeSet::new()));
+        if let Work::Dirs(dirs) = work
+            && dirs.insert(dir)
+        {
+            self.dirs += 1;
+        }
+        // Each Item with too many becomes a sweep of its Replica.
+        if self.dirs > MAX_WAITING_DIRS {
+            for work in self.items.values_mut() {
+                *work = Work::Sweep;
+            }
+            self.dirs = 0;
+        }
+    }
+
+    /// Takes the jobs of `roots` but those at the paths in `busy`, which
+    /// stay waiting, as does the work of Items whose Replica isn't in
+    /// `roots`, unless `declared` says they have none on this Node.
+    fn take(
+        &mut self,
+        roots: Vec<Root>,
+        declared: Option<&BTreeSet<ItemId>>,
+        busy: &BTreeSet<PathBuf>,
+    ) -> Vec<(Root, Work)> {
+        if let Some(declared) = declared {
+            let dirs = &mut self.dirs;
+            self.items.retain(|item, work| {
+                let kept = declared.contains(item);
+                if let (false, Work::Dirs(dropped)) = (kept, &*work) {
+                    *dirs -= dropped.len();
+                }
+                kept
+            });
+        }
+        // A sweep waits until a reconcile configures some. Work for Items
+        // with no configured Replica keeps waiting for theirs.
+        if self.sweep && !roots.is_empty() {
+            self.sweep = false;
+            for root in &roots {
+                if let Some(Work::Dirs(dirs)) = self.items.insert(root.item, Work::Sweep) {
+                    self.dirs -= dirs.len();
                 }
             }
         }
+        let mut jobs = Vec::new();
+        for root in roots {
+            if busy.contains(&root.path) {
+                continue;
+            }
+            if let Some(work) = self.items.remove(&root.item) {
+                if let Work::Dirs(dirs) = &work {
+                    self.dirs -= dirs.len();
+                }
+                jobs.push((root, work));
+            }
+        }
+        jobs
     }
 }
 
@@ -169,7 +243,7 @@ impl Queue {
                 let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
                 waiting.add(item, dir.to_owned());
             }
-            Seen::Missed => *waiting = Waiting::swept(),
+            Seen::Missed => waiting.sweep_all(),
         }
         drop(waiting);
         self.ready.notify_one();
@@ -177,7 +251,7 @@ impl Queue {
 
     /// Queues a sweep of every configured Replica.
     pub(super) fn sweep(&self) {
-        *self.waiting.lock().unwrap() = Waiting::swept();
+        self.waiting.lock().unwrap().sweep_all();
         self.ready.notify_one();
     }
 
@@ -187,26 +261,9 @@ impl Queue {
         self.ready.notify_one();
     }
 
-    fn take(&self) -> Waiting {
-        mem::take(&mut *self.waiting.lock().unwrap())
-    }
-
-    fn give_back(&self, back: Waiting) {
-        let mut waiting = self.waiting.lock().unwrap();
-        if back.sweep {
-            *waiting = Waiting::swept();
-        } else {
-            for (item, dirs) in back.dirs {
-                for dir in dirs {
-                    waiting.add(item, dir);
-                }
-            }
-        }
-    }
-
     /// Runs the waiting work as it arrives, in `me`'s configured Replicas
-    /// as `replicas` has them then, signalling `changes` after each run.
-    /// Runs until it is dropped.
+    /// as `replicas` has them then, at most one job at a time in each,
+    /// signalling `changes` after each job. Runs until it is dropped.
     pub(super) async fn work(
         &self,
         replicas: Arc<Mutex<Replicas>>,
@@ -214,42 +271,49 @@ impl Queue {
         retention: Duration,
         changes: Changes,
     ) {
+        let mut running = tokio::task::JoinSet::new();
+        let mut busy = BTreeSet::new();
         loop {
-            self.ready.notified().await;
-            let waiting = self.take();
-            if waiting.is_empty() {
-                continue;
+            tokio::select! {
+                () = self.ready.notified() => {}
+                Some(done) = running.join_next() => {
+                    busy.remove(&done.expect("only dropping the worker cancels its jobs"));
+                    signal(&changes);
+                }
             }
             let roots = roots(&replicas, &me, retention);
-            if roots.is_empty() {
-                // Until a reconcile configures some.
-                self.give_back(waiting);
-                continue;
+            let declared = declared(&replicas, &me);
+            let jobs = self
+                .waiting
+                .lock()
+                .unwrap()
+                .take(roots, declared.as_ref(), &busy);
+            for (root, work) in jobs {
+                busy.insert(root.path.clone());
+                running.spawn(async move {
+                    let path = root.path.clone();
+                    // Each move is one rename, so a job cut short by the
+                    // daemon stopping leaves no file half moved.
+                    let _ = tokio::task::spawn_blocking(move || work.run(&root)).await;
+                    path
+                });
             }
-            // Directories of Replicas not configured yet wait for them.
-            let mut waiting = waiting;
-            let mut later = Waiting::default();
-            if !waiting.sweep {
-                let ready: BTreeSet<ItemId> = roots.iter().map(|root| root.item).collect();
-                let (now, not_yet) = mem::take(&mut waiting.dirs)
-                    .into_iter()
-                    .partition(|(item, _)| ready.contains(item));
-                waiting.dirs = now;
-                later.dirs = not_yet;
-            }
-            self.give_back(later);
-            // Each move is one rename, so work cut short by the daemon
-            // stopping leaves no file half moved.
-            let _ = tokio::task::spawn_blocking(move || waiting.run(roots)).await;
-            signal(&changes);
         }
     }
 
     /// Runs the waiting work now.
     #[cfg(test)]
     pub(super) fn run_now(&self, replicas: &Mutex<Replicas>, me: &NodeId) {
-        self.take()
-            .run(roots(replicas, me, super::RETENTION_WINDOW));
+        let roots = roots(replicas, me, super::RETENTION_WINDOW);
+        let declared = declared(replicas, me);
+        let jobs = self
+            .waiting
+            .lock()
+            .unwrap()
+            .take(roots, declared.as_ref(), &BTreeSet::new());
+        for (root, work) in jobs {
+            work.run(&root);
+        }
     }
 }
 
@@ -420,7 +484,12 @@ impl Conflicts {
     /// store and expiring old conflicts.
     pub(super) async fn sweep(&self) {
         let roots = self.roots();
-        let _ = tokio::task::spawn_blocking(move || Waiting::swept().run(roots)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            for root in roots {
+                Work::Sweep.run(&root);
+            }
+        })
+        .await;
     }
 
     /// The Data Conflicts kept on this Node, for each Replica whose folder
@@ -583,6 +652,106 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    fn root(item: u128, path: &str) -> Root {
+        Root {
+            item: ItemId::from_u128(item),
+            name: String::new(),
+            path: PathBuf::from(path),
+            retention: super::super::RETENTION_WINDOW,
+        }
+    }
+
+    fn dirs(names: &[&str]) -> Work {
+        Work::Dirs(names.iter().map(|&name| name.to_owned()).collect())
+    }
+
+    #[test]
+    fn a_busy_replica_holds_up_only_its_own_work() {
+        let mut waiting = Waiting::default();
+        for item in 1..=3 {
+            waiting.add(ItemId::from_u128(item), "docs".to_owned());
+        }
+        waiting.add(ItemId::from_u128(1), "more".to_owned());
+        let roots = || vec![root(1, "/srv/a"), root(2, "/srv/b")];
+        let busy = BTreeSet::from([PathBuf::from("/srv/a")]);
+        let jobs = waiting.take(roots(), None, &busy);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0.path, PathBuf::from("/srv/b"));
+        assert_eq!(jobs[0].1, dirs(&["docs"]));
+        // The busy Replica's, and that of an Item with no Replica yet, wait.
+        assert_eq!(waiting.dirs, 3);
+        let jobs = waiting.take(roots(), None, &BTreeSet::new());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1, dirs(&["docs", "more"]));
+        assert_eq!(waiting.dirs, 1);
+        assert!(waiting.items.contains_key(&ItemId::from_u128(3)));
+    }
+
+    #[test]
+    fn a_sweep_is_a_job_in_every_replica() {
+        let mut waiting = Waiting::default();
+        waiting.add(ItemId::from_u128(1), "docs".to_owned());
+        waiting = Waiting::default();
+        waiting.sweep_all();
+        // Until there are Replicas.
+        assert!(waiting.take(Vec::new(), None, &BTreeSet::new()).is_empty());
+        assert!(waiting.sweep);
+        waiting.add(ItemId::from_u128(1), "docs".to_owned());
+        let busy = BTreeSet::from([PathBuf::from("/srv/a")]);
+        let jobs = waiting.take(vec![root(1, "/srv/a"), root(2, "/srv/b")], None, &busy);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1, Work::Sweep);
+        assert_eq!(waiting.items.get(&ItemId::from_u128(1)), Some(&Work::Sweep));
+        // An Item with no configured Replica keeps its directories.
+        waiting.add(ItemId::from_u128(3), "docs".to_owned());
+        waiting.sweep_all();
+        let jobs = waiting.take(vec![root(2, "/srv/b")], None, &BTreeSet::new());
+        assert_eq!(jobs[0].1, Work::Sweep);
+        assert_eq!(
+            waiting.items.get(&ItemId::from_u128(3)),
+            Some(&dirs(&["docs"]))
+        );
+        assert_eq!(waiting.dirs, 1);
+        // A directory adds nothing to a sweep.
+        waiting.add(ItemId::from_u128(1), "docs".to_owned());
+        assert_eq!(waiting.dirs, 1);
+        let jobs = waiting.take(vec![root(1, "/srv/a")], None, &BTreeSet::new());
+        assert_eq!(jobs[0].1, Work::Sweep);
+    }
+
+    #[test]
+    fn too_many_waiting_directories_become_sweeps() {
+        let mut waiting = Waiting::default();
+        waiting.add(ItemId::from_u128(2), "docs".to_owned());
+        for n in 0..MAX_WAITING_DIRS {
+            waiting.add(ItemId::from_u128(1), n.to_string());
+        }
+        assert!(!waiting.sweep && waiting.dirs == 0);
+        for item in [1, 2] {
+            assert_eq!(
+                waiting.items.get(&ItemId::from_u128(item)),
+                Some(&Work::Sweep)
+            );
+        }
+    }
+
+    #[test]
+    fn work_for_a_removed_replica_is_dropped() {
+        let mut waiting = Waiting::default();
+        for item in 1..=2 {
+            waiting.add(ItemId::from_u128(item), "docs".to_owned());
+        }
+        let declared = BTreeSet::from([ItemId::from_u128(1)]);
+        // Neither is configured, but only the first still has a Replica here.
+        assert!(
+            waiting
+                .take(Vec::new(), Some(&declared), &BTreeSet::new())
+                .is_empty()
+        );
+        assert_eq!(waiting.items.len(), 1);
+        assert_eq!(waiting.dirs, 1);
     }
 
     #[tokio::test]

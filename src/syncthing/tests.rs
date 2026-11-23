@@ -316,7 +316,7 @@ async fn only_the_owners_devices_with_addresses_are_configured() {
     for (name, at) in [("gone", "/srv/gone"), ("tagged", "/srv/tagged")] {
         let mut other = ConfigDb::new(node(name), Store::default());
         other
-            .set_device_id(Timestamp::now(), DeviceId::new(SOME_ID).unwrap())
+            .publish(Timestamp::now(), DeviceId::new(SOME_ID).unwrap(), None)
             .unwrap();
         db.merge(other.store(), Timestamp::now());
         db.add_replica(Timestamp::now(), ITEM, &node(name), Replica::new(path(at)))
@@ -362,15 +362,17 @@ impl Pair {
         replica.mirror = b_mirror;
         db.add_replica(Timestamp::now(), ITEM, &node("b"), replica)
             .unwrap();
-        db.set_device_id(
+        db.publish(
             Timestamp::now(),
             a.driver.client().device_id().await.unwrap(),
+            None,
         )
         .unwrap();
         let mut b_db = ConfigDb::new(node("b"), Store::default());
-        b_db.set_device_id(
+        b_db.publish(
             Timestamp::now(),
             b.driver.client().device_id().await.unwrap(),
+            None,
         )
         .unwrap();
         db.merge(b_db.store(), Timestamp::now());
@@ -844,7 +846,7 @@ async fn replica_states_follow_syncthing() {
     // A third peer, which isn't running: B is still current with A, and
     // connected to A alone.
     let mut x = ConfigDb::new(node("x"), Store::default());
-    x.set_device_id(Timestamp::now(), DeviceId::new(SOME_ID).unwrap())
+    x.publish(Timestamp::now(), DeviceId::new(SOME_ID).unwrap(), None)
         .unwrap();
     pair.db.merge(x.store(), Timestamp::now());
     pair.db
@@ -963,7 +965,7 @@ async fn a_sender_syncthing_doesnt_know_is_unreachable() {
     // configured.
     let mut db = added(&syncthing.dir("docs"), false);
     let mut x = ConfigDb::new(node("x"), Store::default());
-    x.set_device_id(Timestamp::now(), DeviceId::new(SOME_ID).unwrap())
+    x.publish(Timestamp::now(), DeviceId::new(SOME_ID).unwrap(), None)
         .unwrap();
     db.merge(x.store(), Timestamp::now());
     let report = syncthing.reconcile(&db.config(), &alone()).await;

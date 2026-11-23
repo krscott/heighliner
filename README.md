@@ -69,11 +69,11 @@ options, such as `retentionDays`.
 
 The CLI asks the local daemon, or another Node's with `--on <node>`. Paths are
 `node:path`, or this Node's when the Node is left out. A path on another Node
-must be absolute.
+is absolute or starts with `~`, the home of the user heighliner runs as there.
 
 ```sh
 heighliner track ~/docs                       # Track a directory as an Item
-heighliner sync docs desktop:/home/alice/docs # Add a Replica on another Node
+heighliner sync docs desktop:~/docs           # Add a Replica on another Node
 heighliner sync docs nas:/srv/docs --mirror   # One that only receives
 heighliner status                             # Each Item's Replicas and their state
 heighliner conflicts                          # This Node's Data Conflicts

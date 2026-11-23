@@ -720,13 +720,22 @@ impl ConfigDb {
         self.edit(|db| db.delete(now, key))
     }
 
-    /// Publishes this Node's Syncthing device ID.
-    /// Does nothing if it is unchanged.
-    pub fn set_device_id(&mut self, now: Timestamp, device_id: DeviceId) -> Result<(), EditError> {
+    /// Publishes this Node's Syncthing device ID and its daemon's user's
+    /// home. Does nothing if they are unchanged.
+    pub fn publish(
+        &mut self,
+        now: Timestamp,
+        device_id: DeviceId,
+        home: Option<AbsPath>,
+    ) -> Result<(), EditError> {
         let key = node_key(self.node());
-        let mut info = NodeInfo::new(device_id);
+        let mut info = NodeInfo::new(device_id, home);
         match self.config().nodes.remove(self.node()) {
-            Some(original) if original.device_id == info.device_id => return Ok(()),
+            Some(original)
+                if (&original.device_id, &original.home) == (&info.device_id, &info.home) =>
+            {
+                return Ok(());
+            }
             Some(original) => info.keep_unknown_fields(original),
             None if is_live(self.store.get(&key)) => return Err(EditError::Unreadable(key)),
             None => {}

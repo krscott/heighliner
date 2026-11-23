@@ -695,12 +695,13 @@ async fn a_node_leaves_through_the_api() {
         .db()
         .lock()
         .unwrap()
-        .set_device_id(
+        .publish(
             Timestamp::now(),
             crate::model::DeviceId::new(
                 "MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD",
             )
             .unwrap(),
+            None,
         )
         .unwrap();
     client.leave().await.unwrap();

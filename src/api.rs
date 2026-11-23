@@ -4,8 +4,8 @@
 //! It is served with the Node protocol on each Node's Tailscale addresses,
 //! so the same ownership check authorizes every request (ADR-0003). Items
 //! are named by ID or, when only one has it, by name, and Nodes by node ID
-//! or machine name. A path on this Node may start with `~`, the daemon's
-//! user's home; a path on another Node must be absolute.
+//! or machine name. A path is absolute or starts with `~`, the home of
+//! the daemon's user on the path's Node.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;

@@ -261,6 +261,9 @@ pub struct Daemon<T> {
     /// How long superseded record versions, tombstones and the Displaced
     /// Versions of Items without their own Retention Window are kept.
     retention: Duration,
+    /// The daemon's user's home, which `~` in a path on this Node stands
+    /// for, if `HOME` names a normalized absolute path.
+    home: Option<AbsPath>,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -416,6 +419,9 @@ impl<T: LocalApi + Clone> Daemon<T> {
             changes: Arc::new(watch::Sender::new(())),
             conflict_gates: Arc::default(),
             retention: RETENTION_WINDOW,
+            home: std::env::var("HOME")
+                .ok()
+                .and_then(|home| AbsPath::new(crate::api::normalize(&home)).ok()),
         })
     }
 
@@ -473,7 +479,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             remote: self.remote.clone(),
             conflicts: self.conflict_ops(),
             state: self.state.clone(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home: self.home.clone(),
             port: self.port,
             changes: self.changes.clone(),
         }
@@ -645,13 +651,13 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 return None;
             }
         };
-        if let Err(error) = self
-            .db
-            .lock()
-            .unwrap()
-            .set_device_id(Timestamp::now(), device_id.clone())
+        if let Err(error) =
+            self.db
+                .lock()
+                .unwrap()
+                .publish(Timestamp::now(), device_id.clone(), self.home.clone())
         {
-            tracing::warn!(%error, "can't publish this Node's Syncthing device ID");
+            tracing::warn!(%error, "can't publish this Node's record");
         }
         let config = self.db.lock().unwrap().config();
         match driver.reconcile(&config, tailnet, &device_id).await {

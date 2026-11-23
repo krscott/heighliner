@@ -20,6 +20,7 @@ rustPlatform.buildRustPackage {
         ./.githooks
         ./.github
         ./GLOSSARY.md
+        ./LICENSE
         ./README.md
         ./default.nix
         ./docs
@@ -36,5 +37,8 @@ rustPlatform.buildRustPackage {
   # The Syncthing driver's tests run real Syncthing instances.
   nativeCheckInputs = [ syncthing ];
 
-  meta.mainProgram = "heighliner";
+  meta = {
+    license = lib.licenses.gpl3Plus;
+    mainProgram = "heighliner";
+  };
 }

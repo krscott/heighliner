@@ -31,3 +31,7 @@ files and leaves partially staged files alone.
 
 Update Nix dependencies with `nix flake update` and Rust dependencies with
 `cargo update`.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).

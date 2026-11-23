@@ -11,7 +11,7 @@ Syncthing only talks over the tailnet.
 
 ## Install
 
-Heighliner ships as a NixOS module. On each Node:
+Heighliner ships as a NixOS module. Add it to each Node's configuration:
 
 ```nix
 {
@@ -20,6 +20,7 @@ Heighliner ships as a NixOS module. On each Node:
   outputs = { nixpkgs, heighliner, ... }: {
     nixosConfigurations.laptop = nixpkgs.lib.nixosSystem {
       modules = [
+        ./configuration.nix
         heighliner.nixosModules.default
         {
           services.tailscale.enable = true;
@@ -54,8 +55,9 @@ options, such as `retentionDays`.
   ```
 
 - Enable network map caching, so a Node that restarts while Tailscale's control
-  server is out of reach can still reach the others. The daemon warns at
-  startup when it's off.
+  server is out of reach starts from its last network map, and can usually
+  reach the others through a DERP relay. It needs Tailscale 1.104 or later. The
+  daemon warns at startup when it's off.
 
   ```json
   "nodeAttrs": [
@@ -66,24 +68,26 @@ options, such as `retentionDays`.
 ## Usage
 
 The CLI asks the local daemon, or another Node's with `--on <node>`. Paths are
-`node:path`, or this Node's when the Node is left out.
+`node:path`, or this Node's when the Node is left out. A path on another Node
+must be absolute.
 
 ```sh
-heighliner track ~/docs                  # Track a directory as an Item
-heighliner sync docs desktop:~/docs      # Add a Replica on another Node
-heighliner sync docs nas:~/docs --mirror # One that only receives
-heighliner status                        # Each Item's Replicas and their state
-heighliner conflicts                     # This Node's Data Conflicts
-heighliner conflicts keep docs <version> # or swap, to make the other side win
-heighliner pause docs [node]             # and resume
-heighliner remove-replica docs desktop   # Stop syncing there; files stay
-heighliner untrack docs                  # Stop syncing everywhere; files stay
-heighliner ui                            # Open the web UI
+heighliner track ~/docs                       # Track a directory as an Item
+heighliner sync docs desktop:/home/alice/docs # Add a Replica on another Node
+heighliner sync docs nas:/srv/docs --mirror   # One that only receives
+heighliner status                             # Each Item's Replicas and their state
+heighliner conflicts                          # This Node's Data Conflicts
+heighliner conflicts keep docs <version>      # or swap, to make the other side win
+heighliner pause docs [node]                  # and resume
+heighliner remove-replica docs desktop        # Stop syncing there; files stay
+heighliner untrack docs                       # Stop syncing everywhere; files stay
+heighliner ui                                 # Open the web UI
 ```
 
-Every command has `--help`. Heighliner never deletes your files: removing a
-Replica or untracking an Item leaves them in place, and `sync` refuses a path
-that already holds files unless you pass `--adopt`.
+Every command has `--help`. Heighliner deletes nothing but expired Displaced
+Versions and Data Conflicts: removing a Replica or untracking an Item leaves its
+files in place, and `sync` refuses a path that already holds files unless you
+pass `--adopt`.
 
 The web UI does everything the CLI does. Open it from any of your devices,
 including a phone, at `http://<node>.<tailnet>.ts.net:7130/` or the Node's
@@ -101,9 +105,8 @@ Heighliner tolerates partitions only as far as Tailscale does:
 
 - A LAN cut off from the internet keeps syncing while its Nodes stay up.
 - A Node that restarts during the outage can't reach the others until
-  Tailscale's control server or a DERP relay is reachable again. Caching
-  network maps (see [Tailscale setup](#tailscale-setup)) lets it start from
-  the last one it saw instead.
+  Tailscale's control server is reachable again, or, if it caches network maps
+  (see [Tailscale setup](#tailscale-setup)), a DERP relay is.
 - There's no LAN fallback outside Tailscale.
 
 Configuration edits are accepted on any Node at any time and merge when Nodes

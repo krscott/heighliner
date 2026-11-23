@@ -113,7 +113,7 @@ struct Waiting {
     items: BTreeMap<ItemId, Work>,
     /// How many directories `items` names.
     dirs: usize,
-    /// Every Replica is to be swept, whatever `items` says.
+    /// Every configured Replica is to be swept, whatever `items` says.
     sweep: bool,
 }
 
@@ -125,11 +125,12 @@ impl Waiting {
         }
     }
 
+    /// Sweeps every Replica configured when the work is taken.
+    fn sweep_all(&mut self) {
+        self.sweep = true;
+    }
+
     fn add(&mut self, item: ItemId, dir: String) {
-        // A sweep looks everywhere anyway.
-        if self.sweep {
-            return;
-        }
         let work = self
             .items
             .entry(item)
@@ -147,11 +148,14 @@ impl Waiting {
     /// Takes the jobs of `roots` but those at the paths in `busy`, which
     /// stay waiting, as does the work of Items with no Replica in `roots`.
     fn take(&mut self, roots: Vec<Root>, busy: &BTreeSet<PathBuf>) -> Vec<(Root, Work)> {
-        // A sweep waits until a reconcile configures some.
+        // A sweep waits until a reconcile configures some. Work for Items
+        // with no configured Replica keeps waiting for theirs.
         if self.sweep && !roots.is_empty() {
-            *self = Self::default();
+            self.sweep = false;
             for root in &roots {
-                self.items.insert(root.item, Work::Sweep);
+                if let Some(Work::Dirs(dirs)) = self.items.insert(root.item, Work::Sweep) {
+                    self.dirs -= dirs.len();
+                }
             }
         }
         let mut jobs = Vec::new();
@@ -211,7 +215,7 @@ impl Queue {
                 let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
                 waiting.add(item, dir.to_owned());
             }
-            Seen::Missed => *waiting = Waiting::swept(),
+            Seen::Missed => waiting.sweep_all(),
         }
         drop(waiting);
         self.ready.notify_one();
@@ -219,7 +223,7 @@ impl Queue {
 
     /// Queues a sweep of every configured Replica.
     pub(super) fn sweep(&self) {
-        *self.waiting.lock().unwrap() = Waiting::swept();
+        self.waiting.lock().unwrap().sweep_all();
         self.ready.notify_one();
     }
 
@@ -661,9 +665,19 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1, Work::Sweep);
         assert_eq!(waiting.items.get(&ItemId::from_u128(1)), Some(&Work::Sweep));
+        // An Item with no configured Replica keeps its directories.
+        waiting.add(ItemId::from_u128(3), "docs".to_owned());
+        waiting.sweep_all();
+        let jobs = waiting.take(vec![root(2, "/srv/b")], &BTreeSet::new());
+        assert_eq!(jobs[0].1, Work::Sweep);
+        assert_eq!(
+            waiting.items.get(&ItemId::from_u128(3)),
+            Some(&dirs(&["docs"]))
+        );
+        assert_eq!(waiting.dirs, 1);
         // A directory adds nothing to a sweep.
         waiting.add(ItemId::from_u128(1), "docs".to_owned());
-        assert_eq!(waiting.dirs, 0);
+        assert_eq!(waiting.dirs, 1);
         let jobs = waiting.take(vec![root(1, "/srv/a")], &BTreeSet::new());
         assert_eq!(jobs[0].1, Work::Sweep);
     }

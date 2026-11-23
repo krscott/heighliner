@@ -16,7 +16,9 @@
 //! `kept-<seconds>` beside it. While a swap is under way, the losing side
 //! is `swapping-<seconds>-<inode>`, named with its own inode, so that once
 //! the swap has exchanged it with the file, the name no longer matches and
-//! a swap cut short then is already done. [`expire`] removes each of these
+//! a swap cut short then is already done. That needs inode numbers that
+//! stay the same across mounts: elsewhere, a swap cut short may count as
+//! done unreviewed, though its side still expires only on schedule. [`expire`] removes each of these
 //! once it has been there for the Item's Retention Window, as Syncthing
 //! does its own Displaced Versions.
 //!
@@ -26,8 +28,9 @@
 //! Every move is a single rename that never replaces a file, and one
 //! operation runs at a time. Where a filesystem can't rename without
 //! replacing, a move links the file at its new name, then unlinks the old;
-//! should the unlink fail, the old name is recognized by its inode as left
-//! over, and the move counts as done. Everything here works on the filesystem and
+//! should the unlink fail, the old name is recognized as the same file and
+//! left over, and the move counts as done. Heighliner removes a left-over
+//! name only in the store, where nothing else writes. Everything here works on the filesystem and
 //! blocks; paths are relative to a Replica's root and use `/`, and
 //! symlinks are never followed.
 
@@ -259,13 +262,29 @@ impl Side {
     }
 }
 
+/// Which file a path names: its device and inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    inode: u64,
+}
+
+impl FileId {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
 /// A file in a conflict's directory.
 struct Leaf {
     path: PathBuf,
     side: Side,
     /// When it was moved there, in seconds since the Unix epoch.
     moved: u64,
-    inode: u64,
+    file: FileId,
 }
 
 impl Leaf {
@@ -274,7 +293,7 @@ impl Leaf {
     fn unresolved(&self) -> bool {
         match self.side {
             Side::Unresolved => true,
-            Side::Swapping { inode } => inode == self.inode,
+            Side::Swapping { inode } => inode == self.file.inode,
             Side::Resolved => false,
         }
     }
@@ -310,7 +329,7 @@ fn leaves(dir: &Path) -> Result<Vec<Leaf>, Error> {
                 path,
                 side,
                 moved,
-                inode: metadata.ino(),
+                file: FileId::of(&metadata),
             });
         }
     }
@@ -325,7 +344,7 @@ fn unresolved(dir: &Path) -> Result<Option<(PathBuf, u64)>, Error> {
     let moved_on = |leaf: &Leaf| {
         leaves
             .iter()
-            .any(|other| other.inode == leaf.inode && other.side.stage() > leaf.side.stage())
+            .any(|other| other.file == leaf.file && other.side.stage() > leaf.side.stage())
     };
     Ok(leaves
         .iter()
@@ -333,10 +352,10 @@ fn unresolved(dir: &Path) -> Result<Option<(PathBuf, u64)>, Error> {
         .map(|leaf| (leaf.path.clone(), leaf.moved)))
 }
 
-/// The inode of the file at `path`.
-fn inode(path: &Path) -> Result<u64, Error> {
+/// Which file `path` names, and how many names it has.
+fn file_id(path: &Path) -> Result<(FileId, u64), Error> {
     fs::symlink_metadata(path)
-        .map(|metadata| metadata.ino())
+        .map(|metadata| (FileId::of(&metadata), metadata.nlink()))
         .map_err(io_error(path))
 }
 
@@ -602,17 +621,17 @@ fn collect_into(
 }
 
 /// Moves the conflict copy `name` in the directory `parts` into the store,
-/// returning the new Data Conflict, or `None` if the copy was already
-/// there, left over from a move.
+/// returning the new Data Conflict, or `None` if the copy is already there,
+/// left over from a move. That one stays where it is: something else may
+/// replace it meanwhile, so it is never removed.
 fn displace(root: &Path, parts: &[&str], name: &str) -> Result<Option<DataConflict>, Error> {
     let conflict = parse(name).expect("a conflict copy's name");
     let mut inner = parts.to_vec();
     inner.push(name);
     let dir = stored(root, &inner, true)?.expect("created");
     let source = root.join(join(parts, name));
-    let copy = inode(&source)?;
-    if leaves(&dir)?.iter().any(|leaf| leaf.inode == copy) {
-        fs::remove_file(&source).map_err(io_error(&source))?;
+    let (copy, _) = file_id(&source)?;
+    if leaves(&dir)?.iter().any(|leaf| leaf.file == copy) {
         return Ok(None);
     }
     if let Some((existing, _)) = unresolved(&dir)? {
@@ -791,10 +810,11 @@ pub fn swap(root: &Path, version: &str) -> Result<DataConflict, Error> {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(SWAPPING));
-        let loser_inode = inode(&loser)?;
-        // One cut short after linking it as the file is done.
-        if resumed && live_exists && inode(&live)? == loser_inode {
-            fs::remove_file(&loser).map_err(io_error(&loser))?;
+        let (loser_id, _) = file_id(&loser)?;
+        // One cut short after linking it as the file is done. The staged
+        // name is kept, as the file may be replaced meanwhile.
+        if resumed && live_exists && file_id(&live)?.0 == loser_id {
+            move_new(&loser, &sibling(&loser, RESOLVED))?;
             return Ok(conflict);
         }
         // Newer than the change it replaces, and changed enough for Syncthing
@@ -808,10 +828,20 @@ pub fn swap(root: &Path, version: &str) -> Result<DataConflict, Error> {
             loser.clone()
         } else {
             let swapping =
-                loser.with_file_name(format!("{SWAPPING}{}-{loser_inode}", seconds_now()));
+                loser.with_file_name(format!("{SWAPPING}{}-{}", seconds_now(), loser_id.inode));
             move_new(&loser, &swapping)?;
             swapping
         };
+        // Other names of the staged file, left over from moving it, would
+        // hold the losing change once it is exchanged, and so look
+        // unresolved again; they go first. Only heighliner writes in the
+        // store, so they stay the staged file meanwhile.
+        let dir = swapping.parent().expect("a conflict's directory");
+        for leaf in leaves(dir)? {
+            if leaf.path != swapping && leaf.file == loser_id && file_id(&swapping)?.1 > 1 {
+                fs::remove_file(&leaf.path).map_err(io_error(&leaf.path))?;
+            }
+        }
         let undo = || {
             if !resumed {
                 let _ = move_new(&swapping, &loser);
@@ -1306,10 +1336,10 @@ mod tests {
         linked(root, &only_leaf(root, &version, UNRESOLVED), &copy);
         let collected = collect(root, "").unwrap();
         assert!(collected.found.is_empty() && collected.failed.is_empty());
-        assert!(!root.join(&copy).exists());
+        // Left alone, as something may have replaced it meanwhile.
+        assert_eq!(read(root, &copy), "lost");
         // Once resolved, it doesn't come back as a new conflict either.
         keep(root, &version).unwrap();
-        linked(root, &only_leaf(root, &version, RESOLVED), &copy);
         let collected = collect(root, "").unwrap();
         assert!(collected.found.is_empty() && collected.failed.is_empty());
         assert!(list(root).unwrap().is_empty());
@@ -1327,6 +1357,24 @@ mod tests {
         assert!(!root.join(&swapping).exists());
         assert_eq!(read(root, "notes.txt"), "lost");
         assert!(list(root).unwrap().is_empty());
+        assert_eq!(read(root, &only_leaf(root, &version, RESOLVED)), "lost");
+    }
+
+    #[test]
+    fn a_loser_left_linked_while_staged_stays_resolved_after_a_swap() {
+        let root = replica();
+        let root = root.path();
+        write(root, &copy(), "lost");
+        write(root, "notes.txt", "won");
+        let version = collect(root, "").unwrap().found.remove(0).version;
+        let loser = only_leaf(root, &version, UNRESOLVED);
+        let swapping = stage_swap(root, &version);
+        linked(root, &swapping, &loser);
+        assert_eq!(list(root).unwrap().len(), 1);
+        swap(root, &version).unwrap();
+        assert_eq!(read(root, "notes.txt"), "lost");
+        assert!(list(root).unwrap().is_empty());
+        assert_eq!(read(root, &only_leaf(root, &version, RESOLVED)), "won");
     }
 
     #[test]

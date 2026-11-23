@@ -165,6 +165,70 @@ async fn a_tilde_is_the_daemons_users_home() {
 }
 
 #[tokio::test]
+async fn a_tilde_on_another_node_is_its_users_home() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let fake = Fake::new(device("laptop", OWNER, "127.0.0.1"));
+    fake.add_device(device("nas", OWNER, "127.0.0.2"));
+    let state = tempfile::tempdir().unwrap();
+    let daemon = Daemon::open(fake.clone(), state.path(), port)
+        .await
+        .unwrap();
+    let _servers = daemon.listen().await.unwrap();
+    let client = Client::connect(&fake, port, None).await.unwrap();
+    let docs = tempfile::tempdir().unwrap();
+    client
+        .track(&track(docs.path().to_str().unwrap()))
+        .await
+        .unwrap();
+    let id = client.status().await.unwrap().items[0].id.to_string();
+    let add = AddReplica {
+        node: Some("nas".into()),
+        path: "~/docs".into(),
+        mirror: false,
+        adopt: false,
+    };
+
+    // Until it shares its home, ~ can't be used there.
+    let refused = client.add_replica(&id, &add).await;
+    assert!(
+        matches!(&refused, Err(Error::Refused { message, .. }) if message.contains("home")),
+        "{refused:?}"
+    );
+
+    let mut nas = crate::config::ConfigDb::new(
+        crate::model::NodeId::new("n-nas").unwrap(),
+        crate::record::Store::default(),
+    );
+    nas.publish(
+        crate::hlc::Timestamp::now(),
+        crate::model::DeviceId::new(
+            "MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD",
+        )
+        .unwrap(),
+        Some(crate::model::AbsPath::new("/home/alice").unwrap()),
+    )
+    .unwrap();
+    daemon
+        .db()
+        .lock()
+        .unwrap()
+        .merge(nas.store(), crate::hlc::Timestamp::now());
+    client.add_replica(&id, &add).await.unwrap();
+    let status = client.status().await.unwrap();
+    let paths: Vec<&str> = status.items[0]
+        .replicas
+        .iter()
+        .map(|replica| replica.path.as_str())
+        .collect();
+    assert!(paths.contains(&"/home/alice/docs"), "{paths:?}");
+}
+
+#[tokio::test]
 async fn edits_are_saved_and_ids_are_only_ids() {
     let port = TcpListener::bind("127.0.0.1:0")
         .await

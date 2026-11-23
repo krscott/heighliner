@@ -261,6 +261,9 @@ pub struct Daemon<T> {
     /// How long superseded record versions, tombstones and the Displaced
     /// Versions of Items without their own Retention Window are kept.
     retention: Duration,
+    /// The daemon's user's home, which `~` in a path on this Node stands
+    /// for, if `HOME` names a normalized absolute path.
+    home: Option<AbsPath>,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -416,6 +419,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             changes: Arc::new(watch::Sender::new(())),
             conflict_gates: Arc::default(),
             retention: RETENTION_WINDOW,
+            home: home(std::env::var("HOME").ok()),
         })
     }
 
@@ -473,7 +477,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             remote: self.remote.clone(),
             conflicts: self.conflict_ops(),
             state: self.state.clone(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home: self.home.clone(),
             port: self.port,
             changes: self.changes.clone(),
         }
@@ -645,13 +649,13 @@ impl<T: LocalApi + Clone> Daemon<T> {
                 return None;
             }
         };
-        if let Err(error) = self
-            .db
-            .lock()
-            .unwrap()
-            .set_device_id(Timestamp::now(), device_id.clone())
+        if let Err(error) =
+            self.db
+                .lock()
+                .unwrap()
+                .publish(Timestamp::now(), device_id.clone(), self.home.clone())
         {
-            tracing::warn!(%error, "can't publish this Node's Syncthing device ID");
+            tracing::warn!(%error, "can't publish this Node's record");
         }
         let config = self.db.lock().unwrap().config();
         match driver.reconcile(&config, tailnet, &device_id).await {
@@ -822,6 +826,12 @@ impl<T: LocalApi + Clone> Daemon<T> {
 /// The `Host`s a request to `device`'s daemon on `port` may name: its
 /// Tailscale addresses and its full MagicDNS name, if it has one. Not its
 /// short name, which whatever network the browser is on may answer for.
+/// The home `HOME` names, if it is absolute and has no `..`.
+fn home(var: Option<String>) -> Option<AbsPath> {
+    let var = var.filter(|home| home.starts_with('/'))?;
+    AbsPath::new(crate::api::normalize(&var)).ok()
+}
+
 fn hosts(device: &tailscale::Device, port: u16) -> BTreeSet<String> {
     let addrs = device
         .ips

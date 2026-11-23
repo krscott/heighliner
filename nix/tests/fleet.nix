@@ -108,7 +108,10 @@ pkgs.testers.runNixOSTest {
     with subtest("An item tracked on one Node is replicated to the other"):
         as_alice(alpha, "mkdir ~/docs && echo hello >~/docs/hello.txt")
         as_alice(alpha, "heighliner track ~/docs")
-        as_alice(alpha, "heighliner sync docs beta:/home/alice/docs")
+        # ~ is beta's user's home, once beta has shared it.
+        alpha.wait_until_succeeds(
+            "su - alice -c " + shlex.quote("heighliner sync docs beta:~/docs"), timeout=120
+        )
         beta.wait_until_succeeds("grep -q hello /home/alice/docs/hello.txt", timeout=120)
         assert beta.succeed("stat -c %U /home/alice/docs/hello.txt").strip() == "alice"
 

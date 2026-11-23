@@ -359,23 +359,29 @@ fn reopening_resumes_after_the_saved_clock_reading() {
 }
 
 #[test]
-fn nodes_publish_their_device_ids() {
+fn nodes_publish_their_records() {
     let id = |s: &str| DeviceId::new(s).unwrap();
     let first = id("MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD");
     let second = id("AAAAAAA-BBBBBBX-BCCCCCC-CDDDDDU-DDEEEEE-EEFFFFR-FFFGGGG-2222223");
     let (mut a, mut b) = (db("a"), db("b"));
-    a.set_device_id(t(1), first.clone()).unwrap();
-    b.set_device_id(t(1), second).unwrap();
+    a.publish(t(1), first.clone(), None).unwrap();
+    b.publish(t(1), second, None).unwrap();
     sync(&mut a, &mut b, t(2));
     let config = b.config();
     assert_eq!(config.nodes.len(), 2);
     assert_eq!(config.nodes[&node("a")].device_id, first);
     assert_eq!(config.problems, []);
 
-    // Setting the same ID again writes nothing.
+    // Publishing the same record again writes nothing.
     let before = a.store().clone();
-    a.set_device_id(t(3), first).unwrap();
+    a.publish(t(3), first.clone(), None).unwrap();
     assert_eq!(a.store(), &before);
+
+    // A changed home is published.
+    let home = AbsPath::new("/home/alice").unwrap();
+    a.publish(t(4), first, Some(home.clone())).unwrap();
+    sync(&mut a, &mut b, t(5));
+    assert_eq!(b.config().nodes[&node("a")].home, Some(home));
 }
 
 #[test]
@@ -385,14 +391,14 @@ fn a_node_leaves_for_good() {
     let second = id("AAAAAAA-BBBBBBX-BCCCCCC-CDDDDDU-DDEEEEE-EEFFFFR-FFFGGGG-2222223");
     let (mut a, mut b) = (db("a"), db("b"));
     assert!(matches!(a.leave(t(1)), Err(EditError::NotJoined)));
-    a.set_device_id(t(2), first.clone()).unwrap();
+    a.publish(t(2), first.clone(), None).unwrap();
     a.leave(t(3)).unwrap();
     assert!(a.config().departed.contains(&node("a")));
     assert_eq!(a.config().nodes[&node("a")].device_id, first);
     sync(&mut a, &mut b, t(4));
     // Reinstalled, it publishes its record afresh, without its history.
     let mut reinstalled = db("a");
-    reinstalled.set_device_id(t(5), second).unwrap();
+    reinstalled.publish(t(5), second, None).unwrap();
     b.merge(reinstalled.store(), t(6));
     assert!(b.config().departed.contains(&node("a")));
 }
@@ -408,7 +414,7 @@ fn an_unreadable_node_record_is_not_overwritten() {
     let id =
         DeviceId::new("MFZWI3D-BONSGYC-YLTMRWG-C43ENR5-QXGZDMM-FZWI3DP-BONSGYY-LTMRWAD").unwrap();
     assert_eq!(
-        a.set_device_id(t(3), id),
+        a.publish(t(3), id, None),
         Err(EditError::Unreadable(node_key(&node("a"))))
     );
 }

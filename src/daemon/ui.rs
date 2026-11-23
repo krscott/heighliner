@@ -395,7 +395,7 @@ fn track_form(status: &Status) -> Markup {
                 label { "Node " (node_select(status)) }
                 label {
                     "Path "
-                    input name="path" required placeholder="/srv/photos, or ~/docs on this Node";
+                    input name="path" required placeholder="/srv/photos or ~/docs";
                 }
                 label { "Name " input name="name" placeholder="the path's last part"; }
                 label.check { input type="checkbox" name="one_way"; " One-way, from this replica" }
@@ -598,7 +598,7 @@ async fn item<T: LocalApi + Clone>(State(api): State<Api<T>>, Path(id): Path<Str
                 label { "Node " (node_select(&status)) }
                 label {
                     "Path "
-                    input name="path" required placeholder="/srv/photos, or ~/docs on this Node";
+                    input name="path" required placeholder="/srv/photos or ~/docs";
                 }
                 label.check { input type="checkbox" name="mirror"; " Mirror: receives only" }
                 label.check {

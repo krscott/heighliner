@@ -55,7 +55,7 @@ enum Command {
     },
     /// Track a directory as a new item, adopting the files already in it.
     Track {
-        /// `[node:]path`; a path on another Node must be absolute.
+        /// `[node:]path`; on another Node, absolute or under `~`, its user's home.
         path: String,
         /// The item's name; the directory's name if none.
         #[arg(long)]
@@ -74,7 +74,7 @@ enum Command {
     Sync {
         /// The item's name or ID.
         item: String,
-        /// `[node:]path`; a path on another Node must be absolute.
+        /// `[node:]path`; on another Node, absolute or under `~`, its user's home.
         path: String,
         /// Only receive changes.
         #[arg(long)]

@@ -514,14 +514,19 @@ impl fmt::Display for DeviceId {
 pub struct NodeInfo {
     /// The device ID of the Node's Syncthing instance.
     pub device_id: DeviceId,
+    /// Its daemon's user's home, which `~` in a path on it stands for, if
+    /// the daemon knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<AbsPath>,
     #[serde(flatten)]
     unknown_fields: UnknownFields,
 }
 
 impl NodeInfo {
-    pub fn new(device_id: DeviceId) -> Self {
+    pub fn new(device_id: DeviceId, home: Option<AbsPath>) -> Self {
         Self {
             device_id,
+            home,
             unknown_fields: UnknownFields::new(),
         }
     }

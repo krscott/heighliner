@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::JsonRejection;
@@ -39,8 +38,9 @@ pub(super) struct Api<T> {
     pub(super) remote: Arc<Mutex<Remote>>,
     pub(super) conflicts: Conflicts,
     pub(super) state: Arc<StateFile>,
-    /// The daemon's user's home, which `~` stands for.
-    pub(super) home: Option<PathBuf>,
+    /// The daemon's user's home, which `~` in a path on this Node stands
+    /// for.
+    pub(super) home: Option<AbsPath>,
     /// The port the daemons serve on.
     pub(super) port: u16,
     pub(super) changes: Changes,
@@ -400,23 +400,25 @@ impl<T: LocalApi + Clone> Api<T> {
     }
 
     /// `path` on `node`, where `~` stands for the daemon's user's home on
-    /// this Node, written as a Replica's path is.
+    /// that Node, written as a Replica's path is.
     fn path(&self, node: &NodeId, path: &str) -> Result<AbsPath, Refusal> {
-        let path = if *node == self.me()
-            && let Some(rest) = path.strip_prefix('~')
+        let path = if let Some(rest) = path.strip_prefix('~')
             && (rest.is_empty() || rest.starts_with('/'))
         {
-            let home = self
-                .home
-                .as_ref()
-                .and_then(|home| home.to_str())
-                .ok_or_else(|| {
+            let home = if *node == self.me() {
+                self.home.clone().ok_or_else(|| {
                     invalid("this Node's daemon doesn't know its user's home, so ~ can't be used")
-                })?;
-            format!("{home}{rest}")
+                })?
+            } else {
+                let nodes = self.db.lock().unwrap().config().nodes;
+                nodes.get(node).and_then(|info| info.home.clone()).ok_or_else(|| {
+                    invalid("that Node hasn't shared its user's home yet, so ~ can't be used there; give an absolute path")
+                })?
+            };
+            format!("{}{rest}", home.as_str())
         } else if !path.starts_with('/') {
             return Err(invalid(format!(
-                "{path} isn't absolute; only a path on this Node may start with ~ instead"
+                "{path} isn't absolute; give an absolute path, or one that starts with ~/"
             )));
         } else {
             path.to_owned()

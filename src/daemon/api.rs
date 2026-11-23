@@ -418,7 +418,7 @@ impl<T: LocalApi + Clone> Api<T> {
             format!("{}{rest}", home.as_str())
         } else if !path.starts_with('/') {
             return Err(invalid(format!(
-                "{path} isn't absolute; give an absolute path, or one that starts with ~"
+                "{path} isn't absolute; give an absolute path, or one that starts with ~/"
             )));
         } else {
             path.to_owned()

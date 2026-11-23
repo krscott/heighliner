@@ -419,9 +419,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             changes: Arc::new(watch::Sender::new(())),
             conflict_gates: Arc::default(),
             retention: RETENTION_WINDOW,
-            home: std::env::var("HOME")
-                .ok()
-                .and_then(|home| AbsPath::new(crate::api::normalize(&home)).ok()),
+            home: home(std::env::var("HOME").ok()),
         })
     }
 
@@ -828,6 +826,12 @@ impl<T: LocalApi + Clone> Daemon<T> {
 /// The `Host`s a request to `device`'s daemon on `port` may name: its
 /// Tailscale addresses and its full MagicDNS name, if it has one. Not its
 /// short name, which whatever network the browser is on may answer for.
+/// The home `HOME` names, if it is absolute and has no `..`.
+fn home(var: Option<String>) -> Option<AbsPath> {
+    let var = var.filter(|home| home.starts_with('/'))?;
+    AbsPath::new(crate::api::normalize(&var)).ok()
+}
+
 fn hosts(device: &tailscale::Device, port: u16) -> BTreeSet<String> {
     let addrs = device
         .ips

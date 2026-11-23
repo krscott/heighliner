@@ -1035,3 +1035,14 @@ async fn a_hung_replica_doesnt_hold_up_listing_conflicts() {
         "{listed:?}"
     );
 }
+
+#[test]
+fn only_an_absolute_home_is_shared() {
+    let home = |var: &str| super::home(Some(var.to_owned())).map(|home| home.as_str().to_owned());
+    assert_eq!(home("/home/alice/"), Some("/home/alice".into()));
+    assert_eq!(home("/"), Some("/".into()));
+    assert_eq!(home(""), None);
+    assert_eq!(home("relative/home"), None);
+    assert_eq!(home("/home/../root"), None);
+    assert_eq!(super::home(None), None);
+}

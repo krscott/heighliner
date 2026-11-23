@@ -283,6 +283,14 @@ pub struct Item {
 }
 
 impl Item {
+    /// How long its Displaced Versions are kept: its own Retention Window,
+    /// or `default`.
+    pub fn retention(&self, default: std::time::Duration) -> std::time::Duration {
+        self.retention_days.map_or(default, |days| {
+            std::time::Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
+        })
+    }
+
     pub fn new(name: impl Into<String>, direction: Direction) -> Self {
         Self {
             name: name.into(),

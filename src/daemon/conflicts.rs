@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use super::{Changes, Daemon, RETENTION_WINDOW, Replicas, signal};
+use super::{Changes, Daemon, Replicas, signal};
 use crate::config::ConfigDb;
 use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId};
@@ -47,7 +47,7 @@ struct Root {
 
 /// This Node's (`me`'s) Replicas whose folders the last reconcile
 /// configured.
-fn roots(replicas: &Mutex<Replicas>, me: &NodeId) -> Vec<Root> {
+fn roots(replicas: &Mutex<Replicas>, me: &NodeId, retention: Duration) -> Vec<Root> {
     let Some(reconciled) = replicas.lock().unwrap().reconciled.clone() else {
         return Vec::new();
     };
@@ -67,13 +67,7 @@ fn roots(replicas: &Mutex<Replicas>, me: &NodeId) -> Vec<Root> {
             item: local.item_id,
             name: local.entry.item.name.clone(),
             path: PathBuf::from(local.replica.path().as_str()),
-            retention: local
-                .entry
-                .item
-                .retention_days
-                .map_or(RETENTION_WINDOW, |days| {
-                    Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
-                }),
+            retention: local.entry.item.retention(retention),
         })
         .collect()
 }
@@ -213,14 +207,20 @@ impl Queue {
     /// Runs the waiting work as it arrives, in `me`'s configured Replicas
     /// as `replicas` has them then, signalling `changes` after each run.
     /// Runs until it is dropped.
-    pub(super) async fn work(&self, replicas: Arc<Mutex<Replicas>>, me: NodeId, changes: Changes) {
+    pub(super) async fn work(
+        &self,
+        replicas: Arc<Mutex<Replicas>>,
+        me: NodeId,
+        retention: Duration,
+        changes: Changes,
+    ) {
         loop {
             self.ready.notified().await;
             let waiting = self.take();
             if waiting.is_empty() {
                 continue;
             }
-            let roots = roots(&replicas, &me);
+            let roots = roots(&replicas, &me, retention);
             if roots.is_empty() {
                 // Until a reconcile configures some.
                 self.give_back(waiting);
@@ -248,7 +248,8 @@ impl Queue {
     /// Runs the waiting work now.
     #[cfg(test)]
     pub(super) fn run_now(&self, replicas: &Mutex<Replicas>, me: &NodeId) {
-        self.take().run(roots(replicas, me));
+        self.take()
+            .run(roots(replicas, me, super::RETENTION_WINDOW));
     }
 }
 
@@ -406,11 +407,13 @@ pub(super) struct Conflicts {
     pub(super) driver: Option<Driver>,
     pub(super) changes: Changes,
     pub(super) gates: Gates,
+    /// The Retention Window of Items without their own.
+    pub(super) retention: Duration,
 }
 
 impl Conflicts {
     fn roots(&self) -> Vec<Root> {
-        roots(&self.replicas, &self.me)
+        roots(&self.replicas, &self.me, self.retention)
     }
 
     /// Sweeps every configured Replica now, moving conflict copies into the
@@ -529,6 +532,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             driver: self.driver.clone(),
             changes: self.changes.clone(),
             gates: self.conflict_gates.clone(),
+            retention: self.retention,
         }
     }
 

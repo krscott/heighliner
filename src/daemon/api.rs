@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use tokio::sync::Notify;
 
 use super::conflicts::{ActionError, Conflicts};
-use super::{Changes, RETENTION_WINDOW, Remote, Replicas, StateFile, signal};
+use super::{Changes, Remote, Replicas, StateFile, signal};
 use crate::api::{
     self, AddReplica, Conflict, ItemStatus, NodeStatus, Reach, Refused, ReplicaStatus, Replication,
     Resolve, SetPaused, Status, Track, Tracked,
@@ -321,11 +321,8 @@ impl<T: LocalApi + Clone> Api<T> {
             let item_name = entry.map_or_else(String::new, |entry| entry.item.name.clone());
             match found {
                 Ok(found) => {
-                    let retention = entry
-                        .and_then(|entry| entry.item.retention_days)
-                        .map_or(RETENTION_WINDOW, |days| {
-                            std::time::Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60)
-                        });
+                    let default = self.conflicts.retention;
+                    let retention = entry.map_or(default, |entry| entry.item.retention(default));
                     listed.conflicts.extend(found.into_iter().map(|conflict| {
                         let DataConflict {
                             path,

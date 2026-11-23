@@ -92,6 +92,19 @@ lint:
 check: format-check lint
     nix flake check -L --no-update-lock-file
 
+# Run the NixOS VM tests, or the ones named; they need KVM.
+vm-test *names:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    names=("$@")
+    if (($# == 0)); then
+        all=$(nix eval --raw .#vmTests --apply 'tests: toString (builtins.attrNames tests)')
+        read -ra names <<<"$all"
+    fi
+    for name in "${names[@]}"; do
+        nix build -L --no-link --no-update-lock-file ".#vmTests.$name"
+    done
+
 # Format staged files for git pre-commit.
 pre-commit:
     #!/usr/bin/env bash

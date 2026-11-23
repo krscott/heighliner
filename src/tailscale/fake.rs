@@ -22,6 +22,7 @@ pub(crate) fn device(name: &str, user: UserId, ip: &str) -> Device {
         user,
         tagged: false,
         ips: vec![ip.parse().unwrap()],
+        caches_network_maps: true,
     }
 }
 

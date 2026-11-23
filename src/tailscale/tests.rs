@@ -100,6 +100,29 @@ fn status_is_read() {
 }
 
 #[test]
+fn netmap_caching_is_read_from_the_node_attributes() {
+    let caches = |cap_map: serde_json::Value| {
+        let mut json = status_json("Running");
+        json["Self"]["CapMap"] = cap_map;
+        let status: StatusResponse = serde_json::from_value(json).unwrap();
+        status
+            .into_tailnet("/status")
+            .unwrap()
+            .me()
+            .caches_network_maps
+    };
+    assert!(!caches(json!(null)));
+    assert!(!caches(json!({ "funnel": null })));
+    assert!(caches(
+        json!({ "cache-network-maps": null, "funnel": null })
+    ));
+    assert!(!caches(json!({
+        "cache-network-maps": null,
+        "disable-cache-network-maps": null,
+    })));
+}
+
+#[test]
 fn a_tagged_device_has_no_tailnet() {
     let mut json = status_json("Running");
     json["Self"]["Tags"] = json!(["tag:server"]);

@@ -35,7 +35,7 @@ use crate::tailscale::{self, Client, LocalApi, Owner, Tailnet};
 pub const DEFAULT_PORT: u16 = 7130;
 
 /// How long superseded record versions, tombstones and Displaced Versions
-/// are kept.
+/// are kept, unless the daemon is told otherwise.
 pub const RETENTION_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long each of a device's addresses may take to answer hello. Devices
@@ -258,6 +258,9 @@ pub struct Daemon<T> {
     remote: Arc<Mutex<Remote>>,
     changes: Changes,
     conflict_gates: conflicts::Gates,
+    /// How long superseded record versions, tombstones and the Displaced
+    /// Versions of Items without their own Retention Window are kept.
+    retention: Duration,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -412,7 +415,15 @@ impl<T: LocalApi + Clone> Daemon<T> {
             remote: Arc::default(),
             changes: Arc::new(watch::Sender::new(())),
             conflict_gates: Arc::default(),
+            retention: RETENTION_WINDOW,
         })
+    }
+
+    /// Makes the daemon keep what it keeps for `retention`, instead of
+    /// [`RETENTION_WINDOW`].
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
     }
 
     /// Makes the daemon configure Syncthing through `driver` each round.
@@ -605,7 +616,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
         self.db
             .lock()
             .unwrap()
-            .prune(Timestamp::now(), RETENTION_WINDOW);
+            .prune(Timestamp::now(), self.retention);
         tracing::debug!(
             pulled = round.pulled.len(),
             incompatible = round.incompatible.len(),
@@ -920,6 +931,8 @@ pub struct Options {
     pub port: u16,
     pub tailscale_socket: PathBuf,
     pub pull_every: Duration,
+    /// See [`Daemon::with_retention`].
+    pub retention: Duration,
     /// How to reach Syncthing, if the daemon is to drive it.
     pub syncthing: Option<SyncthingOptions>,
 }
@@ -939,7 +952,14 @@ pub struct SyncthingOptions {
 /// changes, since its records then belong to the old one.
 pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
-    let mut daemon = open_when_ready(api, &options.state_dir, options.port).await?;
+    let mut daemon = open_when_ready(api, &options.state_dir, options.port)
+        .await?
+        .with_retention(options.retention);
+    if !daemon.tailnet.me().caches_network_maps {
+        tracing::warn!(
+            "this device doesn't cache Tailscale's network map, so if it restarts while Tailscale's control server is out of reach, it can't reach the other Nodes until it is back; give it the cache-network-maps node attribute"
+        );
+    }
     if let Some(syncthing) = &options.syncthing {
         let path = &syncthing.api_key_file;
         let api_key_error = |reason: String| Error::ApiKey {
@@ -949,7 +969,7 @@ pub async fn run(options: Options) -> Result<(), Error> {
         let api_key = fs::read_to_string(path).map_err(|error| api_key_error(error.to_string()))?;
         let client = syncthing::Client::new(&syncthing.socket, api_key.trim())
             .map_err(|error| api_key_error(error.to_string()))?;
-        daemon = daemon.with_driver(Driver::new(client, RETENTION_WINDOW));
+        daemon = daemon.with_driver(Driver::new(client, options.retention));
     }
     let stopped = serve(&mut daemon, options.pull_every).await;
     // Whatever stopped the daemon, keep what it merged since the last save.
@@ -975,8 +995,8 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     {
         let (queue, replicas) = (queue.clone(), daemon.replicas.clone());
         let me = daemon.db.lock().unwrap().node().clone();
-        let changes = daemon.changes.clone();
-        tasks.spawn(async move { queue.work(replicas, me, changes).await });
+        let (retention, changes) = (daemon.retention, daemon.changes.clone());
+        tasks.spawn(async move { queue.work(replicas, me, retention, changes).await });
     }
     if let Some(driver) = daemon.driver.clone() {
         let (changed, queue) = (changed.clone(), queue.clone());

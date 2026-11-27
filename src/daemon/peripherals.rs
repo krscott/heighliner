@@ -29,12 +29,16 @@ use crate::model::NodeId;
 use crate::protocol::{self, Command, NodePeripherals};
 use crate::tailscale::LocalApi;
 
-/// How long a Node, this one included, may take to list its Peripherals.
-const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long BlueZ may take to list this Node's Peripherals.
+const BLUEZ_LIST_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// How long another Node may take to carry out a command, which may
-/// retry connecting for a while.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long another Node may take to list its Peripherals: longer than its
+/// BlueZ may, so that it can say BlueZ didn't answer.
+const LIST_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long another Node may take to carry out a command: connecting
+/// retries for a while, and each try may wait on the Peripheral.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long another Node may take to pair, which scans first.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(90);
@@ -95,20 +99,6 @@ impl Survey {
     fn asked(&self, node: &NodeId) -> Option<&Asked> {
         self.nodes.iter().find(|asked| asked.node.node == *node)
     }
-
-    /// The Nodes that may hold a Peripheral without saying so, by name.
-    fn unknown(&self) -> Vec<&str> {
-        self.nodes
-            .iter()
-            .filter(|asked| {
-                !matches!(
-                    asked.node.bluetooth,
-                    BluetoothState::Ready | BluetoothState::NoAdapter
-                )
-            })
-            .map(|asked| name(&asked.node))
-            .collect()
-    }
 }
 
 fn name(node: &BluetoothNode) -> &str {
@@ -141,7 +131,7 @@ fn refusal(error: &bluetooth::Error) -> StatusCode {
         Error::NoAdapter | Error::AlreadyPaired | Error::NeedsCode | Error::Busy => {
             StatusCode::CONFLICT
         }
-        Error::NotSeen => StatusCode::GATEWAY_TIMEOUT,
+        Error::NotSeen | Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
         Error::Bluez { .. } => StatusCode::BAD_GATEWAY,
         Error::Bus(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
@@ -204,17 +194,18 @@ impl<T: LocalApi + Clone> Api<T> {
         let Some(bluetooth) = &self.bluetooth else {
             return Ok(None);
         };
-        match tokio::time::timeout(LIST_TIMEOUT, bluetooth.paired()).await {
+        match tokio::time::timeout(BLUEZ_LIST_TIMEOUT, bluetooth.paired()).await {
             Ok(paired) => paired.map_err(|error| error.to_string()),
             Err(_) => Err("BlueZ didn't answer in time".to_owned()),
         }
     }
 
     /// Asks every Node of `status` that its latest round reached for its
-    /// Peripherals, at once.
+    /// Peripherals, this one included, at once.
     async fn survey(&self, status: Status) -> Survey {
         let mut asking = JoinSet::new();
         let mut nodes: Vec<Asked> = Vec::new();
+        let mut here = None;
         for (index, node) in status
             .nodes
             .into_iter()
@@ -223,11 +214,11 @@ impl<T: LocalApi + Clone> Api<T> {
         {
             let mut addr = None;
             let (bluetooth, paired) = match (&node.reach, node.ip) {
-                (Reach::Here, _) => match self.paired_here().await {
-                    Ok(Some(paired)) => (BluetoothState::Ready, paired),
-                    Ok(None) => (BluetoothState::NoAdapter, Vec::new()),
-                    Err(error) => (BluetoothState::Failed { error }, Vec::new()),
-                },
+                (Reach::Here, _) => {
+                    here = Some(index);
+                    // Until it is listed, below.
+                    (BluetoothState::NoAdapter, Vec::new())
+                }
                 (Reach::Live { .. }, Some(ip)) => {
                     let at = SocketAddr::new(ip, self.port);
                     addr = Some(at);
@@ -246,6 +237,14 @@ impl<T: LocalApi + Clone> Api<T> {
                 bluetooth,
             };
             nodes.push(Asked { node, addr, paired });
+        }
+        if let Some(index) = here {
+            let asked = &mut nodes[index];
+            (asked.node.bluetooth, asked.paired) = match self.paired_here().await {
+                Ok(Some(paired)) => (BluetoothState::Ready, paired),
+                Ok(None) => (BluetoothState::NoAdapter, Vec::new()),
+                Err(error) => (BluetoothState::Failed { error }, Vec::new()),
+            };
         }
         while let Some(joined) = asking.join_next().await {
             let (index, answer) = joined.expect("asking tasks don't panic");
@@ -267,23 +266,17 @@ impl<T: LocalApi + Clone> Api<T> {
     /// Carries out `command` on this Node's Peripheral at `address`.
     async fn command_here(
         &self,
-        address: Address,
-        command: Command,
+        address: &Address,
+        command: &Command,
     ) -> Result<(), bluetooth::Error> {
-        let bluetooth = self.bluetooth.clone().ok_or(bluetooth::Error::NoAdapter)?;
-        let done = tokio::spawn(async move {
-            match command {
-                Command::Connect => bluetooth.connect(&address).await,
-                Command::Disconnect => bluetooth.disconnect(&address).await,
-                Command::Pair => bluetooth.pair(&address).await,
-                Command::Forget => bluetooth.forget(&address).await,
-                Command::Name { alias } => bluetooth.set_alias(&address, &alias).await,
-            }
-        })
-        .await
-        .expect("Bluetooth commands don't panic");
-        signal(&self.changes);
-        done
+        let bluetooth = self.bluetooth.as_ref().ok_or(bluetooth::Error::NoAdapter)?;
+        match command {
+            Command::Connect => bluetooth.connect(address).await,
+            Command::Disconnect => bluetooth.disconnect(address).await,
+            Command::Pair => bluetooth.pair(address).await,
+            Command::Forget => bluetooth.forget(address).await,
+            Command::Name { alias } => bluetooth.set_alias(address, alias).await,
+        }
     }
 
     /// Has `node` carry out `command` on its Peripheral at `address`.
@@ -296,7 +289,7 @@ impl<T: LocalApi + Clone> Api<T> {
     ) -> Result<(), String> {
         if *node == survey.me {
             return self
-                .command_here(address.clone(), command)
+                .command_here(address, &command)
                 .await
                 .map_err(|error| error.to_string());
         }
@@ -367,10 +360,13 @@ impl<T: LocalApi + Clone> Api<T> {
             .collect()
     }
 
-    /// Where `peripheral` may still be connected, after connecting it
-    /// elsewhere failed.
-    fn holders(survey: &Survey) -> Option<String> {
-        let unknown = survey.unknown();
+    /// Where a Peripheral of `view` may still be connected, after
+    /// connecting it failed.
+    fn holders(view: &Peripherals) -> Option<String> {
+        let unknown: Vec<&str> = view
+            .not_shown()
+            .map(|(node, _)| view.node_name(&node.node))
+            .collect();
         (!unknown.is_empty()).then(|| {
             format!(
                 "it may be connected to a Node that couldn't be asked: {}",
@@ -387,12 +383,14 @@ impl<T: LocalApi + Clone> Api<T> {
         action: PeripheralAction,
     ) -> Result<Done, Refusal> {
         let (api, name) = (self.clone(), name.to_owned());
-        let done = tokio::spawn(async move { api.act(&name, action).await })
-            .await
-            .expect("Peripheral actions don't panic");
-        // Other Nodes' changes show here at once too.
-        signal(&self.changes);
-        done
+        tokio::spawn(async move {
+            let done = api.act(&name, action).await;
+            // Other Nodes' changes show here at once too.
+            signal(&api.changes);
+            done
+        })
+        .await
+        .expect("Peripheral actions don't panic")
     }
 
     async fn act(&self, name: &str, action: PeripheralAction) -> Result<Done, Refusal> {
@@ -420,7 +418,7 @@ impl<T: LocalApi + Clone> Api<T> {
                     .command(&survey, &target.node, address, Command::Connect)
                     .await;
                 if let Err(error) = connected {
-                    notes.extend(Self::holders(&survey));
+                    notes.extend(Self::holders(&view));
                     let message = format!("couldn't connect {alias} on {target_name}: {error}");
                     return Err(failed(with_notes(message, &notes)));
                 }
@@ -442,6 +440,7 @@ impl<T: LocalApi + Clone> Api<T> {
                     .command(&survey, &target.node, address, Command::Pair)
                     .await;
                 if let Err(error) = paired {
+                    notes.extend(Self::holders(&view));
                     let message = format!("couldn't pair {alias} with {target_name}: {error}");
                     return Err(failed(with_notes(message, &notes)));
                 }
@@ -465,6 +464,7 @@ impl<T: LocalApi + Clone> Api<T> {
                     notes.push(format!(
                         "paired it, but couldn't connect it on {target_name}: {error}"
                     ));
+                    notes.extend(Self::holders(&view));
                 }
                 Ok(Done { notes })
             }
@@ -582,9 +582,15 @@ async fn node_command<T: LocalApi + Clone>(
 ) -> Answer<()> {
     let Json(command) = command.map_err(rejected)?;
     let address: Address = address.parse().map_err(invalid)?;
-    api.command_here(address, command)
-        .await
-        .map_err(|error| Refusal(refusal(&error), error.to_string()))?;
+    // To the end even if the asking Node gives up.
+    tokio::spawn(async move {
+        let done = api.command_here(&address, &command).await;
+        signal(&api.changes);
+        done
+    })
+    .await
+    .expect("Bluetooth commands don't panic")
+    .map_err(|error| Refusal(refusal(&error), error.to_string()))?;
     Ok(Json(()))
 }
 

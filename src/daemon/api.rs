@@ -269,8 +269,13 @@ impl<T: LocalApi + Clone> Api<T> {
             .chain(&config.departed)
             .chain(remote.incompatible.keys())
             // A Node that answered, even one that hasn't published its
-            // record yet or holds no Replica.
-            .chain(remote.states.keys())
+            // record yet or holds no Replica, while it is on the tailnet.
+            .chain(
+                remote
+                    .states
+                    .keys()
+                    .filter(|node| devices.contains_key(node)),
+            )
             .chain([&me])
             .collect();
         let mut nodes: Vec<NodeStatus> = named

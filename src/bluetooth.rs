@@ -100,6 +100,8 @@ pub enum Error {
     NeedsCode,
     /// This Node is already pairing a Peripheral.
     Busy,
+    /// BlueZ didn't answer in time.
+    Timeout,
     /// BlueZ refused, with its error's name and message.
     Bluez {
         name: String,
@@ -126,6 +128,7 @@ impl fmt::Display for Error {
             Self::Busy => {
                 f.write_str("it is already pairing a Peripheral; try again once that's done")
             }
+            Self::Timeout => f.write_str("BlueZ didn't answer in time"),
             Self::Bluez { name, message } => {
                 let message = message.as_deref().unwrap_or(name);
                 write!(f, "BlueZ says {message}")?;

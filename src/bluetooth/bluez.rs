@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::time::Instant;
 use zbus::fdo::ObjectManagerProxy;
 use zbus::message::Type;
@@ -32,8 +32,9 @@ const SCAN_POLL: Duration = Duration::from_millis(500);
 /// connect, which can wait on the Peripheral.
 const CALL_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// The properties whose changes the UI shows.
-const SHOWN: [&str; 4] = ["Alias", "Connected", "Paired", "Powered"];
+/// How long to wait after BlueZ signals a change for the rest of its burst,
+/// such as a scan's, before seeing what changed.
+const SETTLE: Duration = Duration::from_millis(500);
 
 /// How long connecting keeps trying while the Peripheral frees itself
 /// from the host it just left.
@@ -55,6 +56,7 @@ trait Device1 {
     fn connect(&self) -> zbus::Result<()>;
     fn disconnect(&self) -> zbus::Result<()>;
     fn pair(&self) -> zbus::Result<()>;
+    fn cancel_pairing(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn set_alias(&self, alias: &str) -> zbus::Result<()>;
     #[zbus(property)]
@@ -202,6 +204,9 @@ fn bluez_error(error: zbus::Error) -> Error {
             message,
         },
         zbus::Error::FDO(error) => fdo_error(*error),
+        zbus::Error::InputOutput(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Error::Timeout
+        }
         error => Error::Bus(error),
     }
 }
@@ -247,9 +252,10 @@ impl Bluez {
         })
     }
 
-    /// Calls `changed` whenever BlueZ says something the UI shows changed,
-    /// such as a Peripheral connecting, until the connection to the bus
-    /// closes. Changes a scan makes, such as signal strengths, don't count.
+    /// Calls `changed` whenever this Node's paired Peripherals change, such
+    /// as one connecting, until the connection to the bus closes. Each burst
+    /// of BlueZ's signals is checked once it settles, so a scan's churn,
+    /// such as signal strengths, doesn't count.
     pub async fn watch(&self, changed: impl Fn()) -> Result<(), Error> {
         let rule = MatchRule::builder()
             .msg_type(Type::Signal)
@@ -259,8 +265,13 @@ impl Bluez {
         let mut signals = MessageStream::for_match_rule(rule, &self.connection, None)
             .await
             .map_err(Error::Bus)?;
-        while let Some(signal) = signals.next().await {
-            if signal.is_ok_and(|signal| shown(&signal)) {
+        let mut last = self.paired().await.ok();
+        while signals.next().await.is_some() {
+            tokio::time::sleep(SETTLE).await;
+            while let Some(Some(_)) = signals.next().now_or_never() {}
+            let now = self.paired().await.ok();
+            if now != last {
+                last = now;
                 changed();
             }
         }
@@ -518,6 +529,13 @@ impl Bluez {
                 .map_err(bluez_error)?;
             let device = self.device_proxy(path).await?;
             let paired = device.pair().await.map_err(bluez_error);
+            if paired.is_err() {
+                // So that a bonding that outlived the call doesn't finish
+                // without heighliner trusting the Peripheral.
+                if let Err(error) = device.cancel_pairing().await {
+                    tracing::debug!(%error, "can't cancel pairing");
+                }
+            }
             if let Err(error) = manager.unregister_agent(&agent_path).await {
                 tracing::debug!(%error, "can't unregister the pairing agent");
             }
@@ -528,70 +546,5 @@ impl Bluez {
             tracing::debug!(%error, "can't stop serving the pairing agent");
         }
         paired
-    }
-}
-
-/// Whether `signal` says something the UI shows changed: a property of
-/// [`SHOWN`] on an adapter or device, or a paired device appearing.
-fn shown(signal: &zbus::Message) -> bool {
-    let header = signal.header();
-    let body = signal.body();
-    match header.member().map(|member| member.as_str()) {
-        Some("PropertiesChanged") => body
-            .deserialize::<(&str, HashMap<&str, zbus::Variant<'_>>, Vec<&str>)>()
-            .is_ok_and(|(interface, changed, invalidated)| {
-                [ADAPTER, DEVICE].contains(&interface)
-                    && changed
-                        .keys()
-                        .chain(&invalidated)
-                        .any(|name| SHOWN.contains(name))
-            }),
-        Some("InterfacesAdded") => body
-            .deserialize::<(ObjectPath<'_>, HashMap<&str, Properties>)>()
-            .is_ok_and(|(_, interfaces)| {
-                interfaces
-                    .get(DEVICE)
-                    .is_some_and(|properties| boolean(properties, "Paired"))
-            }),
-        Some("InterfacesRemoved") => true,
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn properties_changed(interface: &str, changed: &[(&str, bool)]) -> zbus::Message {
-        let changed: HashMap<&str, zbus::Variant<'_>> = changed
-            .iter()
-            .map(|(name, value)| (*name, zbus::Variant::from(*value)))
-            .collect();
-        zbus::Message::signal(
-            "/org/bluez/hci0/dev_98_47_44_A6_21_19",
-            "org.freedesktop.DBus.Properties",
-            "PropertiesChanged",
-        )
-        .build(&(interface, changed, Vec::<&str>::new()))
-        .unwrap()
-    }
-
-    #[test]
-    fn only_changes_the_ui_shows_count() {
-        assert!(shown(&properties_changed(DEVICE, &[("Connected", true)])));
-        assert!(shown(&properties_changed(ADAPTER, &[("Powered", false)])));
-        // A scan's churn.
-        assert!(!shown(&properties_changed(
-            DEVICE,
-            &[("ServicesResolved", true)]
-        )));
-        assert!(!shown(&properties_changed(
-            ADAPTER,
-            &[("Discovering", true)]
-        )));
-        assert!(!shown(&properties_changed(
-            "org.bluez.MediaTransport1",
-            &[("Connected", true)]
-        )));
     }
 }

@@ -29,7 +29,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the daemon may take to act on a Peripheral, which can involve
 /// another Node scanning for it, then pairing and connecting it.
-const PERIPHERAL_TIMEOUT: Duration = Duration::from_secs(240);
+const PERIPHERAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long connecting to one of the daemon's addresses may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -471,22 +471,15 @@ pub fn format_peripherals(view: &api::Peripherals) -> String {
         }
     }
     let without: Vec<&str> = view
-        .nodes
-        .iter()
-        .filter(|node| node.bluetooth == api::BluetoothState::NoAdapter)
+        .without_bluetooth()
         .map(|node| view.node_name(&node.node))
         .collect();
     if !without.is_empty() {
         out.push_str(&format!("Without Bluetooth: {}\n", without.join(", ")));
     }
     let unknown: Vec<String> = view
-        .nodes
-        .iter()
-        .filter(|node| node.bluetooth != api::BluetoothState::NoAdapter)
-        .filter_map(|node| {
-            let problem = node.bluetooth.problem()?;
-            Some(format!("  {} {problem}\n", view.node_name(&node.node)))
-        })
+        .not_shown()
+        .map(|(node, problem)| format!("  {} {problem}\n", view.node_name(&node.node)))
         .collect();
     if !unknown.is_empty() {
         out.push_str("Nodes not shown:\n");

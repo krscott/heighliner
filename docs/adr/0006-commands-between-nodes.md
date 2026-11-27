@@ -2,12 +2,13 @@
 
 Items and Replicas are records that every Node keeps and merges, so edits work
 while Nodes can't reach each other. A Peripheral's connection is different: it
-belongs to one Node's Bluetooth stack right now, and moving it needs both Nodes
-at once. So heighliner stores nothing about Peripherals. The Node serving a
-page asks each reachable Node for its Peripherals. A Handoff, pairing,
-disconnecting, forgetting and naming are synchronous requests from that Node to each Node
-involved, over write routes in the Node protocol; a Handoff disconnects
-wherever the Peripheral is connected, then connects on the target.
+belongs to one Node's Bluetooth stack right now, and moving it needs both
+Nodes at once. So heighliner stores nothing about Peripherals. The Node
+serving a page asks each reachable Node for its Peripherals. A Handoff,
+pairing, disconnecting, forgetting and naming are synchronous requests from
+that Node to each Node involved, over write routes in the Node protocol; a
+Handoff disconnects wherever the Peripheral is connected, then connects on the
+target.
 
 ## Considered Options
 

@@ -93,7 +93,7 @@ pub struct NodePeripherals {
 pub enum Command {
     Connect,
     Disconnect,
-    /// Scan for it in pairing mode, then pair, trust and connect it.
+    /// Scan for it in pairing mode, then pair and trust it.
     Pair,
     Forget,
     /// Name it `alias` on the Node.

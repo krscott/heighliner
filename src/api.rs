@@ -53,9 +53,9 @@ pub fn replica(item: &str, node: &str) -> String {
 pub struct Status {
     /// The Node answering.
     pub node: NodeId,
-    /// The Nodes the records name, the ones on the tailnet whose states
-    /// were read, and the ones that speak another major version of the
-    /// Node protocol.
+    /// The Nodes the records name, the ones whose states were read unless
+    /// Tailscale says they have left the tailnet, and the ones that speak
+    /// another major version of the Node protocol.
     #[serde(default)]
     pub nodes: Vec<NodeStatus>,
     pub items: Vec<ItemStatus>,

@@ -1031,8 +1031,11 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     if let Some(Bluetooth::Bluez(bluez)) = daemon.bluetooth.clone() {
         let changes = daemon.changes.clone();
         tasks.spawn(async move {
-            if let Err(error) = bluez.watch(|| self::signal(&changes)).await {
-                tracing::warn!(%error, "can't follow BlueZ's changes; pages show them on their next refresh");
+            match bluez.watch(|| self::signal(&changes)).await {
+                Ok(()) => tracing::warn!(
+                    "lost the system bus, so Peripherals can't be managed until heighliner restarts"
+                ),
+                Err(error) => tracing::warn!(%error, "can't follow BlueZ's changes; pages show them on their next refresh"),
             }
         });
     }

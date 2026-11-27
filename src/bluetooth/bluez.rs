@@ -492,16 +492,21 @@ impl Bluez {
             asked_for_code: asked_for_code.clone(),
         };
         let device = self.device_proxy(&path).await?;
-        // So that it can reconnect by itself and use its profiles, such as
-        // audio, without asking. Trusted first, so that a bonding that
-        // outlives the call to pair ends trusted too.
-        device.set_trusted(true).await.map_err(bluez_error)?;
-        let paired = self.pair_with_agent(&path, agent).await;
+        let paired = self.pair_with_agent(&device, agent).await;
         drop(pairing);
-        if paired.is_err() && asked_for_code.load(Ordering::Relaxed) {
-            return Err(Error::NeedsCode);
+        match paired {
+            Err(_) if asked_for_code.load(Ordering::Relaxed) => Err(Error::NeedsCode),
+            // A bonding that outlived the call may still finish; trusted,
+            // it can be used once it does. A failed one is left untrusted,
+            // so that BlueZ forgets the device.
+            Ok(()) | Err(Error::Timeout) => {
+                // So that it can reconnect by itself and use its profiles,
+                // such as audio, without asking.
+                device.set_trusted(true).await.map_err(bluez_error)?;
+                paired
+            }
+            Err(error) => Err(error),
         }
-        paired
     }
 
     /// Waits until the scan on `adapter` sees `address`, and returns its
@@ -529,8 +534,8 @@ impl Bluez {
         }
     }
 
-    /// Pairs the device at `path`, with `agent` answering BlueZ.
-    async fn pair_with_agent(&self, path: &OwnedObjectPath, agent: Agent) -> Result<(), Error> {
+    /// Pairs `device`, with `agent` answering BlueZ.
+    async fn pair_with_agent(&self, device: &Device1Proxy<'_>, agent: Agent) -> Result<(), Error> {
         let agent_path = ObjectPath::from_static_str_unchecked(AGENT_PATH);
         let server = self.connection.object_server();
         server.at(&agent_path, agent).await.map_err(Error::Bus)?;
@@ -544,7 +549,6 @@ impl Bluez {
                 .register_agent(&agent_path, "NoInputNoOutput")
                 .await
                 .map_err(bluez_error)?;
-            let device = self.device_proxy(path).await?;
             let paired = device.pair().await.map_err(bluez_error);
             if let Err(error) = manager.unregister_agent(&agent_path).await {
                 tracing::debug!(%error, "can't unregister the pairing agent");

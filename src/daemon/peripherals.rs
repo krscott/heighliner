@@ -218,11 +218,11 @@ impl<T: LocalApi + Clone> Api<T> {
             .enumerate()
         {
             let mut addr = None;
+            // Until it answers, for a Node that is asked.
             let bluetooth = match (&node.reach, node.ip) {
                 (Reach::Here, _) => {
                     let api = self.clone();
                     asking.spawn(async move { (index, answered(api.paired_here().await)) });
-                    // Until it answers.
                     BluetoothState::Unreachable
                 }
                 (Reach::Live { .. }, Some(ip)) => {
@@ -244,8 +244,11 @@ impl<T: LocalApi + Clone> Api<T> {
                 name: node.name,
                 bluetooth,
             };
-            let paired = Vec::new();
-            nodes.push(Asked { node, addr, paired });
+            nodes.push(Asked {
+                node,
+                addr,
+                paired: Vec::new(),
+            });
         }
         while let Some(joined) = asking.join_next().await {
             let (index, answer) = joined.expect("asking tasks don't panic");

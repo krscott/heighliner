@@ -137,24 +137,24 @@ impl<T: LocalApi + Clone> Api<T> {
     /// This Node's view of the Fleet.
     pub(super) async fn status(&self) -> Status {
         // Names are a convenience; without Tailscale, IDs do.
-        let tailnet = self.tailscale.status().await;
-        let asked_tailscale = tailnet.is_ok();
-        let devices: BTreeMap<NodeId, (String, Option<IpAddr>)> = match tailnet {
-            Ok(tailnet) => std::iter::once(tailnet.me())
-                .chain(tailnet.owned_devices())
-                .map(|device| {
-                    let ip = device
-                        .ips
-                        .iter()
-                        .find(|ip| ip.is_ipv4())
-                        .or(device.ips.first())
-                        .copied();
-                    (device.id.clone(), (device.name.clone(), ip))
-                })
-                .collect(),
-            Err(_) => BTreeMap::new(),
-        };
-        let name_of = |node: &NodeId| devices.get(node).map(|(name, _)| name.clone());
+        // None if Tailscale can't be asked.
+        let devices: Option<BTreeMap<NodeId, (String, Option<IpAddr>)>> =
+            self.tailscale.status().await.ok().map(|tailnet| {
+                std::iter::once(tailnet.me())
+                    .chain(tailnet.owned_devices())
+                    .map(|device| {
+                        let ip = device
+                            .ips
+                            .iter()
+                            .find(|ip| ip.is_ipv4())
+                            .or(device.ips.first())
+                            .copied();
+                        (device.id.clone(), (device.name.clone(), ip))
+                    })
+                    .collect()
+            });
+        let device = |node: &NodeId| devices.as_ref().and_then(|devices| devices.get(node));
+        let name_of = |node: &NodeId| device(node).map(|(name, _)| name.clone());
         let (config, me) = {
             let db = self.db.lock().unwrap();
             (db.config(), db.node().clone())
@@ -272,12 +272,11 @@ impl<T: LocalApi + Clone> Api<T> {
             // A Node that answered, even one that hasn't published its
             // record yet or holds no Replica, unless Tailscale says it has
             // left the tailnet.
-            .chain(
-                remote
-                    .states
-                    .keys()
-                    .filter(|node| !asked_tailscale || devices.contains_key(node)),
-            )
+            .chain(remote.states.keys().filter(|node| {
+                devices
+                    .as_ref()
+                    .is_none_or(|devices| devices.contains_key(*node))
+            }))
             .chain([&me])
             .collect();
         let mut nodes: Vec<NodeStatus> = named
@@ -298,7 +297,7 @@ impl<T: LocalApi + Clone> Api<T> {
                 NodeStatus {
                     node: node.clone(),
                     name: name_of(node),
-                    ip: devices.get(node).and_then(|(_, ip)| *ip),
+                    ip: device(node).and_then(|(_, ip)| *ip),
                     departed: config.departed.contains(node),
                     reach,
                 }

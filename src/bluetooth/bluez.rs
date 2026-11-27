@@ -498,17 +498,17 @@ impl Bluez {
             paired => paired,
         };
         match &paired {
-            // The call to pair, or to register the agent, may have timed
-            // out after BlueZ acted, and the bonding may still finish,
-            // trusted.
+            // The call to pair may have timed out while BlueZ bonds, and the
+            // bonding may still finish, trusted. A timed-out registration
+            // lands here too; pairing wasn't asked for, so a newly found
+            // device is still temporary, and BlueZ forgets it.
             Ok(()) | Err(Error::Timeout) => {}
             // Another operation on the device is under way, not to be
             // undone.
             Err(error) if is_bluez(error, "InProgress") => {}
-            // BlueZ keeps a device it tried to pair, and forgets an
-            // untrusted one whose pairing failed; trusted, it would stay
-            // stored, unpaired, where heighliner can't see or forget it. So
-            // it is removed, as BlueZ would have.
+            // Asked to pair a device, BlueZ stores it; trusted, one whose
+            // pairing failed stays stored, unpaired, where heighliner can't
+            // see or forget it, so it is removed.
             Err(_) => {
                 if let Err(error) = adapter.remove_device(&path.as_ref()).await {
                     tracing::debug!(%error, "can't remove a Peripheral that didn't pair");

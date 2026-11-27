@@ -13,14 +13,13 @@ use axum::http::{StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures_util::future::BoxFuture;
 use maud::{Markup, html};
 use tokio::time::Instant;
 
 use super::actions::{self, same_origin};
 use super::{PERIPHERALS, any_page, button, node_name, other_nodes};
 use crate::api::{Peripherals, Status};
-use crate::auth::{Denied, Recheck};
+use crate::auth::Recheck;
 use crate::daemon::api::Api;
 use crate::input::{Device, MAX_TEXT, RemoteInput, Session};
 use crate::tailscale::LocalApi;
@@ -123,10 +122,11 @@ fn controls(me: &str) -> Markup {
                 (key("volume_up", "Vol +", "Volume up"))
                 (key("mute", "Mute", "Mute"))
             }
-            // Last, so the keys stay in view above the phone's keyboard.
+            p.note.remote-note role="status" {}
+            // Last, so the keys and notices stay in view above the phone's
+            // keyboard.
             textarea.typing rows="1" placeholder="Type here" aria-label="Type"
                 autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" {}
-            p.note.remote-note role="status" {}
             script src="/ui/input.js" defer {}
         }
     }
@@ -255,8 +255,18 @@ async fn socket<T: LocalApi + Clone>(
 async fn serve<T: LocalApi>(mut socket: WebSocket, device: Arc<Device>, recheck: Recheck<T>) {
     let mut session = Session::new(device);
     let mut pings = tokio::time::interval(PING_EVERY);
-    let mut rechecks = tokio::time::interval_at(Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
-    let mut checking: Option<BoxFuture<'static, Result<(), Denied>>> = None;
+    // Checked alongside the page's messages, since asking tailscaled can
+    // take seconds.
+    let revoked = async {
+        let mut rechecks = tokio::time::interval_at(Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
+        loop {
+            rechecks.tick().await;
+            if let Err(denied) = recheck.authorize().await {
+                break denied;
+            }
+        }
+    };
+    tokio::pin!(revoked);
     let mut deadline = Instant::now() + SILENCE;
     loop {
         let message = tokio::select! {
@@ -270,20 +280,9 @@ async fn serve<T: LocalApi>(mut socket: WebSocket, device: Arc<Device>, recheck:
                 }
                 continue;
             }
-            // Checked alongside the page's messages, since asking tailscaled
-            // can take seconds.
-            _ = rechecks.tick(), if checking.is_none() => {
-                let recheck = recheck.clone();
-                checking = Some(Box::pin(async move { recheck.authorize().await }));
-                continue;
-            }
-            checked = async { checking.as_mut().expect("checked only while checking").await }, if checking.is_some() => {
-                checking = None;
-                if let Err(denied) = checked {
-                    tracing::warn!(%denied, "closing a Remote Input page whose caller is no longer authorized");
-                    break;
-                }
-                continue;
+            denied = &mut revoked => {
+                tracing::warn!(%denied, "closing a Remote Input page whose caller is no longer authorized");
+                break;
             }
             () = tokio::time::sleep_until(deadline) => {
                 tracing::info!("a Remote Input page went quiet; releasing what it held");

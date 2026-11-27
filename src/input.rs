@@ -151,7 +151,7 @@ pub enum Message {
     },
     /// Presses `button` and leaves it down, or releases it.
     Button { button: Button, down: bool },
-    /// Types `text`, a keystroke for each character, with `modifiers` held.
+    /// Types `text`, each character one chord with `modifiers`.
     Text {
         text: String,
         #[serde(default)]

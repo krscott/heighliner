@@ -60,8 +60,10 @@
     const opened = new WebSocket(url);
     socket = opened;
     opened.addEventListener("open", () => {
-      // What was typed while disconnected never arrived.
+      // What was typed while disconnected never arrived, and the daemon
+      // released what the last connection held.
       forget();
+      held.clear();
       show("connected", "good");
     });
     opened.addEventListener("message", (event) => {
@@ -152,34 +154,26 @@
     frame ??= requestAnimationFrame(flush);
   }
 
-  // How many of the page's controls hold each button down: a Left button
-  // held while the touchpad drags is released only when both let go.
-  const holds = { left: 0, middle: 0, right: 0 };
+  // The buttons the page holds down, which a click would release.
+  const held = new Set();
 
-  function sendClick(button) {
-    // A click would release a button a control holds.
-    if (holds[button] === 0) {
-      flush();
-      send({ type: "click", button, modifiers: takeModifiers() });
+  // Sends a tap's click that is waiting to see whether a second tap
+  // follows, so that it comes before whatever is sent next.
+  function settle() {
+    if (waiting !== null) {
+      clearTimeout(waiting);
+      waiting = null;
+      click("left");
     }
   }
 
   function click(button) {
+    settle();
     forget();
-    sendClick(button);
-  }
-
-  // Sends a tap's click that is waiting to see whether a second tap
-  // follows, so that it comes before what is sent next. Says whether it
-  // did.
-  function settle() {
-    if (waiting === null) {
-      return false;
+    if (!held.has(button)) {
+      flush();
+      send({ type: "click", button, modifiers: takeModifiers() });
     }
-    clearTimeout(waiting);
-    waiting = null;
-    sendClick("left");
-    return true;
   }
 
   function pressKeys(keys) {
@@ -191,16 +185,15 @@
   function press(button) {
     settle();
     forget();
-    holds[button] += 1;
-    if (holds[button] === 1) {
+    if (!held.has(button)) {
+      held.add(button);
       flush();
       send({ type: "button", button, down: true });
     }
   }
 
   function release(button) {
-    holds[button] -= 1;
-    if (holds[button] === 0) {
+    if (held.delete(button)) {
       flush();
       send({ type: "button", button, down: false });
     }
@@ -219,18 +212,23 @@
 
   for (const button of remote.querySelectorAll("[data-modifier]")) {
     const key = button.dataset.modifier;
-    button.addEventListener("click", () => setLatched(key, !latched.has(key)));
+    button.addEventListener("click", () => {
+      // A tap before the modifier doesn't get it, and what the field holds
+      // no longer matters.
+      settle();
+      forget();
+      setLatched(key, !latched.has(key));
+    });
   }
 
-  // Mouse buttons are held for as long as they are pressed, so one can be
-  // held while another finger moves the pointer. With a modifier latched,
-  // one clicks instead.
+  // Mouse buttons are held for as long as a finger is on them, so one can
+  // be held while another finger moves the pointer. With a modifier
+  // latched, one clicks instead.
   for (const button of remote.querySelectorAll("[data-button]")) {
     const name = button.dataset.button;
-    let down = false;
-    const up = () => {
-      if (down) {
-        down = false;
+    const fingers = new Set();
+    const up = (event) => {
+      if (fingers.delete(event.pointerId) && fingers.size === 0) {
         release(name);
       }
     };
@@ -241,8 +239,10 @@
         click(name);
         return;
       }
-      down = true;
-      press(name);
+      fingers.add(event.pointerId);
+      if (fingers.size === 1) {
+        press(name);
+      }
     });
     button.addEventListener("pointerup", up);
     button.addEventListener("pointercancel", up);
@@ -357,6 +357,8 @@
       // The second tap of a double tap.
       click("left");
     } else {
+      // The click will move the text cursor on the Node.
+      forget();
       waiting = setTimeout(() => {
         waiting = null;
         click("left");
@@ -365,12 +367,16 @@
   });
 
   // A touch the browser took away, for example for a system gesture,
-  // clicks nothing; a drag it was making ends.
+  // clicks nothing, though the tap before it still does; a drag it was
+  // making ends.
   pad.addEventListener("touchcancel", () => {
-    if (gesture?.dragging) {
-      release("left");
-    }
+    const cancelled = gesture;
     gesture = null;
+    if (cancelled?.dragging) {
+      release("left");
+    } else if (cancelled?.owed) {
+      click("left");
+    }
   });
 
   // Typing. While the user only types, what the field holds is compared
@@ -434,14 +440,10 @@
       }
       return;
     }
-    // After a click, the text cursor may be elsewhere on the Node, where
-    // what the field held isn't.
-    if (settle()) {
-      forget();
-    } else {
-      for (let i = 0; i < erase; i += 1) {
-        send({ type: "keys", keys: ["backspace"] });
-      }
+    // A tap emptied the field, so its click needs nothing erased.
+    settle();
+    for (let i = 0; i < erase; i += 1) {
+      send({ type: "keys", keys: ["backspace"] });
     }
     if (text.length > 0) {
       send({ type: "text", text: text.join(""), modifiers: [] });

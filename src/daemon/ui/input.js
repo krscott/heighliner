@@ -171,8 +171,8 @@
 
   // Sends a tap's click that is waiting to see whether a second tap
   // follows, so that it comes before whatever is sent next. A touch that
-  // started meanwhile can then no longer become a drag. Queuing the tap emptied
-  // the typing field already.
+  // started meanwhile can then no longer become a drag. Queuing the tap
+  // emptied the typing field already.
   function settle() {
     if (waiting !== null) {
       clearTimeout(waiting);

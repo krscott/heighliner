@@ -209,10 +209,7 @@ async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
             None,
         ),
         RemoteInput::Failed(error) => (
-            unavailable(
-                &me,
-                html! { (error) ". heighliner tries again when it restarts." },
-            ),
+            unavailable(&me, html! { (error) ". Restart heighliner to try again." }),
             None,
         ),
     };

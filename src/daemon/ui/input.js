@@ -171,7 +171,7 @@
 
   // Sends a tap's click that is waiting to see whether a second tap
   // follows, so that it comes before whatever is sent next. A touch that
-  // started meanwhile is then no longer a drag. Queuing the tap emptied
+  // started meanwhile can then no longer become a drag. Queuing the tap emptied
   // the typing field already.
   function settle() {
     if (waiting !== null) {
@@ -245,6 +245,8 @@
     button.addEventListener("pointerdown", (event) => {
       event.preventDefault();
       button.setPointerCapture(event.pointerId);
+      // A tap before this may take the latched modifiers first.
+      settle();
       if (latched.size > 0) {
         click(name);
       } else {
@@ -292,9 +294,9 @@
     gesture.fingers = Math.max(gesture.fingers, touches.length);
     gesture.at = centre(touches);
     gesture.count = touches.length;
-    if (gesture.fingers > 1 && gesture.owed) {
-      gesture.owed = false;
-      click("left");
+    // A second finger makes it a scroll or a right click, not a drag.
+    if (gesture.fingers > 1) {
+      settle();
     }
   });
 
@@ -410,6 +412,9 @@
   }
 
   typing.addEventListener("input", () => {
+    // A tap before this may take the latched modifiers first; it emptied
+    // the field already.
+    settle();
     const chars = Array.from(typing.value).flatMap((c) => Array.from(plain[c] ?? c));
     const kept = chars.filter(typeable);
     if (kept.length !== chars.length) {
@@ -437,7 +442,6 @@
     if (latched.size > 0) {
       forget();
       if (text.length === 1) {
-        settle();
         send({ type: "text", text: text[0], modifiers: takeModifiers() });
       } else if (text.length === 0 && erase === 1) {
         pressKeys(["backspace"]);
@@ -446,8 +450,6 @@
       }
       return;
     }
-    // A tap emptied the field, so its click needs nothing erased.
-    settle();
     for (let i = 0; i < erase; i += 1) {
       send({ type: "keys", keys: ["backspace"] });
     }

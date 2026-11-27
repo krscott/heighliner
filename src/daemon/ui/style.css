@@ -349,6 +349,12 @@ form.stack button {
   grid-template-columns: repeat(3, 1fr);
 }
 
+/* A held button stays held while its finger drifts, rather than the page
+   scrolling and cancelling it. */
+.keys.mouse button {
+  touch-action: none;
+}
+
 .keys button {
   padding: 0.6rem 0.25rem;
   touch-action: manipulation;

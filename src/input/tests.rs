@@ -1,8 +1,8 @@
 use super::*;
 
-fn session() -> (Arc<Device>, Session) {
-    let device = Arc::new(Device::recorded());
-    (device.clone(), Session::new(device))
+fn session() -> (Arc<VirtualInput>, Session) {
+    let virtual_input = Arc::new(VirtualInput::recorded());
+    (virtual_input.clone(), Session::new(virtual_input))
 }
 
 fn parse(json: &str) -> Message {
@@ -51,7 +51,7 @@ fn messages_are_read_from_json() {
 
 #[tokio::test]
 async fn text_is_typed_through_a_us_layout() {
-    let (device, mut session) = session();
+    let (virtual_input, mut session) = session();
     session
         .apply(Message::Text {
             text: "aZ!\n".into(),
@@ -64,7 +64,7 @@ async fn text_is_typed_through_a_us_layout() {
     let one = KeyCode::KEY_1;
     let enter = KeyCode::KEY_ENTER;
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [
             vec![Press(a)],
             vec![Release(a)],
@@ -94,7 +94,7 @@ fn every_printable_ascii_character_can_be_typed() {
 
 #[tokio::test]
 async fn text_with_a_character_the_layout_lacks_types_nothing() {
-    let (device, mut session) = session();
+    let (virtual_input, mut session) = session();
     let refused = session
         .apply(Message::Text {
             text: "café".into(),
@@ -102,7 +102,7 @@ async fn text_with_a_character_the_layout_lacks_types_nothing() {
         })
         .await;
     assert!(matches!(refused, Err(Refused::Untypeable('é'))));
-    assert!(device.take().is_empty());
+    assert!(virtual_input.take().is_empty());
 
     let refused = session
         .apply(Message::Text {
@@ -111,12 +111,12 @@ async fn text_with_a_character_the_layout_lacks_types_nothing() {
         })
         .await;
     assert!(matches!(refused, Err(Refused::TooLong)));
-    assert!(device.take().is_empty());
+    assert!(virtual_input.take().is_empty());
 }
 
 #[tokio::test]
 async fn modifiers_are_held_around_text_keys_and_clicks() {
-    let (device, mut session) = session();
+    let (virtual_input, mut session) = session();
     session
         .apply(Message::Text {
             text: "A".into(),
@@ -127,7 +127,7 @@ async fn modifiers_are_held_around_text_keys_and_clicks() {
     let a = KeyCode::KEY_A;
     // Shift is already held, so it isn't pressed again for the capital.
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [
             vec![Press(CTRL)],
             vec![Press(SHIFT)],
@@ -148,7 +148,7 @@ async fn modifiers_are_held_around_text_keys_and_clicks() {
         .unwrap();
     let (alt, b) = (KeyCode::KEY_LEFTALT, KeyCode::KEY_B);
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [
             vec![Press(alt)],
             vec![Press(a)],
@@ -169,7 +169,7 @@ async fn modifiers_are_held_around_text_keys_and_clicks() {
         .unwrap();
     let (alt, tab) = (KeyCode::KEY_LEFTALT, KeyCode::KEY_TAB);
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [
             vec![Press(alt)],
             vec![Press(tab)],
@@ -187,7 +187,7 @@ async fn modifiers_are_held_around_text_keys_and_clicks() {
         .unwrap();
     let left = KeyCode::BTN_LEFT;
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [
             vec![Press(CTRL)],
             vec![Press(left)],
@@ -202,7 +202,7 @@ async fn modifiers_are_held_around_text_keys_and_clicks() {
         })
         .await;
     assert!(matches!(refused, Err(Refused::TooManyKeys)));
-    assert!(device.take().is_empty());
+    assert!(virtual_input.take().is_empty());
 }
 
 #[tokio::test]
@@ -220,10 +220,13 @@ async fn a_double_click_leaves_the_button_up_long_enough_to_count() {
 
 #[tokio::test]
 async fn moves_skip_still_axes() {
-    let (device, mut session) = session();
+    let (virtual_input, mut session) = session();
     session.apply(Message::Move { x: 5, y: 0 }).await.unwrap();
     session.apply(Message::Move { x: 0, y: 0 }).await.unwrap();
-    assert_eq!(device.take(), [vec![Move(RelativeAxisCode::REL_X, 5)]]);
+    assert_eq!(
+        virtual_input.take(),
+        [vec![Move(RelativeAxisCode::REL_X, 5)]]
+    );
 }
 
 #[tokio::test]
@@ -231,13 +234,13 @@ async fn scrolling_sends_whole_notches_as_they_add_up() {
     const REL_HWHEEL_HI_RES: RelativeAxisCode = RelativeAxisCode::REL_HWHEEL_HI_RES;
     const REL_WHEEL: RelativeAxisCode = RelativeAxisCode::REL_WHEEL;
     const REL_WHEEL_HI_RES: RelativeAxisCode = RelativeAxisCode::REL_WHEEL_HI_RES;
-    let (device, mut session) = session();
+    let (virtual_input, mut session) = session();
     // Down: the wheel's axis points up.
     for (x, y) in [(0, 100), (0, 30), (-7, 0)] {
         session.apply(Message::Scroll { x, y }).await.unwrap();
     }
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [
             vec![Move(REL_WHEEL_HI_RES, -100)],
             vec![Move(REL_WHEEL_HI_RES, -30), Move(REL_WHEEL, -1)],
@@ -248,7 +251,7 @@ async fn scrolling_sends_whole_notches_as_they_add_up() {
 
 #[tokio::test]
 async fn dropping_a_session_releases_the_buttons_it_held() {
-    let (device, mut session) = session();
+    let (virtual_input, mut session) = session();
     for (button, down) in [
         (Button::Left, true),
         (Button::Right, true),
@@ -259,7 +262,7 @@ async fn dropping_a_session_releases_the_buttons_it_held() {
             .await
             .unwrap();
     }
-    device.take();
+    virtual_input.take();
     drop(session);
-    assert_eq!(device.take(), [vec![Release(KeyCode::BTN_LEFT)]]);
+    assert_eq!(virtual_input.take(), [vec![Release(KeyCode::BTN_LEFT)]]);
 }

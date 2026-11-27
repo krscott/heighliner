@@ -18,7 +18,7 @@ use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode, Rela
 use serde::Deserialize;
 use tokio::time::Instant;
 
-/// The name the desktop shows for the virtual devices.
+/// The name the desktop shows for the virtual keyboard and pointer.
 const NAME: &str = "heighliner Remote Input";
 
 /// The longest text one message may type.
@@ -49,14 +49,14 @@ pub enum RemoteInput {
     Off,
     /// Enabled, but the virtual keyboard and pointer couldn't be created.
     Failed(Arc<str>),
-    Ready(Arc<Device>),
+    Ready(Arc<VirtualInput>),
 }
 
 impl RemoteInput {
     /// Creates the virtual keyboard and pointer.
     pub fn open() -> Self {
-        match Device::create() {
-            Ok(device) => Self::Ready(Arc::new(device)),
+        match VirtualInput::create() {
+            Ok(virtual_input) => Self::Ready(Arc::new(virtual_input)),
             Err(error) => {
                 let error = format!(
                     "can't create the virtual keyboard and pointer through /dev/uinput: {error}"
@@ -166,8 +166,8 @@ pub enum Refused {
     Untypeable(char),
     TooLong,
     TooManyKeys,
-    /// Writing to the virtual device failed.
-    Device(io::Error),
+    /// Writing to the virtual keyboard and pointer failed.
+    Write(io::Error),
 }
 
 impl fmt::Display for Refused {
@@ -179,18 +179,21 @@ impl fmt::Display for Refused {
             ),
             Self::TooLong => write!(f, "can't type more than {MAX_TEXT} characters at once"),
             Self::TooManyKeys => write!(f, "can't press more than {MAX_KEYS} keys at once"),
-            Self::Device(error) => write!(f, "can't send input to the virtual devices: {error}"),
+            Self::Write(error) => write!(
+                f,
+                "can't send input to the virtual keyboard and pointer: {error}"
+            ),
         }
     }
 }
 
 impl From<io::Error> for Refused {
     fn from(error: io::Error) -> Self {
-        Self::Device(error)
+        Self::Write(error)
     }
 }
 
-/// An input event, before it is written to the virtual device.
+/// An input event, before it is written to the virtual keyboard and pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Event {
     Press(KeyCode),
@@ -209,7 +212,7 @@ impl From<Event> for InputEvent {
 }
 
 /// The virtual keyboard and pointer: one uinput device that has both.
-pub struct Device(Mutex<Sink>);
+pub struct VirtualInput(Mutex<Sink>);
 
 enum Sink {
     Uinput(VirtualDevice),
@@ -218,7 +221,7 @@ enum Sink {
     Recorded(Vec<Vec<Event>>),
 }
 
-impl Device {
+impl VirtualInput {
     fn create() -> io::Result<Self> {
         // Every keyboard key, which saves keeping a list in step with `Key`
         // and the layout, and the pointer's buttons.
@@ -240,13 +243,13 @@ impl Device {
         ] {
             axes.insert(axis);
         }
-        let device = VirtualDevice::builder()?
+        let uinput = VirtualDevice::builder()?
             .name(NAME)
             .input_id(InputId::new(BusType::BUS_VIRTUAL, 0, 0, 1))
             .with_keys(&keys)?
             .with_relative_axes(&axes)?
             .build()?;
-        Ok(Self(Mutex::new(Sink::Uinput(device))))
+        Ok(Self(Mutex::new(Sink::Uinput(uinput))))
     }
 
     #[cfg(test)]
@@ -259,7 +262,7 @@ impl Device {
     pub(crate) fn take(&self) -> Vec<Vec<Event>> {
         match &mut *self.0.lock().unwrap() {
             Sink::Recorded(reports) => std::mem::take(reports),
-            Sink::Uinput(_) => unreachable!("only a recorded device is read"),
+            Sink::Uinput(_) => unreachable!("only a recorded one is read"),
         }
     }
 
@@ -268,9 +271,9 @@ impl Device {
         let mut sink = self.0.lock().unwrap();
         for report in reports.iter().filter(|report| !report.is_empty()) {
             match &mut *sink {
-                Sink::Uinput(device) => {
+                Sink::Uinput(uinput) => {
                     let events: Vec<InputEvent> = report.iter().map(|&e| e.into()).collect();
-                    device.emit(&events)?;
+                    uinput.emit(&events)?;
                 }
                 #[cfg(test)]
                 Sink::Recorded(reports) => reports.push(report.clone()),
@@ -367,11 +370,11 @@ fn chord(keys: &[KeyCode]) -> Vec<Vec<Event>> {
     presses.chain(releases).collect()
 }
 
-/// One page's connection to the virtual devices. It remembers the buttons
+/// One page's connection to the virtual keyboard and pointer. It remembers the buttons
 /// it holds down, and releases them when dropped, so a page that loses its
 /// connection mid-drag leaves nothing held.
 pub struct Session {
-    device: Arc<Device>,
+    virtual_input: Arc<VirtualInput>,
     held: BTreeSet<Button>,
     /// Scrolling not yet sent as a whole wheel notch, right and down.
     unsent: (i32, i32),
@@ -382,10 +385,10 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(device: Arc<Device>) -> Self {
+    pub fn new(virtual_input: Arc<VirtualInput>) -> Self {
         let now = Instant::now();
         Self {
-            device,
+            virtual_input,
             held: BTreeSet::new(),
             unsent: (0, 0),
             next_stroke: now,
@@ -402,7 +405,7 @@ impl Session {
                     .filter(|&(_, value)| value != 0)
                     .map(|(axis, value)| Event::Move(axis, value.into()))
                     .collect();
-                self.device.send(&[report])?;
+                self.virtual_input.send(&[report])?;
             }
             Message::Scroll { x, y } => self.scroll(x.into(), y.into())?,
             Message::Keys { keys } => {
@@ -420,10 +423,12 @@ impl Session {
                 if down {
                     tokio::time::sleep_until(self.next_press).await;
                     self.held.insert(button);
-                    self.device.send(&[vec![Event::Press(button.code())]])?;
+                    self.virtual_input
+                        .send(&[vec![Event::Press(button.code())]])?;
                 } else {
                     self.held.remove(&button);
-                    self.device.send(&[vec![Event::Release(button.code())]])?;
+                    self.virtual_input
+                        .send(&[vec![Event::Release(button.code())]])?;
                     self.next_press = Instant::now() + BUTTON_GAP;
                 }
             }
@@ -435,7 +440,7 @@ impl Session {
     /// Sends `reports` once the last keystroke or click has had its pause.
     async fn stroke(&mut self, reports: Vec<Vec<Event>>) -> io::Result<()> {
         tokio::time::sleep_until(self.next_stroke).await;
-        self.device.send(&reports)?;
+        self.virtual_input.send(&reports)?;
         self.next_stroke = Instant::now() + STROKE_GAP;
         Ok(())
     }
@@ -457,7 +462,7 @@ impl Session {
         .filter(|&(_, value)| value != 0)
         .map(|(axis, value)| Event::Move(axis, value))
         .collect();
-        self.device.send(&[report])
+        self.virtual_input.send(&[report])
     }
 
     /// Types `text`, each character a chord with `modifiers`, if every
@@ -502,7 +507,7 @@ impl Drop for Session {
             .iter()
             .map(|button| vec![Event::Release(button.code())])
             .collect();
-        if let Err(error) = self.device.send(&released) {
+        if let Err(error) = self.virtual_input.send(&released) {
             tracing::warn!(%error, "can't release the buttons a Remote Input page held");
         }
     }

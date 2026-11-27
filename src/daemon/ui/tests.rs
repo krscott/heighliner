@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::daemon::Daemon;
-use crate::input::{Device, RemoteInput};
+use crate::input::{RemoteInput, VirtualInput};
 use crate::model::{AbsPath, Direction, Item, Replica};
 use crate::tailscale::UserId;
 use crate::tailscale::fake::{Fake, device};
@@ -439,7 +439,7 @@ async fn the_remote_input_page_offers_its_controls_and_peripherals() {
     let daemon = daemon(dir.path())
         .await
         .with_bluetooth(bluetooth.bluetooth())
-        .with_remote_input(RemoteInput::Ready(Arc::new(Device::recorded())));
+        .with_remote_input(RemoteInput::Ready(Arc::new(VirtualInput::recorded())));
     let (code, _, body) = get_page(&daemon, input::PAGE).await;
     assert_eq!(code, StatusCode::OK);
     assert!(body.contains("data-socket=\"/ui/input\""), "{body}");
@@ -465,7 +465,7 @@ async fn the_remote_input_page_offers_its_controls_and_peripherals() {
 }
 
 #[tokio::test]
-async fn remote_input_goes_from_the_page_to_the_virtual_devices() {
+async fn remote_input_goes_from_the_page_to_the_virtual_keyboard_and_pointer() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
@@ -473,10 +473,10 @@ async fn remote_input_goes_from_the_page_to_the_virtual_devices() {
     use crate::input::Event;
 
     let dir = tempfile::tempdir().unwrap();
-    let device = Arc::new(Device::recorded());
+    let virtual_input = Arc::new(VirtualInput::recorded());
     let daemon = daemon(dir.path())
         .await
-        .with_remote_input(RemoteInput::Ready(device.clone()));
+        .with_remote_input(RemoteInput::Ready(virtual_input.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let authorizer = Arc::new(Authorizer::new(daemon.api.clone()).await.unwrap());
@@ -517,7 +517,7 @@ async fn remote_input_goes_from_the_page_to_the_virtual_devices() {
     };
     assert!(answer.contains("US keyboard layout"), "{answer}");
     assert_eq!(
-        device.take(),
+        virtual_input.take(),
         [vec![Event::Press(evdev::KeyCode::BTN_LEFT)]]
     );
 
@@ -525,7 +525,7 @@ async fn remote_input_goes_from_the_page_to_the_virtual_devices() {
     drop(socket);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let released = device.take();
+            let released = virtual_input.take();
             if !released.is_empty() {
                 assert_eq!(released, [vec![Event::Release(evdev::KeyCode::BTN_LEFT)]]);
                 break;

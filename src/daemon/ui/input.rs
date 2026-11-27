@@ -21,7 +21,7 @@ use super::{PERIPHERALS, any_page, button, node_name, other_nodes};
 use crate::api::{Peripherals, Status};
 use crate::auth::Recheck;
 use crate::daemon::api::Api;
-use crate::input::{Device, MAX_TEXT, RemoteInput, Session};
+use crate::input::{MAX_TEXT, RemoteInput, Session, VirtualInput};
 use crate::tailscale::LocalApi;
 
 /// The Remote Input page.
@@ -232,8 +232,8 @@ async fn socket<T: LocalApi + Clone>(
     Extension(recheck): Extension<Recheck<T>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let device = match &api.remote_input {
-        RemoteInput::Ready(device) => device.clone(),
+    let virtual_input = match &api.remote_input {
+        RemoteInput::Ready(virtual_input) => virtual_input.clone(),
         RemoteInput::Off => {
             return (StatusCode::NOT_FOUND, "Remote Input is off on this Node").into_response();
         }
@@ -243,14 +243,18 @@ async fn socket<T: LocalApi + Clone>(
     };
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| serve(socket, device, recheck))
+        .on_upgrade(move |socket| serve(socket, virtual_input, recheck))
 }
 
 /// Carries out each message a page sends, answering one it can't with
 /// `{"refused": "why"}`, until the page goes away or its caller may no
 /// longer send them.
-async fn serve<T: LocalApi>(mut socket: WebSocket, device: Arc<Device>, recheck: Recheck<T>) {
-    let mut session = Session::new(device);
+async fn serve<T: LocalApi>(
+    mut socket: WebSocket,
+    virtual_input: Arc<VirtualInput>,
+    recheck: Recheck<T>,
+) {
+    let mut session = Session::new(virtual_input);
     let mut pings = tokio::time::interval(PING_EVERY);
     // Checked alongside the page's messages, since asking tailscaled can
     // take seconds.

@@ -105,21 +105,28 @@ fn name(node: &BluetoothNode) -> &str {
     node.name.as_deref().unwrap_or(node.node.as_str())
 }
 
-/// What another Node's answer says of its Bluetooth.
-fn answered(answer: Result<NodePeripherals, protocol::Error>) -> (BluetoothState, Vec<Paired>) {
+/// What a Node's answer says of its Bluetooth.
+fn answered<E: ToString>(answer: Result<Option<Vec<Paired>>, E>) -> (BluetoothState, Vec<Paired>) {
     match answer {
-        Ok(NodePeripherals { peripherals: None }) => (BluetoothState::NoAdapter, Vec::new()),
-        Ok(NodePeripherals {
-            peripherals: Some(peripherals),
-        }) => (BluetoothState::Ready, peripherals),
-        Err(error) if error.is_not_found() => (BluetoothState::Older, Vec::new()),
-        Err(error) if error.is_unreachable() => (BluetoothState::Unreachable, Vec::new()),
+        Ok(None) => (BluetoothState::NoAdapter, Vec::new()),
+        Ok(Some(peripherals)) => (BluetoothState::Ready, peripherals),
         Err(error) => (
             BluetoothState::Failed {
                 error: error.to_string(),
             },
             Vec::new(),
         ),
+    }
+}
+
+/// What another Node's answer to being asked says of its Bluetooth.
+fn asked_remotely(
+    answer: Result<NodePeripherals, protocol::Error>,
+) -> (BluetoothState, Vec<Paired>) {
+    match answer {
+        Err(error) if error.is_not_found() => (BluetoothState::Older, Vec::new()),
+        Err(error) if error.is_unreachable() => (BluetoothState::Unreachable, Vec::new()),
+        answer => answered(answer.map(|answer| answer.peripherals)),
     }
 }
 
@@ -190,14 +197,13 @@ fn with_notes(message: String, notes: &[String]) -> String {
 
 impl<T: LocalApi + Clone> Api<T> {
     /// This Node's own Peripherals, or `None` if it has no Bluetooth.
-    async fn paired_here(&self) -> Result<Option<Vec<Paired>>, String> {
+    async fn paired_here(&self) -> Result<Option<Vec<Paired>>, bluetooth::Error> {
         let Some(bluetooth) = &self.bluetooth else {
             return Ok(None);
         };
-        match tokio::time::timeout(BLUEZ_LIST_TIMEOUT, bluetooth.paired()).await {
-            Ok(paired) => paired.map_err(|error| error.to_string()),
-            Err(_) => Err("BlueZ didn't answer in time".to_owned()),
-        }
+        tokio::time::timeout(BLUEZ_LIST_TIMEOUT, bluetooth.paired())
+            .await
+            .unwrap_or(Err(bluetooth::Error::Timeout))
     }
 
     /// Asks every Node of `status` that its latest round reached for its
@@ -205,7 +211,6 @@ impl<T: LocalApi + Clone> Api<T> {
     async fn survey(&self, status: Status) -> Survey {
         let mut asking = JoinSet::new();
         let mut nodes: Vec<Asked> = Vec::new();
-        let mut here = None;
         for (index, node) in status
             .nodes
             .into_iter()
@@ -213,43 +218,39 @@ impl<T: LocalApi + Clone> Api<T> {
             .enumerate()
         {
             let mut addr = None;
-            let (bluetooth, paired) = match (&node.reach, node.ip) {
+            let bluetooth = match (&node.reach, node.ip) {
                 (Reach::Here, _) => {
-                    here = Some(index);
-                    // Until it is listed, below.
-                    (BluetoothState::NoAdapter, Vec::new())
+                    let api = self.clone();
+                    asking.spawn(async move { (index, answered(api.paired_here().await)) });
+                    // Until it answers.
+                    BluetoothState::Unreachable
                 }
                 (Reach::Live { .. }, Some(ip)) => {
                     let at = SocketAddr::new(ip, self.port);
                     addr = Some(at);
-                    asking.spawn(
-                        async move { (index, protocol::peripherals(at, LIST_TIMEOUT).await) },
-                    );
-                    // Until it answers.
-                    (BluetoothState::Unreachable, Vec::new())
+                    asking.spawn(async move {
+                        (
+                            index,
+                            asked_remotely(protocol::peripherals(at, LIST_TIMEOUT).await),
+                        )
+                    });
+                    BluetoothState::Unreachable
                 }
-                (Reach::Incompatible { .. }, _) => (BluetoothState::Incompatible, Vec::new()),
-                _ => (BluetoothState::Unreachable, Vec::new()),
+                (Reach::Incompatible { .. }, _) => BluetoothState::Incompatible,
+                _ => BluetoothState::Unreachable,
             };
             let node = BluetoothNode {
                 node: node.node,
                 name: node.name,
                 bluetooth,
             };
+            let paired = Vec::new();
             nodes.push(Asked { node, addr, paired });
-        }
-        if let Some(index) = here {
-            let asked = &mut nodes[index];
-            (asked.node.bluetooth, asked.paired) = match self.paired_here().await {
-                Ok(Some(paired)) => (BluetoothState::Ready, paired),
-                Ok(None) => (BluetoothState::NoAdapter, Vec::new()),
-                Err(error) => (BluetoothState::Failed { error }, Vec::new()),
-            };
         }
         while let Some(joined) = asking.join_next().await {
             let (index, answer) = joined.expect("asking tasks don't panic");
             let asked = &mut nodes[index];
-            (asked.node.bluetooth, asked.paired) = answered(answer);
+            (asked.node.bluetooth, asked.paired) = answer;
         }
         Survey {
             me: status.node,
@@ -569,7 +570,7 @@ async fn node_list<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Answer<Nod
     let peripherals = api
         .paired_here()
         .await
-        .map_err(|error| Refusal(StatusCode::SERVICE_UNAVAILABLE, error))?;
+        .map_err(|error| Refusal(refusal(&error), error.to_string()))?;
     Ok(Json(NodePeripherals { peripherals }))
 }
 

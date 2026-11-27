@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use zbus::fdo::ObjectManagerProxy;
 use zbus::message::Type;
@@ -56,7 +57,6 @@ trait Device1 {
     fn connect(&self) -> zbus::Result<()>;
     fn disconnect(&self) -> zbus::Result<()>;
     fn pair(&self) -> zbus::Result<()>;
-    fn cancel_pairing(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn set_alias(&self, alias: &str) -> zbus::Result<()>;
     #[zbus(property)]
@@ -216,6 +216,8 @@ fn fdo_error(error: zbus::fdo::Error) -> Error {
         zbus::fdo::Error::ServiceUnknown(_) | zbus::fdo::Error::NameHasNoOwner(_) => {
             Error::NoAdapter
         }
+        // The bus gave up waiting for BlueZ.
+        zbus::fdo::Error::NoReply(_) => Error::Timeout,
         zbus::fdo::Error::ZBus(error) => bluez_error(error),
         error => Error::Bus(error.into()),
     }
@@ -265,17 +267,32 @@ impl Bluez {
         let mut signals = MessageStream::for_match_rule(rule, &self.connection, None)
             .await
             .map_err(Error::Bus)?;
-        let mut last = self.paired().await.ok();
-        while signals.next().await.is_some() {
-            tokio::time::sleep(SETTLE).await;
-            while let Some(Some(_)) = signals.next().now_or_never() {}
-            let now = self.paired().await.ok();
-            if now != last {
-                last = now;
-                changed();
+        // The signals are read all along, so they never back up behind
+        // the replies this Node's other calls wait for.
+        let signalled = Notify::new();
+        let read = async {
+            while signals.next().await.is_some() {
+                signalled.notify_one();
             }
+        };
+        let check = async {
+            let mut last = self.paired().await.ok();
+            loop {
+                signalled.notified().await;
+                tokio::time::sleep(SETTLE).await;
+                // A failed read says nothing about what changed.
+                if let Ok(now) = self.paired().await
+                    && last.as_ref() != Some(&now)
+                {
+                    last = Some(now);
+                    changed();
+                }
+            }
+        };
+        tokio::select! {
+            () = read => Ok(()),
+            never = check => never,
         }
-        Ok(())
     }
 
     async fn objects(&self) -> Result<Objects, Error> {
@@ -474,17 +491,17 @@ impl Bluez {
             device: path.clone(),
             asked_for_code: asked_for_code.clone(),
         };
+        let device = self.device_proxy(&path).await?;
+        // So that it can reconnect by itself and use its profiles, such as
+        // audio, without asking. Trusted first, so that a bonding that
+        // outlives the call to pair ends trusted too.
+        device.set_trusted(true).await.map_err(bluez_error)?;
         let paired = self.pair_with_agent(&path, agent).await;
+        drop(pairing);
         if paired.is_err() && asked_for_code.load(Ordering::Relaxed) {
             return Err(Error::NeedsCode);
         }
-        paired?;
-        let device = self.device_proxy(&path).await?;
-        // So that it can reconnect by itself and use its profiles, such as
-        // audio, without asking.
-        device.set_trusted(true).await.map_err(bluez_error)?;
-        drop(pairing);
-        Ok(())
+        paired
     }
 
     /// Waits until the scan on `adapter` sees `address`, and returns its
@@ -529,13 +546,6 @@ impl Bluez {
                 .map_err(bluez_error)?;
             let device = self.device_proxy(path).await?;
             let paired = device.pair().await.map_err(bluez_error);
-            if paired.is_err() {
-                // So that a bonding that outlived the call doesn't finish
-                // without heighliner trusting the Peripheral.
-                if let Err(error) = device.cancel_pairing().await {
-                    tracing::debug!(%error, "can't cancel pairing");
-                }
-            }
             if let Err(error) = manager.unregister_agent(&agent_path).await {
                 tracing::debug!(%error, "can't unregister the pairing agent");
             }

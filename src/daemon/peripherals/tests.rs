@@ -375,7 +375,7 @@ fn an_older_node_answers_not_found() {
         status: StatusCode::NOT_FOUND,
         body: String::new(),
     };
-    assert_eq!(answered(Err(older)).0, BluetoothState::Older);
+    assert_eq!(asked_remotely(Err(older)).0, BluetoothState::Older);
     assert_eq!(
         BluetoothState::Older.problem().unwrap(),
         "runs an older heighliner that can't manage Peripherals; upgrade it"

@@ -819,7 +819,7 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
                             &match (peripheral.paired.len(), view.not_shown().next()) {
                                 (2.., _) => format!("It is unpaired from {name}. Pairing it again there needs it in pairing mode."),
                                 (_, None) => format!("It is unpaired from {name}, the only Node it is paired with, so heighliner can't pair it again."),
-                                (_, Some(_)) => format!("It is unpaired from {name}, the only Node that could be asked it is paired with, so heighliner may not be able to pair it again."),
+                                (_, Some(_)) => format!("It is unpaired from {name}. No other Node that could be asked has it paired, so heighliner may not be able to pair it again."),
                             },
                             button(actions::PERIPHERAL, &[("peripheral", address), ("action", "forget"), node], &format!("Forget it on {name}")),
                         ))

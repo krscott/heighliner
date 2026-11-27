@@ -137,22 +137,23 @@ impl<T: LocalApi + Clone> Api<T> {
     /// This Node's view of the Fleet.
     pub(super) async fn status(&self) -> Status {
         // Names are a convenience; without Tailscale, IDs do.
-        let devices: BTreeMap<NodeId, (String, Option<IpAddr>)> =
-            match self.tailscale.status().await {
-                Ok(tailnet) => std::iter::once(tailnet.me())
-                    .chain(tailnet.owned_devices())
-                    .map(|device| {
-                        let ip = device
-                            .ips
-                            .iter()
-                            .find(|ip| ip.is_ipv4())
-                            .or(device.ips.first())
-                            .copied();
-                        (device.id.clone(), (device.name.clone(), ip))
-                    })
-                    .collect(),
-                Err(_) => BTreeMap::new(),
-            };
+        let tailnet = self.tailscale.status().await;
+        let asked_tailscale = tailnet.is_ok();
+        let devices: BTreeMap<NodeId, (String, Option<IpAddr>)> = match tailnet {
+            Ok(tailnet) => std::iter::once(tailnet.me())
+                .chain(tailnet.owned_devices())
+                .map(|device| {
+                    let ip = device
+                        .ips
+                        .iter()
+                        .find(|ip| ip.is_ipv4())
+                        .or(device.ips.first())
+                        .copied();
+                    (device.id.clone(), (device.name.clone(), ip))
+                })
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        };
         let name_of = |node: &NodeId| devices.get(node).map(|(name, _)| name.clone());
         let (config, me) = {
             let db = self.db.lock().unwrap();
@@ -269,12 +270,13 @@ impl<T: LocalApi + Clone> Api<T> {
             .chain(&config.departed)
             .chain(remote.incompatible.keys())
             // A Node that answered, even one that hasn't published its
-            // record yet or holds no Replica, while it is on the tailnet.
+            // record yet or holds no Replica, unless Tailscale says it has
+            // left the tailnet.
             .chain(
                 remote
                     .states
                     .keys()
-                    .filter(|node| devices.contains_key(node)),
+                    .filter(|node| !asked_tailscale || devices.contains_key(node)),
             )
             .chain([&me])
             .collect();

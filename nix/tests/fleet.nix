@@ -163,7 +163,8 @@ pkgs.testers.runNixOSTest {
         url = "ws://alpha.tailnet:7130/ui/input"
         beta.succeed(
             f"printf '%s\\n' {' '.join(shlex.quote(m) for m in messages)}"
-            f" | websocat -E -H 'Origin: http://alpha.tailnet:7130' {url}"
+            # The URL first: -H takes every argument after it.
+            f" | websocat -E {url} -H 'Origin: http://alpha.tailnet:7130'"
         )
         for seen in [
             "(KEY_LEFTSHIFT), value 1",
@@ -179,7 +180,7 @@ pkgs.testers.runNixOSTest {
             alpha.wait_until_succeeds(f"grep -qF '{seen}' /tmp/events", timeout=30)
 
         # Another site's page can't open the connection.
-        beta.fail(f"echo '{messages[0]}' | websocat -E -H 'Origin: http://evil.example' {url}")
+        beta.fail(f"echo '{messages[0]}' | websocat -E {url} -H 'Origin: http://evil.example'")
 
         page = beta.succeed("curl -sf http://beta.tailnet:7130/input")
         assert "Remote Input is off on this Node" in page, page

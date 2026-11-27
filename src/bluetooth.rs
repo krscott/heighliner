@@ -11,7 +11,7 @@ mod bluez;
 #[cfg(test)]
 pub(crate) mod fake;
 
-pub use bluez::Bluez;
+pub use bluez::{Bluez, SCAN};
 
 /// A Peripheral's Bluetooth address, as six uppercase hex pairs joined by
 /// colons, which is how BlueZ writes it.
@@ -84,10 +84,6 @@ pub struct Paired {
     pub address: Address,
     /// What this Node calls it: the name it was given here, or its own.
     pub alias: String,
-    /// Its own name, as it announces it, if it has.
-    pub name: Option<String>,
-    /// The freedesktop icon name for its kind, such as `audio-headset`.
-    pub icon: Option<String>,
     pub connected: bool,
 }
 
@@ -122,12 +118,14 @@ impl fmt::Display for Error {
             Self::NotSeen => write!(
                 f,
                 "it didn't see the Peripheral within {} s; is the Peripheral in pairing mode?",
-                bluez::SCAN.as_secs()
+                SCAN.as_secs()
             ),
             Self::NeedsCode => f.write_str(
-                "the Peripheral asks for a PIN or passkey, which heighliner can't enter yet",
+                "the Peripheral asks for a PIN or passkey, which heighliner can't enter",
             ),
-            Self::Busy => f.write_str("it is already pairing a Peripheral; try again after"),
+            Self::Busy => {
+                f.write_str("it is already pairing a Peripheral; try again once that's done")
+            }
             Self::Bluez { name, message } => {
                 let message = message.as_deref().unwrap_or(name);
                 write!(f, "BlueZ says {message}")?;
@@ -183,8 +181,8 @@ impl Bluetooth {
         }
     }
 
-    /// Scans for `address`, which must be in pairing mode, then pairs,
-    /// trusts and connects it.
+    /// Scans for `address`, which must be in pairing mode, then pairs and
+    /// trusts it.
     pub async fn pair(&self, address: &Address) -> Result<(), Error> {
         match self {
             Self::Bluez(bluez) => bluez.pair(address).await,

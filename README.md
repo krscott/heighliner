@@ -2,7 +2,7 @@
 
 A control plane for your Tailscale fleet. It tracks directories across the fleet
 and keeps them replicated with Syncthing, and moves Bluetooth Peripherals, such
-as a headset, from one machine to another. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
+as a headset, from one Node to another. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
 and [docs/adr](docs/adr) for the foundational decisions.
 
 Each Node runs a heighliner daemon and a Syncthing instance that heighliner

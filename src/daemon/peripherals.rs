@@ -2,6 +2,11 @@
 //! reachable Node as it is needed, and the actions that move them between
 //! Nodes by commanding each Node involved (ADR-0006). Nothing about them
 //! is stored.
+//!
+//! Actions run in tasks of their own, so that a client that gives up, such
+//! as a phone whose page closes, can't cut one short halfway, as between
+//! disconnecting a Peripheral and connecting it elsewhere, or between
+//! starting a scan and stopping it.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -16,15 +21,15 @@ use tokio::task::JoinSet;
 use super::api::{Answer, Api, Refusal, invalid, rejected};
 use super::signal;
 use crate::api::{
-    self, Bluetooth as NodeBluetooth, BluetoothNode, Done, PairedOn, Peripheral, PeripheralAction,
-    Peripherals, Reach,
+    self, BluetoothNode, BluetoothState, Done, PairedOn, Peripheral, PeripheralAction, Peripherals,
+    Reach, Status,
 };
 use crate::bluetooth::{self, Address, Paired};
 use crate::model::NodeId;
 use crate::protocol::{self, Command, NodePeripherals};
 use crate::tailscale::LocalApi;
 
-/// How long another Node may take to list its Peripherals.
+/// How long a Node, this one included, may take to list its Peripherals.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long another Node may take to carry out a command, which may
@@ -46,7 +51,7 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
 /// One Node, as asked for its Peripherals.
 struct Asked {
     node: BluetoothNode,
-    /// Where to send it commands, for another Node that answered.
+    /// Where it was asked, for another Node.
     addr: Option<SocketAddr>,
     paired: Vec<Paired>,
 }
@@ -71,14 +76,10 @@ impl Survey {
                     .iter_mut()
                     .find(|known| known.address == paired.address)
                 {
-                    Some(known) => {
-                        known.icon = known.icon.take().or_else(|| paired.icon.clone());
-                        known.paired.push(on);
-                    }
+                    Some(known) => known.paired.push(on),
                     None => peripherals.push(Peripheral {
                         address: paired.address.clone(),
                         alias: paired.alias.clone(),
-                        icon: paired.icon.clone(),
                         paired: vec![on],
                     }),
                 }
@@ -102,7 +103,7 @@ impl Survey {
             .filter(|asked| {
                 !matches!(
                     asked.node.bluetooth,
-                    NodeBluetooth::Ready | NodeBluetooth::NoAdapter
+                    BluetoothState::Ready | BluetoothState::NoAdapter
                 )
             })
             .map(|asked| name(&asked.node))
@@ -115,14 +116,16 @@ fn name(node: &BluetoothNode) -> &str {
 }
 
 /// What another Node's answer says of its Bluetooth.
-fn answered(answer: Result<NodePeripherals, protocol::Error>) -> (NodeBluetooth, Vec<Paired>) {
+fn answered(answer: Result<NodePeripherals, protocol::Error>) -> (BluetoothState, Vec<Paired>) {
     match answer {
-        Ok(NodePeripherals { adapter: false, .. }) => (NodeBluetooth::NoAdapter, Vec::new()),
-        Ok(NodePeripherals { peripherals, .. }) => (NodeBluetooth::Ready, peripherals),
-        Err(error) if error.is_not_found() => (NodeBluetooth::Older, Vec::new()),
-        Err(error) if error.is_unreachable() => (NodeBluetooth::Unreachable, Vec::new()),
+        Ok(NodePeripherals { peripherals: None }) => (BluetoothState::NoAdapter, Vec::new()),
+        Ok(NodePeripherals {
+            peripherals: Some(peripherals),
+        }) => (BluetoothState::Ready, peripherals),
+        Err(error) if error.is_not_found() => (BluetoothState::Older, Vec::new()),
+        Err(error) if error.is_unreachable() => (BluetoothState::Unreachable, Vec::new()),
         Err(error) => (
-            NodeBluetooth::Failed {
+            BluetoothState::Failed {
                 error: error.to_string(),
             },
             Vec::new(),
@@ -197,17 +200,19 @@ fn with_notes(message: String, notes: &[String]) -> String {
 
 impl<T: LocalApi + Clone> Api<T> {
     /// This Node's own Peripherals, or `None` if it has no Bluetooth.
-    async fn paired_here(&self) -> Result<Option<Vec<Paired>>, bluetooth::Error> {
-        match &self.bluetooth {
-            Some(bluetooth) => bluetooth.paired().await,
-            None => Ok(None),
+    async fn paired_here(&self) -> Result<Option<Vec<Paired>>, String> {
+        let Some(bluetooth) = &self.bluetooth else {
+            return Ok(None);
+        };
+        match tokio::time::timeout(LIST_TIMEOUT, bluetooth.paired()).await {
+            Ok(paired) => paired.map_err(|error| error.to_string()),
+            Err(_) => Err("BlueZ didn't answer in time".to_owned()),
         }
     }
 
-    /// Asks every Node of the Fleet that the latest round reached for its
+    /// Asks every Node of `status` that its latest round reached for its
     /// Peripherals, at once.
-    async fn survey(&self) -> Survey {
-        let status = self.status().await;
+    async fn survey(&self, status: Status) -> Survey {
         let mut asking = JoinSet::new();
         let mut nodes: Vec<Asked> = Vec::new();
         for (index, node) in status
@@ -216,41 +221,31 @@ impl<T: LocalApi + Clone> Api<T> {
             .filter(|node| !node.departed)
             .enumerate()
         {
-            let addr = node.ip.map(|ip| SocketAddr::new(ip, self.port));
-            let bluetooth = match (&node.reach, addr) {
-                (Reach::Here, _) => NodeBluetooth::Ready,
-                (Reach::Live { .. }, Some(addr)) => {
-                    asking.spawn(async move {
-                        (index, protocol::peripherals(addr, LIST_TIMEOUT).await)
-                    });
-                    NodeBluetooth::Ready
+            let mut addr = None;
+            let (bluetooth, paired) = match (&node.reach, node.ip) {
+                (Reach::Here, _) => match self.paired_here().await {
+                    Ok(Some(paired)) => (BluetoothState::Ready, paired),
+                    Ok(None) => (BluetoothState::NoAdapter, Vec::new()),
+                    Err(error) => (BluetoothState::Failed { error }, Vec::new()),
+                },
+                (Reach::Live { .. }, Some(ip)) => {
+                    let at = SocketAddr::new(ip, self.port);
+                    addr = Some(at);
+                    asking.spawn(
+                        async move { (index, protocol::peripherals(at, LIST_TIMEOUT).await) },
+                    );
+                    // Until it answers.
+                    (BluetoothState::Unreachable, Vec::new())
                 }
-                (Reach::Incompatible { .. }, _) => NodeBluetooth::Incompatible,
-                _ => NodeBluetooth::Unreachable,
+                (Reach::Incompatible { .. }, _) => (BluetoothState::Incompatible, Vec::new()),
+                _ => (BluetoothState::Unreachable, Vec::new()),
             };
-            let paired = Vec::new();
             let node = BluetoothNode {
                 node: node.node,
                 name: node.name,
                 bluetooth,
             };
             nodes.push(Asked { node, addr, paired });
-        }
-        if let Some(here) = nodes
-            .iter_mut()
-            .find(|asked| asked.node.node == status.node)
-        {
-            (here.node.bluetooth, here.paired) = match self.paired_here().await {
-                Ok(Some(paired)) => (NodeBluetooth::Ready, paired),
-                Ok(None) => (NodeBluetooth::NoAdapter, Vec::new()),
-                Err(error) => (
-                    NodeBluetooth::Failed {
-                        error: error.to_string(),
-                    },
-                    Vec::new(),
-                ),
-            };
-            here.addr = None;
         }
         while let Some(joined) = asking.join_next().await {
             let (index, answer) = joined.expect("asking tasks don't panic");
@@ -263,25 +258,30 @@ impl<T: LocalApi + Clone> Api<T> {
         }
     }
 
-    /// The Fleet's Peripherals, as each Node that could be asked has them.
-    pub(super) async fn peripherals(&self) -> Peripherals {
-        self.survey().await.view()
+    /// The Fleet's Peripherals, as each Node of `status` that could be
+    /// asked has them.
+    pub(super) async fn peripherals(&self, status: Status) -> Peripherals {
+        self.survey(status).await.view()
     }
 
     /// Carries out `command` on this Node's Peripheral at `address`.
     async fn command_here(
         &self,
-        address: &Address,
-        command: &Command,
+        address: Address,
+        command: Command,
     ) -> Result<(), bluetooth::Error> {
-        let bluetooth = self.bluetooth.as_ref().ok_or(bluetooth::Error::NoAdapter)?;
-        let done = match command {
-            Command::Connect => bluetooth.connect(address).await,
-            Command::Disconnect => bluetooth.disconnect(address).await,
-            Command::Pair => bluetooth.pair(address).await,
-            Command::Forget => bluetooth.forget(address).await,
-            Command::Name { alias } => bluetooth.set_alias(address, alias).await,
-        };
+        let bluetooth = self.bluetooth.clone().ok_or(bluetooth::Error::NoAdapter)?;
+        let done = tokio::spawn(async move {
+            match command {
+                Command::Connect => bluetooth.connect(&address).await,
+                Command::Disconnect => bluetooth.disconnect(&address).await,
+                Command::Pair => bluetooth.pair(&address).await,
+                Command::Forget => bluetooth.forget(&address).await,
+                Command::Name { alias } => bluetooth.set_alias(&address, &alias).await,
+            }
+        })
+        .await
+        .expect("Bluetooth commands don't panic");
         signal(&self.changes);
         done
     }
@@ -296,7 +296,7 @@ impl<T: LocalApi + Clone> Api<T> {
     ) -> Result<(), String> {
         if *node == survey.me {
             return self
-                .command_here(address, &command)
+                .command_here(address.clone(), command)
                 .await
                 .map_err(|error| error.to_string());
         }
@@ -336,7 +336,7 @@ impl<T: LocalApi + Clone> Api<T> {
     }
 
     /// Disconnects `peripheral` from every Node it is connected to but
-    /// `target`, and says where that failed.
+    /// `target`, all at once, and says where that failed.
     async fn disconnect_elsewhere(
         &self,
         survey: &Survey,
@@ -344,23 +344,28 @@ impl<T: LocalApi + Clone> Api<T> {
         peripheral: &Peripheral,
         target: &NodeId,
     ) -> Vec<String> {
-        let mut notes = Vec::new();
-        for on in &peripheral.paired {
-            if on.connected && on.node != *target {
+        let disconnecting = peripheral
+            .paired
+            .iter()
+            .filter(|on| on.connected && on.node != *target)
+            .map(|on| async move {
                 let disconnected = self
                     .command(survey, &on.node, &peripheral.address, Command::Disconnect)
                     .await;
-                if let Err(error) = disconnected {
+                disconnected.err().map(|error| {
                     let node = view.node_name(&on.node);
-                    notes.push(format!("couldn't disconnect it from {node}: {error}"));
-                }
-            }
-        }
-        notes
+                    format!("couldn't disconnect it from {node}: {error}")
+                })
+            });
+        futures_util::future::join_all(disconnecting)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
-    /// The notes for a failed connection, about where `peripheral` may
-    /// still be connected.
+    /// Where `peripheral` may still be connected, after connecting it
+    /// elsewhere failed.
     fn holders(survey: &Survey) -> Option<String> {
         let unknown = survey.unknown();
         (!unknown.is_empty()).then(|| {
@@ -371,13 +376,21 @@ impl<T: LocalApi + Clone> Api<T> {
         })
     }
 
-    /// Carries out `action` on the Peripheral `name` names.
+    /// Carries out `action` on the Peripheral `name` names, to the end even
+    /// if the request is dropped.
     pub(super) async fn act_on_peripheral(
         &self,
         name: &str,
         action: PeripheralAction,
     ) -> Result<Done, Refusal> {
-        let survey = self.survey().await;
+        let (api, name) = (self.clone(), name.to_owned());
+        tokio::spawn(async move { api.act(&name, action).await })
+            .await
+            .expect("Peripheral actions don't panic")
+    }
+
+    async fn act(&self, name: &str, action: PeripheralAction) -> Result<Done, Refusal> {
+        let survey = self.survey(self.status().await).await;
         let view = survey.view();
         let peripheral = find(&view, name)?;
         let alias = &peripheral.alias;
@@ -429,21 +442,23 @@ impl<T: LocalApi + Clone> Api<T> {
                 // Its other Nodes' name, if they agree on one.
                 if let [(alias, _)] = &peripheral.aliases()[..] {
                     let alias = (*alias).to_owned();
-                    let named = self
-                        .command(
-                            &survey,
-                            &target.node,
-                            address,
-                            Command::Name {
-                                alias: alias.clone(),
-                            },
-                        )
-                        .await;
+                    let command = Command::Name {
+                        alias: alias.clone(),
+                    };
+                    let named = self.command(&survey, &target.node, address, command).await;
                     if let Err(error) = named {
                         notes.push(format!(
                             "couldn't name it {alias} on {target_name}: {error}"
                         ));
                     }
+                }
+                let connected = self
+                    .command(&survey, &target.node, address, Command::Connect)
+                    .await;
+                if let Err(error) = connected {
+                    notes.push(format!(
+                        "paired it, but couldn't connect it on {target_name}: {error}"
+                    ));
                 }
                 Ok(Done { notes })
             }
@@ -485,7 +500,7 @@ impl<T: LocalApi + Clone> Api<T> {
                     };
                     match self.command(&survey, &on.node, address, command).await {
                         Ok(()) => named.push(node),
-                        Err(error) => failures.push(format!("couldn't on {node}: {error}")),
+                        Err(error) => failures.push(format!("couldn't name it on {node}: {error}")),
                     }
                 }
                 if !failures.is_empty() {
@@ -531,7 +546,7 @@ impl<T: LocalApi + Clone> Api<T> {
 }
 
 async fn list<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Json<Peripherals> {
-    Json(api.peripherals().await)
+    Json(api.peripherals(api.status().await).await)
 }
 
 async fn act<T: LocalApi + Clone>(
@@ -545,18 +560,11 @@ async fn act<T: LocalApi + Clone>(
 
 /// This Node's Peripherals, for the other Nodes (Node protocol).
 async fn node_list<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Answer<NodePeripherals> {
-    let answer = match api.paired_here().await {
-        Ok(Some(peripherals)) => NodePeripherals {
-            adapter: true,
-            peripherals,
-        },
-        Ok(None) => NodePeripherals {
-            adapter: false,
-            peripherals: Vec::new(),
-        },
-        Err(error) => return Err(Refusal(refusal(&error), error.to_string())),
-    };
-    Ok(Json(answer))
+    let peripherals = api
+        .paired_here()
+        .await
+        .map_err(|error| Refusal(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    Ok(Json(NodePeripherals { peripherals }))
 }
 
 /// Carries out another Node's command on one of this Node's Peripherals
@@ -568,7 +576,7 @@ async fn node_command<T: LocalApi + Clone>(
 ) -> Answer<()> {
     let Json(command) = command.map_err(rejected)?;
     let address: Address = address.parse().map_err(invalid)?;
-    api.command_here(&address, &command)
+    api.command_here(address, command)
         .await
         .map_err(|error| Refusal(refusal(&error), error.to_string()))?;
     Ok(Json(()))

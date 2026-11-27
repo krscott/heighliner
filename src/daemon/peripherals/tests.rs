@@ -117,7 +117,7 @@ async fn every_reachable_node_lists_its_peripherals() {
             ("n-127.0.0.3", "127.0.0.3")
         ]
     );
-    assert_eq!(view.nodes[2].bluetooth, NodeBluetooth::NoAdapter);
+    assert_eq!(view.nodes[2].bluetooth, BluetoothState::NoAdapter);
     let home = &view.peripherals[0];
     // This Node's name for it.
     assert_eq!(home.alias, "Q20 Home");
@@ -143,10 +143,7 @@ async fn every_reachable_node_lists_its_peripherals() {
         "{text}"
     );
     assert!(text.contains("  127.0.0.1: not paired\n"), "{text}");
-    assert!(
-        text.contains("Nodes not shown:\n  127.0.0.3 has no Bluetooth adapter"),
-        "{text}"
-    );
+    assert!(text.ends_with("Without Bluetooth: 127.0.0.3\n"), "{text}");
 }
 
 #[tokio::test]
@@ -207,7 +204,7 @@ async fn a_failed_handoff_says_where_it_may_still_be() {
          it may be connected to a Node that couldn't be asked: 127.0.0.3"
     );
     let view = client.peripherals().await.unwrap();
-    assert_eq!(view.nodes[2].bluetooth, NodeBluetooth::Unreachable);
+    assert_eq!(view.nodes[2].bluetooth, BluetoothState::Unreachable);
     let to_it = PeripheralAction::Handoff {
         node: node("127.0.0.3"),
     };
@@ -291,7 +288,27 @@ async fn pairing_keeps_its_own_name_when_the_others_disagree() {
     let pair = PeripheralAction::Pair { node: None };
     client.act_on_peripheral(WORK, &pair).await.unwrap();
     assert_eq!(a.get(WORK).unwrap().alias, "soundcore Life Q20");
-    assert_eq!(a.log(), [format!("pair {WORK}")]);
+    assert_eq!(a.log(), [format!("pair {WORK}"), format!("connect {WORK}")]);
+}
+
+#[tokio::test]
+async fn a_pairing_that_cant_connect_still_pairs() {
+    let a = FakeBluetooth::with([]);
+    let b = FakeBluetooth::with([paired(WORK, "Work Q20", false)]);
+    let fleet = Fleet::start(vec![("127.0.0.1", a.clone()), ("127.0.0.2", b)]).await;
+    a.make_pairable(WORK, "soundcore Life Q20");
+    a.make_unreachable(WORK);
+    let client = fleet.client().await;
+    let pair = PeripheralAction::Pair { node: None };
+    let done = client.act_on_peripheral(WORK, &pair).await.unwrap();
+    assert_eq!(
+        done.notes,
+        [
+            "paired it, but couldn't connect it on 127.0.0.1: BlueZ says br-connection-page-timeout; \
+          is the Peripheral on and in range?"
+        ]
+    );
+    assert_eq!(a.get(WORK).unwrap().alias, "Work Q20");
 }
 
 #[tokio::test]
@@ -380,9 +397,9 @@ fn an_older_node_answers_not_found() {
         status: StatusCode::NOT_FOUND,
         body: String::new(),
     };
-    assert_eq!(answered(Err(older)).0, NodeBluetooth::Older);
+    assert_eq!(answered(Err(older)).0, BluetoothState::Older);
     assert_eq!(
-        NodeBluetooth::Older.problem().unwrap(),
+        BluetoothState::Older.problem().unwrap(),
         "runs an older heighliner that can't manage Peripherals; upgrade it"
     );
 }

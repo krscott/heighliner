@@ -380,7 +380,19 @@ async fn the_peripherals_page_moves_and_names_them() {
     let form = format!("peripheral={}&action=fly", percent_encode(WORK));
     let (code, _, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
-    assert!(body.contains("fly isn"), "{body}");
+    assert!(
+        body.contains("Couldn&#39;t do that") || body.contains("Couldn't do that"),
+        "{body}"
+    );
+
+    let form = format!(
+        "peripheral={}&action=name&alias={}",
+        percent_encode(WORK),
+        percent_encode("Q20 Work")
+    );
+    let (code, location, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(location.as_deref(), Some(PERIPHERALS));
 
     // A refusal says why.
     let form = format!(

@@ -23,10 +23,17 @@ const DEVICE: &str = "org.bluez.Device1";
 const AGENT_PATH: &str = "/net/heighliner/agent";
 
 /// How long pairing scans for the Peripheral.
-pub(super) const SCAN: Duration = Duration::from_secs(30);
+pub const SCAN: Duration = Duration::from_secs(30);
 
 /// How often a scan checks whether the Peripheral has shown up.
 const SCAN_POLL: Duration = Duration::from_millis(500);
+
+/// How long BlueZ may take to answer a call, such as one to pair or
+/// connect, which can wait on the Peripheral.
+const CALL_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The properties whose changes the UI shows.
+const SHOWN: [&str; 4] = ["Alias", "Connected", "Paired", "Powered"];
 
 /// How long connecting keeps trying while the Peripheral frees itself
 /// from the host it just left.
@@ -225,15 +232,20 @@ impl Objects {
 impl Bluez {
     /// Connects to the system bus. BlueZ itself needn't be running yet.
     pub async fn open() -> Result<Self, Error> {
-        let connection = Connection::system().await.map_err(Error::Bus)?;
+        let connection = zbus::connection::Builder::system()
+            .method_timeout(CALL_TIMEOUT)
+            .build()
+            .await
+            .map_err(Error::Bus)?;
         Ok(Self {
             connection,
             pairing: Arc::default(),
         })
     }
 
-    /// Calls `changed` whenever BlueZ says anything changed, such as a
-    /// Peripheral connecting, until the connection to the bus closes.
+    /// Calls `changed` whenever BlueZ says something the UI shows changed,
+    /// such as a Peripheral connecting, until the connection to the bus
+    /// closes. Changes a scan makes, such as signal strengths, don't count.
     pub async fn watch(&self, changed: impl Fn()) -> Result<(), Error> {
         let rule = MatchRule::builder()
             .msg_type(Type::Signal)
@@ -243,8 +255,10 @@ impl Bluez {
         let mut signals = MessageStream::for_match_rule(rule, &self.connection, None)
             .await
             .map_err(Error::Bus)?;
-        while signals.next().await.is_some() {
-            changed();
+        while let Some(signal) = signals.next().await {
+            if signal.is_ok_and(|signal| shown(&signal)) {
+                changed();
+            }
         }
         Ok(())
     }
@@ -280,7 +294,6 @@ impl Bluez {
             let (Some(address), Some(adapter)) = (address, adapter) else {
                 continue;
             };
-            let name = string(properties, "Name");
             devices.push(Device {
                 path,
                 adapter,
@@ -288,11 +301,9 @@ impl Bluez {
                 seen: properties.contains_key("RSSI"),
                 peripheral: Paired {
                     alias: string(properties, "Alias")
-                        .or_else(|| name.clone())
+                        .or_else(|| string(properties, "Name"))
                         .unwrap_or_else(|| address.to_string()),
                     address,
-                    name,
-                    icon: string(properties, "Icon"),
                     connected: boolean(properties, "Connected"),
                 },
             });
@@ -458,7 +469,7 @@ impl Bluez {
         // audio, without asking.
         device.set_trusted(true).await.map_err(bluez_error)?;
         drop(pairing);
-        self.connect(address).await
+        Ok(())
     }
 
     /// Waits until the scan on `adapter` sees `address`, and returns its
@@ -513,5 +524,70 @@ impl Bluez {
             tracing::debug!(%error, "can't stop serving the pairing agent");
         }
         paired
+    }
+}
+
+/// Whether `signal` says something the UI shows changed: a property of
+/// [`SHOWN`] on an adapter or device, or a paired device appearing.
+fn shown(signal: &zbus::Message) -> bool {
+    let header = signal.header();
+    let body = signal.body();
+    match header.member().map(|member| member.as_str()) {
+        Some("PropertiesChanged") => body
+            .deserialize::<(&str, HashMap<&str, zbus::Variant<'_>>, Vec<&str>)>()
+            .is_ok_and(|(interface, changed, invalidated)| {
+                [ADAPTER, DEVICE].contains(&interface)
+                    && changed
+                        .keys()
+                        .chain(&invalidated)
+                        .any(|name| SHOWN.contains(name))
+            }),
+        Some("InterfacesAdded") => body
+            .deserialize::<(ObjectPath<'_>, HashMap<&str, Properties>)>()
+            .is_ok_and(|(_, interfaces)| {
+                interfaces
+                    .get(DEVICE)
+                    .is_some_and(|properties| boolean(properties, "Paired"))
+            }),
+        Some("InterfacesRemoved") => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn properties_changed(interface: &str, changed: &[(&str, bool)]) -> zbus::Message {
+        let changed: HashMap<&str, zbus::Variant<'_>> = changed
+            .iter()
+            .map(|(name, value)| (*name, zbus::Variant::from(*value)))
+            .collect();
+        zbus::Message::signal(
+            "/org/bluez/hci0/dev_98_47_44_A6_21_19",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+        )
+        .build(&(interface, changed, Vec::<&str>::new()))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_changes_the_ui_shows_count() {
+        assert!(shown(&properties_changed(DEVICE, &[("Connected", true)])));
+        assert!(shown(&properties_changed(ADAPTER, &[("Powered", false)])));
+        // A scan's churn.
+        assert!(!shown(&properties_changed(
+            DEVICE,
+            &[("ServicesResolved", true)]
+        )));
+        assert!(!shown(&properties_changed(
+            ADAPTER,
+            &[("Discovering", true)]
+        )));
+        assert!(!shown(&properties_changed(
+            "org.bluez.MediaTransport1",
+            &[("Connected", true)]
+        )));
     }
 }

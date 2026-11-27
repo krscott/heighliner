@@ -352,10 +352,19 @@ async fn leave<T: LocalApi + Clone>(
 struct PeripheralForm {
     /// Its address.
     peripheral: String,
-    /// A [`PeripheralAction`]'s tag.
-    action: String,
-    node: Option<String>,
-    alias: Option<String>,
+    #[serde(flatten)]
+    action: PeripheralAction,
+}
+
+/// What `action` does, to say it couldn't.
+fn what(action: &PeripheralAction) -> &'static str {
+    match action {
+        PeripheralAction::Handoff { .. } => "connect it",
+        PeripheralAction::Pair { .. } => "pair it",
+        PeripheralAction::Disconnect { .. } => "disconnect it",
+        PeripheralAction::Forget { .. } => "forget it",
+        PeripheralAction::Name { .. } => "rename it",
+    }
 }
 
 async fn peripheral<T: LocalApi + Clone>(
@@ -363,26 +372,12 @@ async fn peripheral<T: LocalApi + Clone>(
     form: Result<Form<PeripheralForm>, FormRejection>,
 ) -> Response {
     let back_to = PERIPHERALS.to_owned();
-    let form = match fields(form) {
+    let PeripheralForm { peripheral, action } = match fields(form) {
         Ok(form) => form,
         Err(refused) => return done(&api, "do that", Err(refused), back_to).await,
     };
-    let node = form.node;
-    let (what, action) = match (form.action.as_str(), form.alias) {
-        ("handoff", _) => ("connect it", PeripheralAction::Handoff { node }),
-        ("pair", _) => ("pair it", PeripheralAction::Pair { node }),
-        ("disconnect", _) => ("disconnect it", PeripheralAction::Disconnect { node }),
-        ("forget", _) => ("forget it", PeripheralAction::Forget { node }),
-        ("name", Some(alias)) => ("rename it", PeripheralAction::Name { alias }),
-        (action, _) => {
-            let refused = Refusal(
-                StatusCode::BAD_REQUEST,
-                format!("{action} isn't something heighliner can do with a Peripheral"),
-            );
-            return done(&api, "do that", Err(refused), back_to).await;
-        }
-    };
-    match api.act_on_peripheral(&form.peripheral, action).await {
+    let what = what(&action);
+    match api.act_on_peripheral(&peripheral, action).await {
         Ok(Done { notes }) if !notes.is_empty() => {
             let status = api.status().await;
             let main = html! {

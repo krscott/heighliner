@@ -29,8 +29,6 @@ pub(crate) fn paired(address: &str, alias: &str, connected: bool) -> Paired {
     Paired {
         address: address.parse().unwrap(),
         alias: alias.to_owned(),
-        name: Some("soundcore Life Q20".to_owned()),
-        icon: Some("audio-headset".to_owned()),
         connected,
     }
 }
@@ -152,15 +150,12 @@ impl Fake {
             return Err(Error::AlreadyPaired);
         }
         let name = state.pairable.remove(address).ok_or(Error::NotSeen)?;
-        let connected = !state.unreachable.contains(address);
         state.paired.insert(
             address.clone(),
             Paired {
                 address: address.clone(),
-                alias: name.clone(),
-                name: Some(name),
-                icon: Some("audio-headset".into()),
-                connected,
+                alias: name,
+                connected: false,
             },
         );
         Ok(())

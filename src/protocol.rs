@@ -81,9 +81,9 @@ pub fn peripheral_path(address: &Address) -> String {
 /// The answer to `GET` [`PERIPHERALS_PATH`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePeripherals {
-    /// Whether the Node has a Bluetooth adapter that BlueZ manages.
-    pub adapter: bool,
-    pub peripherals: Vec<Paired>,
+    /// Its Peripherals, or none if it has no Bluetooth adapter that BlueZ
+    /// manages.
+    pub peripherals: Option<Vec<Paired>>,
 }
 
 /// What a Node is asked to do with one of its Peripherals. A body is

@@ -288,13 +288,13 @@ pub struct BluetoothNode {
     pub node: NodeId,
     /// Its machine name, if the Node is on the tailnet.
     pub name: Option<String>,
-    pub bluetooth: Bluetooth,
+    pub bluetooth: BluetoothState,
 }
 
 /// What a Node said of its Bluetooth.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
-pub enum Bluetooth {
+pub enum BluetoothState {
     /// It listed its Peripherals.
     Ready,
     /// It has no Bluetooth adapter, or BlueZ isn't running there.
@@ -310,7 +310,7 @@ pub enum Bluetooth {
     },
 }
 
-impl Bluetooth {
+impl BluetoothState {
     /// Why the Node's Peripherals aren't known, if they aren't.
     pub fn problem(&self) -> Option<String> {
         match self {
@@ -333,8 +333,6 @@ pub struct Peripheral {
     /// the order of [`Peripherals::nodes`], so the answering Node's when it
     /// is paired there.
     pub alias: String,
-    /// The freedesktop icon name for its kind, such as `audio-headset`.
-    pub icon: Option<String>,
     /// The Nodes it is paired with, in the order of [`Peripherals::nodes`].
     pub paired: Vec<PairedOn>,
 }
@@ -369,7 +367,7 @@ impl Peripheral {
         nodes: &'a [BluetoothNode],
     ) -> impl Iterator<Item = &'a BluetoothNode> {
         nodes.iter().filter(|node| {
-            node.bluetooth == Bluetooth::Ready
+            node.bluetooth == BluetoothState::Ready
                 && !self.paired.iter().any(|paired| paired.node == node.node)
         })
     }
@@ -395,8 +393,8 @@ pub enum PeripheralAction {
     Handoff {
         node: Option<String>,
     },
-    /// Pair it with the Node, where it must be in pairing mode, then
-    /// connect it there, disconnecting it from every other.
+    /// Disconnect it from every other Node, then pair it with the Node,
+    /// where it must be in pairing mode, and connect it there.
     Pair {
         node: Option<String>,
     },

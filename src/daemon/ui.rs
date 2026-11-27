@@ -18,9 +18,10 @@ use maud::{DOCTYPE, Markup, html};
 
 use super::api::Api;
 use crate::api::{
-    self, ItemStatus, NodeStatus, Peripheral, Peripherals, Reach, ReplicaStatus, Replication,
-    Status,
+    self, BluetoothState, ItemStatus, NodeStatus, Peripheral, Peripherals, Reach, ReplicaStatus,
+    Replication, Status,
 };
+use crate::bluetooth;
 use crate::hlc::Timestamp;
 use crate::http::percent_encode;
 use crate::model::{ItemId, ReplicaState, Role};
@@ -810,7 +811,11 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
                         }
                         (confirmed(
                             "Forget",
-                            "It is unpaired from this Node. Pairing it again needs it in pairing mode.",
+                            &if peripheral.paired.len() > 1 {
+                                format!("It is unpaired from {name}. Pairing it again there needs it in pairing mode.")
+                            } else {
+                                format!("It is unpaired from {name}, the only Node it is paired with, so heighliner can't pair it again.")
+                            },
                             button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "forget"), node.to_vec()].concat(), &format!("Forget it on {name}")),
                         ))
                     }
@@ -824,7 +829,10 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
                     div.actions {
                         (confirmed(
                             "Pair",
-                            "Put it in pairing mode first. The Node looks for it for 30 seconds, then pairs and connects it, disconnecting it from the others.",
+                            &format!(
+                                "Put it in pairing mode first. {name} looks for it for {} seconds, then pairs and connects it, disconnecting it from the others.",
+                                bluetooth::SCAN.as_secs()
+                            ),
                             button(actions::PERIPHERAL, &fields, &format!("Pair it with {name}")),
                         ))
                     }
@@ -835,10 +843,18 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
 }
 
 async fn peripherals<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
-    let (status, view) = tokio::join!(api.status(), api.peripherals());
+    let status = api.status().await;
+    let view = api.peripherals(status.clone()).await;
+    let without: Vec<&str> = view
+        .nodes
+        .iter()
+        .filter(|node| node.bluetooth == BluetoothState::NoAdapter)
+        .map(|node| view.node_name(&node.node))
+        .collect();
     let unknown: Vec<(&str, String)> = view
         .nodes
         .iter()
+        .filter(|node| node.bluetooth != BluetoothState::NoAdapter)
         .filter_map(|node| Some((view.node_name(&node.node), node.bluetooth.problem()?)))
         .collect();
     let main = html! {
@@ -854,6 +870,9 @@ async fn peripherals<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response
             @for peripheral in &view.peripherals {
                 li.card { (peripheral_card(&view, peripheral)) }
             }
+        }
+        @if !without.is_empty() {
+            p.note { "Without Bluetooth: " (without.join(", ")) }
         }
         @if !unknown.is_empty() {
             h2 { "Nodes not shown" }

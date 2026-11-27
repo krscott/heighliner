@@ -323,7 +323,10 @@ impl<T: LocalApi + Clone> Api<T> {
         let asked = survey.asked(&node).ok_or_else(|| {
             Refusal(
                 StatusCode::NOT_FOUND,
-                format!("{} isn't a Node of the Fleet", name.unwrap_or("this")),
+                match name {
+                    Some(name) => format!("{name} isn't a Node of the Fleet"),
+                    None => "this Node has left the Fleet".to_owned(),
+                },
             )
         })?;
         match asked.node.bluetooth.problem() {
@@ -384,9 +387,12 @@ impl<T: LocalApi + Clone> Api<T> {
         action: PeripheralAction,
     ) -> Result<Done, Refusal> {
         let (api, name) = (self.clone(), name.to_owned());
-        tokio::spawn(async move { api.act(&name, action).await })
+        let done = tokio::spawn(async move { api.act(&name, action).await })
             .await
-            .expect("Peripheral actions don't panic")
+            .expect("Peripheral actions don't panic");
+        // Other Nodes' changes show here at once too.
+        signal(&self.changes);
+        done
     }
 
     async fn act(&self, name: &str, action: PeripheralAction) -> Result<Done, Refusal> {

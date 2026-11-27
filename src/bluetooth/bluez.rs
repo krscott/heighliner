@@ -99,8 +99,12 @@ impl Agent {
         }
     }
 
-    fn refuse_code(&self) -> AgentError {
-        self.asked_for_code.store(true, Ordering::Relaxed);
+    /// Refuses a PIN or passkey, noting that the Peripheral being paired
+    /// asked for one.
+    fn refuse_code(&self, device: &ObjectPath<'_>) -> AgentError {
+        if *device == *self.device {
+            self.asked_for_code.store(true, Ordering::Relaxed);
+        }
         AgentError::Rejected("heighliner can't enter a PIN or passkey".into())
     }
 }
@@ -109,20 +113,20 @@ impl Agent {
 impl Agent {
     fn release(&self) {}
 
-    fn request_pin_code(&self, _device: ObjectPath<'_>) -> Result<String, AgentError> {
-        Err(self.refuse_code())
+    fn request_pin_code(&self, device: ObjectPath<'_>) -> Result<String, AgentError> {
+        Err(self.refuse_code(&device))
     }
 
-    fn display_pin_code(&self, _device: ObjectPath<'_>, _pin: &str) -> Result<(), AgentError> {
-        Err(self.refuse_code())
+    fn display_pin_code(&self, device: ObjectPath<'_>, _pin: &str) -> Result<(), AgentError> {
+        Err(self.refuse_code(&device))
     }
 
-    fn request_passkey(&self, _device: ObjectPath<'_>) -> Result<u32, AgentError> {
-        Err(self.refuse_code())
+    fn request_passkey(&self, device: ObjectPath<'_>) -> Result<u32, AgentError> {
+        Err(self.refuse_code(&device))
     }
 
-    fn display_passkey(&self, _device: ObjectPath<'_>, _passkey: u32, _entered: u16) {
-        self.asked_for_code.store(true, Ordering::Relaxed);
+    fn display_passkey(&self, device: ObjectPath<'_>, _passkey: u32, _entered: u16) {
+        self.refuse_code(&device);
     }
 
     fn request_confirmation(

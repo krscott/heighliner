@@ -113,8 +113,19 @@ async fn events<T: LocalApi + Clone>(
     Sse::new(stream)
 }
 
-/// A page titled `title`, served by `status.node`.
+/// A page titled `title`, served by `status.node`, which keeps itself
+/// current.
 fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
+    any_page(status, title, code, main, true)
+}
+
+/// The page a form's post answers with, which stays as it is: fetching
+/// its address again would ask for a form's action.
+fn outcome_page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
+    any_page(status, title, code, main, false)
+}
+
+fn any_page(status: &Status, title: &str, code: StatusCode, main: Markup, live: bool) -> Response {
     let me = node_name(status, &status.node);
     let markup = html! {
         (DOCTYPE)
@@ -124,8 +135,10 @@ fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Respons
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · heighliner on " (me) }
                 link rel="stylesheet" href="/ui/style.css";
-                script src="/ui/live.js" defer {}
-                noscript { meta http-equiv="refresh" content=(TICK.as_secs()); }
+                @if live {
+                    script src="/ui/live.js" defer {}
+                    noscript { meta http-equiv="refresh" content=(TICK.as_secs()); }
+                }
             }
             body {
                 header {
@@ -761,20 +774,12 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     page(&status, "Data conflicts", StatusCode::OK, main)
 }
 
-/// The form fields that act on `peripheral` with `action`, an
-/// [`api::PeripheralAction`]'s tag.
-fn peripheral_fields<'a>(peripheral: &'a Peripheral, action: &'a str) -> Vec<(&'a str, &'a str)> {
-    vec![
-        ("peripheral", peripheral.address.as_str()),
-        ("action", action),
-    ]
-}
-
 /// `peripheral`'s card: each Node it is paired with, with connecting,
 /// disconnecting and forgetting it there, the Nodes it can be paired
 /// with, and a choice of name when its Nodes name it differently.
 fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
     let aliases = peripheral.aliases();
+    let address = peripheral.address.as_str();
     html! {
         p.title { (peripheral.alias) " " span.note { code { (peripheral.address) } } }
         @if aliases.len() > 1 {
@@ -782,7 +787,7 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
                 p { "Its Nodes name it differently. Pick one name for all of them:" }
                 ul.replicas {
                     @for (alias, nodes) in &aliases {
-                        @let fields = [peripheral_fields(peripheral, "name"), vec![("alias", *alias)]].concat();
+                        @let fields = [("peripheral", address), ("action", "name"), ("alias", *alias)];
                         @let names: Vec<&str> = nodes.iter().map(|node| view.node_name(node)).collect();
                         li {
                             q { (alias) } " " span.note { "on " (names.join(", ")) } " "
@@ -795,7 +800,7 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
         ul.paired {
             @for on in &peripheral.paired {
                 @let name = view.node_name(&on.node);
-                @let node = [("node", on.node.as_str())];
+                @let node = ("node", on.node.as_str());
                 li {
                     (name) " "
                     @if on.connected {
@@ -805,9 +810,9 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
                     }
                     div.actions {
                         @if on.connected {
-                            (button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "disconnect"), node.to_vec()].concat(), "Disconnect"))
+                            (button(actions::PERIPHERAL, &[("peripheral", address), ("action", "disconnect"), node], "Disconnect"))
                         } @else {
-                            (button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "handoff"), node.to_vec()].concat(), "Connect"))
+                            (button(actions::PERIPHERAL, &[("peripheral", address), ("action", "handoff"), node], "Connect"))
                         }
                         (confirmed(
                             "Forget",
@@ -816,14 +821,14 @@ fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
                             } else {
                                 format!("It is unpaired from {name}, the only Node it is paired with, so heighliner can't pair it again.")
                             },
-                            button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "forget"), node.to_vec()].concat(), &format!("Forget it on {name}")),
+                            button(actions::PERIPHERAL, &[("peripheral", address), ("action", "forget"), node], &format!("Forget it on {name}")),
                         ))
                     }
                 }
             }
             @for node in peripheral.pairable(&view.nodes) {
                 @let name = view.node_name(&node.node);
-                @let fields = [peripheral_fields(peripheral, "pair"), vec![("node", node.node.as_str())]].concat();
+                @let fields = [("peripheral", address), ("action", "pair"), ("node", node.node.as_str())];
                 li {
                     (name) " " span.badge.unknown { "not paired" }
                     div.actions {

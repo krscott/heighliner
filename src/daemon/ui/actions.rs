@@ -17,7 +17,7 @@ use axum::routing::post;
 use maud::html;
 use serde::Deserialize;
 
-use super::{PERIPHERALS, item_href, page};
+use super::{PERIPHERALS, item_href, outcome_page};
 use crate::api::{self, AddReplica, Done, PeripheralAction, Resolve, Track};
 use crate::daemon::api::{Api, Refusal};
 use crate::http::percent_encode;
@@ -130,7 +130,7 @@ async fn done<T: LocalApi + Clone>(
                 p.callout { (message) }
                 p { a href=(back) { "Back" } }
             };
-            page(&status, &format!("Couldn't {what}"), code, main)
+            outcome_page(&status, &format!("Couldn't {what}"), code, main)
         }
     }
 }
@@ -385,7 +385,7 @@ async fn peripheral<T: LocalApi + Clone>(
                 ul { @for note in &notes { li { (note) } } }
                 p { a href=(back_to) { "Back" } }
             };
-            page(&status, "Done, with problems", StatusCode::OK, main)
+            outcome_page(&status, "Done, with problems", StatusCode::OK, main)
         }
         result => done(&api, what, result.map(drop), back_to).await,
     }

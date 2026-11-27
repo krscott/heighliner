@@ -406,4 +406,6 @@ async fn the_peripherals_page_moves_and_names_them() {
         "{body}"
     );
     assert!(body.contains("already paired with laptop"), "{body}");
+    // It stays as it is, rather than fetching the form's address again.
+    assert!(!body.contains("live.js"), "{body}");
 }

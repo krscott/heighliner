@@ -2,8 +2,6 @@ use super::*;
 use crate::bluetooth::fake::{Fake as FakeBluetooth, paired};
 use crate::cli::{self, Client};
 use crate::daemon::Daemon;
-use crate::hlc::Timestamp;
-use crate::model::{AbsPath, Direction, Item, ItemId, Replica};
 use crate::tailscale::UserId;
 use crate::tailscale::fake::{Fake, device};
 
@@ -11,8 +9,8 @@ const HOME: &str = "98:47:44:A6:21:19";
 const WORK: &str = "98:47:44:A5:A9:3B";
 
 /// A daemon at each of `ips`, each with the Bluetooth stack beside it,
-/// all serving, and the first having pulled from the others, so it reaches
-/// them.
+/// all serving, and the first having pulled from the others, so it knows
+/// and reaches them, though none has published a record.
 struct Fleet {
     daemons: Vec<Daemon<Fake>>,
     tailnets: Vec<Fake>,
@@ -46,26 +44,6 @@ impl Fleet {
             fleet.daemons.push(daemon);
             fleet.tailnets.push(tailnet);
             fleet._dirs.push(dir);
-        }
-        // An Item with a Replica on each Node, so that each is named.
-        {
-            let mut db = fleet.daemons[0].db().lock().unwrap();
-            let id = ItemId::from_u128(1);
-            let me = db.node().clone();
-            let replica = || Replica::new(AbsPath::new("/srv/x").unwrap());
-            db.track(
-                Timestamp::now(),
-                id,
-                Item::new("x", Direction::TwoWay),
-                &me,
-                replica(),
-            )
-            .unwrap();
-            for ip in &ips[1..] {
-                let node = NodeId::new(format!("n-{ip}")).unwrap();
-                db.add_replica(Timestamp::now(), id, &node, replica())
-                    .unwrap();
-            }
         }
         fleet.daemons[0].pull_round().await.unwrap();
         fleet

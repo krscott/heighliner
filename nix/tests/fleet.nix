@@ -27,7 +27,6 @@ let
     users.users.alice.isNormalUser = true;
     environment.systemPackages = [
       pkgs.curl
-      pkgs.evtest
       pkgs.websocat
     ];
   };
@@ -148,9 +147,13 @@ pkgs.testers.runNixOSTest {
             "for d in /sys/class/input/event*; do"
             f" grep -qx '{name}' $d/device/name && basename $d; done | grep ."
         ).strip()
-        # Line-buffered, so each event is in the file as it happens.
-        alpha.succeed(f"systemd-run --unit=evtest sh -c 'stdbuf -oL evtest /dev/input/{event} >/tmp/events'")
-        alpha.wait_until_succeeds("grep -q 'Testing ...' /tmp/events")
+        # By path, since systemd-run's PATH lacks the system's packages, and
+        # line-buffered, so each event is in the file as it happens.
+        alpha.succeed(
+            "systemd-run --unit=evtest sh -c"
+            f" '${pkgs.coreutils}/bin/stdbuf -oL ${pkgs.evtest}/bin/evtest /dev/input/{event} >/tmp/events'"
+        )
+        alpha.wait_until_succeeds("grep -q 'Testing ...' /tmp/events", timeout=30)
         messages = [
             '{"type":"text","text":"Hi"}',
             '{"type":"keys","keys":["ctrl","escape"]}',

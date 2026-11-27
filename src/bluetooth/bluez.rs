@@ -473,12 +473,6 @@ impl Bluez {
             return Err(Error::AlreadyPaired);
         }
         let adapter = objects.adapters.first().ok_or(Error::NoAdapter)?;
-        // Whether BlueZ knew the device before this scan, so that it can be
-        // told apart from one the scan added.
-        let known = objects
-            .devices
-            .iter()
-            .any(|device| device.peripheral.address == *address && device.adapter == adapter.path);
         self.power_on(adapter).await?;
         let adapter = self.adapter_proxy(&adapter.path).await?;
         adapter.start_discovery().await.map_err(bluez_error)?;
@@ -495,29 +489,29 @@ impl Bluez {
         };
         let device = self.device_proxy(&path).await?;
         // Trusted, it can reconnect by itself and use its profiles, such as
-        // audio, without asking. BlueZ decides on the profiles it opens as
-        // it pairs before the call to pair answers, so it is trusted first.
+        // audio, without asking. BlueZ answers the call to pair only after
+        // browsing its services, and authorizes the profiles the Peripheral
+        // opens before then, so it is trusted first.
         device.set_trusted(true).await.map_err(bluez_error)?;
         let paired = match self.pair_with_agent(&device, agent).await {
             Err(_) if asked_for_code.load(Ordering::Relaxed) => Err(Error::NeedsCode),
             paired => paired,
         };
         match &paired {
-            // A bonding that outlived the call may still finish, trusted.
+            // The call to pair, or to register the agent, may have timed
+            // out after BlueZ acted, and the bonding may still finish,
+            // trusted.
             Ok(()) | Err(Error::Timeout) => {}
-            // Another client's pairing, not to be undone.
-            Err(error) if is_bluez(error, "InProgress") || is_bluez(error, "AlreadyExists") => {}
-            // Trusted, a failed pairing's device would stay stored, so it
-            // is removed if the scan added it, as BlueZ would have, and
-            // untrusted otherwise.
+            // Another operation on the device is under way, not to be
+            // undone.
+            Err(error) if is_bluez(error, "InProgress") => {}
+            // BlueZ keeps a device it tried to pair, and forgets an
+            // untrusted one whose pairing failed; trusted, it would stay
+            // stored, unpaired, where heighliner can't see or forget it. So
+            // it is removed, as BlueZ would have.
             Err(_) => {
-                let undone = if known {
-                    device.set_trusted(false).await
-                } else {
-                    adapter.remove_device(&path.as_ref()).await
-                };
-                if let Err(error) = undone {
-                    tracing::debug!(%error, "can't undo trusting a Peripheral that didn't pair");
+                if let Err(error) = adapter.remove_device(&path.as_ref()).await {
+                    tracing::debug!(%error, "can't remove a Peripheral that didn't pair");
                 }
             }
         }
@@ -553,22 +547,28 @@ impl Bluez {
     /// Pairs `device`, with `agent` answering BlueZ.
     async fn pair_with_agent(&self, device: &Device1Proxy<'_>, agent: Agent) -> Result<(), Error> {
         let agent_path = ObjectPath::from_static_str_unchecked(AGENT_PATH);
-        let server = self.connection.object_server();
-        server.at(&agent_path, agent).await.map_err(Error::Bus)?;
         let manager = AgentManager1Proxy::builder(&self.connection)
             .cache_properties(CacheProperties::No)
             .build()
             .await
             .map_err(Error::Bus)?;
+        // Nothing returns between serving the agent and removing it.
+        let server = self.connection.object_server();
+        server.at(&agent_path, agent).await.map_err(Error::Bus)?;
         let registered = manager
             .register_agent(&agent_path, "NoInputNoOutput")
             .await
             .map_err(bluez_error);
         let paired = match registered {
-            // Its path is always the same, so one already registered, as
-            // when unregistering it last failed, is this one.
+            // BlueZ keeps one agent per bus connection, and this one
+            // registers only this agent, so one already registered, as when
+            // unregistering it last failed, is this one.
             Err(error) if !is_bluez(&error, "AlreadyExists") => Err(error),
-            _ => device.pair().await.map_err(bluez_error),
+            _ => match device.pair().await.map_err(bluez_error) {
+                // It paired some other way meanwhile.
+                Err(error) if is_bluez(&error, "AlreadyExists") => Ok(()),
+                paired => paired,
+            },
         };
         // Even after registering seemed to fail, which can be a call that
         // timed out after BlueZ registered it.

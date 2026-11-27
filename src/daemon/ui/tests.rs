@@ -426,10 +426,7 @@ async fn the_remote_input_page_says_why_a_node_takes_none() {
 
     let daemon = daemon.with_remote_input(RemoteInput::Failed("can't open /dev/uinput".into()));
     let (_, _, body) = get_page(&daemon, input::PAGE).await;
-    assert!(
-        body.contains("can&#39;t open /dev/uinput") || body.contains("can't open /dev/uinput"),
-        "{body}"
-    );
+    assert!(body.contains("can't open /dev/uinput"), "{body}");
     assert!(!body.contains("input.js"), "{body}");
 }
 

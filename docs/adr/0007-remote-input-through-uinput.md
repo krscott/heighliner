@@ -24,6 +24,8 @@ browser to that Node over one connection.
 
 A Node that enables Remote Input gives the daemon write access to
 `/dev/uinput`, which can type into any session on the machine, so it's off
-by default and enabled per Node. Input follows the keyboard layout the
+by default and enabled per Node. WhoIs authorizes the owner's devices, not
+programs on them, so any program on any of them, including another
+user's on the Node itself, can send it. Input follows the keyboard layout the
 desktop has, so the page maps text through one layout, US, and refuses
 characters it can't type.

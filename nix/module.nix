@@ -233,7 +233,8 @@ in
             ++ lib.optional cfg.remoteInput.enable "--remote-input"
           )
         );
-        # Only the daemon, not the user's own sessions, may use uinput.
+        # /dev/uinput is the daemon's alone; the user's own sessions don't
+        # get it.
         SupplementaryGroups = lib.optional cfg.remoteInput.enable "uinput";
       };
     };

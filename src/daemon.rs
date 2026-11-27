@@ -989,7 +989,11 @@ pub async fn run(options: Options) -> Result<(), Error> {
     let mut daemon = open_when_ready(api, &options.state_dir, options.port)
         .await?
         .with_retention(options.retention)
-        .with_remote_input(RemoteInput::open(options.remote_input));
+        .with_remote_input(if options.remote_input {
+            RemoteInput::open()
+        } else {
+            RemoteInput::Off
+        });
     if !daemon.tailnet.me().caches_network_maps {
         tracing::warn!(
             "this device doesn't cache Tailscale's network map, so if it restarts while Tailscale's control server is out of reach, it can't reach the other Nodes until it is back; give it the cache-network-maps node attribute"

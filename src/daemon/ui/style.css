@@ -333,6 +333,11 @@ form.stack button {
   -webkit-touch-callout: none;
 }
 
+/* Touches on the caption are the touchpad's. */
+.touchpad .note {
+  pointer-events: none;
+}
+
 .keys {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr));

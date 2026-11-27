@@ -148,10 +148,12 @@ pkgs.testers.runNixOSTest {
             "for d in /sys/class/input/event*; do"
             f" grep -qx '{name}' $d/device/name && basename $d; done | grep ."
         ).strip()
-        alpha.succeed(f"systemd-run --unit=evtest sh -c 'evtest /dev/input/{event} >/tmp/events'")
+        # Line-buffered, so each event is in the file as it happens.
+        alpha.succeed(f"systemd-run --unit=evtest sh -c 'stdbuf -oL evtest /dev/input/{event} >/tmp/events'")
         alpha.wait_until_succeeds("grep -q 'Testing ...' /tmp/events")
         messages = [
             '{"type":"text","text":"Hi"}',
+            '{"type":"keys","keys":["ctrl","escape"]}',
             '{"type":"move","x":5,"y":-3}',
             '{"type":"button","button":"left","down":true}',
         ]
@@ -164,6 +166,7 @@ pkgs.testers.runNixOSTest {
             "(KEY_LEFTSHIFT), value 1",
             "(KEY_H), value 1",
             "(KEY_I), value 0",
+            "(KEY_ESC), value 1",
             "(REL_X), value 5",
             "(REL_Y), value -3",
             "(BTN_LEFT), value 1",

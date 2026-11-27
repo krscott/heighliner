@@ -1,7 +1,7 @@
 // The Remote Input page: turns touches on the touchpad, the buttons and
 // typing into messages for this Node's virtual keyboard and pointer, sent
-// over a WebSocket. The daemon releases whatever a page held when its
-// connection closes.
+// over a WebSocket. Keys are pressed and released within one message; the
+// daemon releases any button a page held when its connection closes.
 "use strict";
 (() => {
   const remote = document.querySelector(".remote[data-socket]");
@@ -17,7 +17,7 @@
   const SPEED = 2;
   // Scrolling, in 120ths of a wheel notch, per CSS pixel two fingers move.
   const SCROLL = 4;
-  // A touch shorter than this that moves less than SLOP pixels is a tap.
+  // A touch shorter than this that moves less than SLOP CSS pixels is a tap.
   const TAP_MS = 250;
   const SLOP = 8;
   // How long after a tap a touch counts as the second half of a double tap.
@@ -26,6 +26,8 @@
   const RETRY_MS = 1000;
   // How long a notice stays.
   const NOTICE_MS = 5000;
+  // The most text one message may type, as the daemon allows.
+  const MAX_TEXT = 1024;
 
   let socket = null;
   let retry = null;
@@ -55,11 +57,16 @@
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const opened = new WebSocket(url);
     socket = opened;
-    opened.addEventListener("open", () => show("connected", "good"));
+    opened.addEventListener("open", () => {
+      // What was typed while disconnected never arrived.
+      forget();
+      show("connected", "good");
+    });
     opened.addEventListener("message", (event) => {
       try {
         const answer = JSON.parse(event.data);
         if (answer.refused) {
+          forget();
           notice(`Refused: ${answer.refused}`);
         }
       } catch {
@@ -107,78 +114,17 @@
     button?.setAttribute("aria-pressed", String(on));
   }
 
-  // Runs `act` with the latched modifiers held, then releases them.
-  function withModifiers(act) {
-    const held = [...latched];
-    for (const key of held) {
-      send({ type: "key", key, down: true });
-    }
-    act();
-    for (const key of held.reverse()) {
-      send({ type: "key", key, down: false });
+  // The latched modifiers, which are then no longer latched.
+  function takeModifiers() {
+    const taken = [...latched];
+    for (const key of taken) {
       setLatched(key, false);
     }
+    return taken;
   }
 
-  // Presses `keys` in order, then releases them in reverse.
-  function tap(keys) {
-    for (const key of keys) {
-      send({ type: "key", key, down: true });
-    }
-    for (const key of [...keys].reverse()) {
-      send({ type: "key", key, down: false });
-    }
-  }
-
-  function click(button) {
-    send({ type: "button", button, down: true });
-    send({ type: "button", button, down: false });
-  }
-
-  // Pressing a key or modifier leaves the focus where it was, so the
-  // phone's keyboard stays open while typing.
-  for (const button of remote.querySelectorAll("[data-keys], [data-modifier]")) {
-    button.addEventListener("pointerdown", (event) => event.preventDefault());
-  }
-
-  for (const button of remote.querySelectorAll("[data-keys]")) {
-    button.addEventListener("click", () =>
-      withModifiers(() => tap(button.dataset.keys.split(" "))),
-    );
-  }
-
-  for (const button of remote.querySelectorAll("[data-modifier]")) {
-    const key = button.dataset.modifier;
-    button.addEventListener("click", () => setLatched(key, !latched.has(key)));
-  }
-
-  // Mouse buttons are held for as long as they are pressed, so one can be
-  // held while another finger moves the pointer.
-  for (const button of remote.querySelectorAll("[data-button]")) {
-    const name = button.dataset.button;
-    let down = false;
-    const release = () => {
-      if (down) {
-        down = false;
-        send({ type: "button", button: name, down: false });
-      }
-    };
-    button.addEventListener("pointerdown", (event) => {
-      event.preventDefault();
-      button.setPointerCapture(event.pointerId);
-      if (latched.size > 0) {
-        withModifiers(() => click(name));
-        return;
-      }
-      down = true;
-      send({ type: "button", button: name, down: true });
-    });
-    button.addEventListener("pointerup", release);
-    button.addEventListener("pointercancel", release);
-    button.addEventListener("contextmenu", (event) => event.preventDefault());
-  }
-
-  // Movement not sent yet, sent once per frame.
+  // Movement not sent yet, sent once per frame, or before anything that
+  // must come after it.
   const pending = { moveX: 0, moveY: 0, scrollX: 0, scrollY: 0 };
   let frame = null;
 
@@ -202,6 +148,71 @@
   function queue(key, amount) {
     pending[key] += amount;
     frame ??= requestAnimationFrame(flush);
+  }
+
+  function pressKeys(keys) {
+    forget();
+    send({ type: "keys", keys: [...takeModifiers(), ...keys] });
+  }
+
+  function click(button) {
+    forget();
+    flush();
+    send({ type: "click", button, modifiers: takeModifiers() });
+  }
+
+  function press(button) {
+    forget();
+    flush();
+    send({ type: "button", button, down: true });
+  }
+
+  function release(button) {
+    flush();
+    send({ type: "button", button, down: false });
+  }
+
+  // Pressing a key or modifier leaves the focus where it was, so the
+  // phone's keyboard stays open while typing.
+  for (const button of remote.querySelectorAll("[data-keys], [data-modifier]")) {
+    button.addEventListener("pointerdown", (event) => event.preventDefault());
+    button.addEventListener("mousedown", (event) => event.preventDefault());
+  }
+
+  for (const button of remote.querySelectorAll("[data-keys]")) {
+    button.addEventListener("click", () => pressKeys(button.dataset.keys.split(" ")));
+  }
+
+  for (const button of remote.querySelectorAll("[data-modifier]")) {
+    const key = button.dataset.modifier;
+    button.addEventListener("click", () => setLatched(key, !latched.has(key)));
+  }
+
+  // Mouse buttons are held for as long as they are pressed, so one can be
+  // held while another finger moves the pointer. With a modifier latched,
+  // one clicks instead.
+  for (const button of remote.querySelectorAll("[data-button]")) {
+    const name = button.dataset.button;
+    let down = false;
+    const up = () => {
+      if (down) {
+        down = false;
+        release(name);
+      }
+    };
+    button.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      button.setPointerCapture(event.pointerId);
+      if (latched.size > 0) {
+        click(name);
+        return;
+      }
+      down = true;
+      press(name);
+    });
+    button.addEventListener("pointerup", up);
+    button.addEventListener("pointercancel", up);
+    button.addEventListener("contextmenu", (event) => event.preventDefault());
   }
 
   // The touchpad. One finger moves the pointer and two scroll, moving the
@@ -236,6 +247,9 @@
         // A click is owed for the tap this touch followed.
         owed: afterTap,
         dragging: false,
+        // Movement held back until it is clear whether this is a drag, so
+        // that the press comes before it.
+        early: { x: 0, y: 0 },
       };
     }
     gesture.fingers = Math.max(gesture.fingers, touches.length);
@@ -243,7 +257,7 @@
     gesture.count = touches.length;
     if (gesture.fingers > 1 && gesture.owed) {
       gesture.owed = false;
-      withModifiers(() => click("left"));
+      click("left");
     }
   });
 
@@ -264,21 +278,26 @@
     const dy = at.y - gesture.at.y;
     gesture.at = at;
     gesture.travelled += Math.abs(dx) + Math.abs(dy);
-    if (touches.length === 1) {
-      if (gesture.owed && !gesture.dragging && gesture.travelled > SLOP) {
-        gesture.owed = false;
-        gesture.dragging = true;
-        send({ type: "button", button: "left", down: true });
-      }
-      queue("moveX", dx * SPEED);
-      queue("moveY", dy * SPEED);
-    } else {
+    if (touches.length > 1) {
       queue("scrollX", -dx * SCROLL);
       queue("scrollY", -dy * SCROLL);
+    } else if (gesture.owed && !gesture.dragging) {
+      gesture.early.x += dx * SPEED;
+      gesture.early.y += dy * SPEED;
+      if (gesture.travelled > SLOP) {
+        gesture.owed = false;
+        gesture.dragging = true;
+        press("left");
+        queue("moveX", gesture.early.x);
+        queue("moveY", gesture.early.y);
+      }
+    } else {
+      queue("moveX", dx * SPEED);
+      queue("moveY", dy * SPEED);
     }
   });
 
-  function touchEnd(event) {
+  pad.addEventListener("touchend", (event) => {
     event.preventDefault();
     if (!gesture) {
       return;
@@ -291,45 +310,62 @@
     const ended = gesture;
     gesture = null;
     if (ended.dragging) {
-      send({ type: "button", button: "left", down: false });
+      release("left");
       return;
     }
     const isTap = performance.now() - ended.start < TAP_MS && ended.travelled < SLOP;
     if (ended.owed) {
-      withModifiers(() => click("left"));
+      click("left");
     }
     if (!isTap) {
       return;
     }
     if (ended.fingers > 1) {
-      withModifiers(() => click("right"));
+      click("right");
     } else if (ended.owed) {
       // The second tap of a double tap.
-      withModifiers(() => click("left"));
+      click("left");
     } else {
       waiting = setTimeout(() => {
         waiting = null;
-        withModifiers(() => click("left"));
+        click("left");
       }, DOUBLE_MS);
     }
-  }
+  });
 
-  pad.addEventListener("touchend", touchEnd);
-  pad.addEventListener("touchcancel", touchEnd);
+  // A touch the browser took away, for example for a system gesture,
+  // clicks nothing; a drag it was making ends.
+  pad.addEventListener("touchcancel", () => {
+    if (gesture?.dragging) {
+      release("left");
+    }
+    gesture = null;
+  });
 
-  // Typing. What the field holds is compared with what it held, so that
-  // whatever the phone's keyboard does, such as replacing a word it
-  // corrected, is sent as the backspaces and characters that do the same.
-  // The US layout the daemon types with has only printable ASCII.
+  // Typing. While the user only types, what the field holds is compared
+  // with what it held, so that whatever the phone's keyboard does, such as
+  // replacing a word it corrected, is sent as the backspaces and characters
+  // that do the same. Anything else sent can move the text cursor on the
+  // Node, so it empties the field first. The US layout the daemon types
+  // with has only printable ASCII; the curly quotes phones put in are typed
+  // as straight ones.
+  const straight = { "‘": "'", "’": "'", "“": '"', "”": '"' };
   const typeable = (c) => c === "\n" || c === "\t" || (c >= " " && c <= "~");
   let typed = [];
 
+  function forget() {
+    typing.value = "";
+    typed = [];
+  }
+
   typing.addEventListener("input", () => {
-    const chars = Array.from(typing.value);
+    const chars = Array.from(typing.value, (c) => straight[c] ?? c);
     const kept = chars.filter(typeable);
     if (kept.length !== chars.length) {
       const dropped = [...new Set(chars.filter((c) => !typeable(c)))].join(" ");
       notice(`Can't type ${dropped}: Remote Input types through a US keyboard layout.`);
+    }
+    if (kept.join("") !== typing.value) {
       typing.value = kept.join("");
     }
     let same = 0;
@@ -337,22 +373,24 @@
       same += 1;
     }
     const erase = typed.length - same;
-    const text = kept.slice(same).join("");
-    if (erase > 0 || text) {
-      withModifiers(() => {
-        for (let i = 0; i < erase; i += 1) {
-          tap(["backspace"]);
-        }
-        if (text) {
-          send({ type: "text", text });
-        }
-      });
+    const text = kept.slice(same);
+    if (text.length > MAX_TEXT) {
+      notice(`Can't type more than ${MAX_TEXT} characters at once.`);
+      forget();
+      return;
+    }
+    const modifiers = takeModifiers();
+    for (let i = 0; i < erase; i += 1) {
+      send({ type: "keys", keys: [...modifiers, "backspace"] });
+    }
+    if (text.length > 0) {
+      send({ type: "text", text: text.join(""), modifiers });
     }
     typed = kept;
-    // A finished line starts a new one, which keeps the field short.
-    if (text.endsWith("\n")) {
-      typing.value = "";
-      typed = [];
+    // With a modifier, the characters were a shortcut, not text; and a
+    // finished line starts a new one, which keeps the field short.
+    if (modifiers.length > 0 || text.at(-1) === "\n") {
+      forget();
     }
   });
 
@@ -360,7 +398,7 @@
   typing.addEventListener("keydown", (event) => {
     if (event.key === "Backspace" && typing.value === "") {
       event.preventDefault();
-      withModifiers(() => tap(["backspace"]));
+      pressKeys(["backspace"]);
     }
   });
 

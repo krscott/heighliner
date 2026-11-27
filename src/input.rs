@@ -4,26 +4,43 @@
 //!
 //! Text is typed through a US keyboard layout, whatever layout the desktop
 //! has, so only the characters that layout types without dead keys are
-//! accepted.
+//! accepted. Keys are only ever pressed and released within one message;
+//! only pointer buttons stay down between messages, for dragging.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode, RelativeAxisCode};
 use serde::Deserialize;
+use tokio::time::Instant;
 
 /// The name the desktop shows for the virtual devices.
 const NAME: &str = "heighliner Remote Input";
 
-/// The longest text one message may type.
+/// The longest text one message may type; `ui/input.js` knows it too.
 pub const MAX_TEXT: usize = 1024;
+
+/// The most keys one message may press at once.
+const MAX_KEYS: usize = 8;
 
 /// How far one wheel notch is, in the high-resolution units scrolling is
 /// sent in.
 const NOTCH: i32 = 120;
+
+/// The pause after each keystroke or click. The kernel keeps only a few
+/// dozen events for each reader of a device and drops the rest, so a
+/// compositor that is busy for a moment would otherwise lose keystrokes.
+const STROKE_GAP: Duration = Duration::from_millis(8);
+
+/// How long a released button stays up before it is pressed again.
+/// libinput takes a release and press closer together than its debounce
+/// time for a bouncing switch and drops both, which would make a double
+/// click one long click.
+const BUTTON_GAP: Duration = Duration::from_millis(30);
 
 /// Remote Input on this Node.
 #[derive(Clone)]
@@ -36,11 +53,8 @@ pub enum RemoteInput {
 }
 
 impl RemoteInput {
-    /// Creates the virtual keyboard and pointer if `enabled`.
-    pub fn open(enabled: bool) -> Self {
-        if !enabled {
-            return Self::Off;
-        }
+    /// Creates the virtual keyboard and pointer.
+    pub fn open() -> Self {
         match Device::create() {
             Ok(device) => Self::Ready(Arc::new(device)),
             Err(error) => {
@@ -54,7 +68,7 @@ impl RemoteInput {
     }
 }
 
-/// A key the page has a button for.
+/// A key the page has a button for, or a modifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Key {
@@ -77,25 +91,6 @@ pub enum Key {
 }
 
 impl Key {
-    const ALL: [Self; 16] = [
-        Self::Escape,
-        Self::Tab,
-        Self::Enter,
-        Self::Backspace,
-        Self::Left,
-        Self::Right,
-        Self::Up,
-        Self::Down,
-        Self::Super,
-        Self::Ctrl,
-        Self::Alt,
-        Self::Shift,
-        Self::F11,
-        Self::VolumeDown,
-        Self::VolumeUp,
-        Self::Mute,
-    ];
-
     fn code(self) -> KeyCode {
         match self {
             Self::Escape => KeyCode::KEY_ESC,
@@ -128,8 +123,6 @@ pub enum Button {
 }
 
 impl Button {
-    const ALL: [Self; 3] = [Self::Left, Self::Middle, Self::Right];
-
     fn code(self) -> KeyCode {
         match self {
             Self::Left => KeyCode::BTN_LEFT,
@@ -144,27 +137,25 @@ impl Button {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     /// Moves the pointer right by `x` and down by `y`.
-    Move {
-        x: i16,
-        y: i16,
-    },
+    Move { x: i16, y: i16 },
     /// Scrolls the view right by `x` and down by `y`, in 120ths of a wheel
     /// notch.
-    Scroll {
-        x: i16,
-        y: i16,
-    },
-    Button {
+    Scroll { x: i16, y: i16 },
+    /// Presses `keys` in order, then releases them in reverse.
+    Keys { keys: Vec<Key> },
+    /// Clicks `button` with `modifiers` held.
+    Click {
         button: Button,
-        down: bool,
+        #[serde(default)]
+        modifiers: Vec<Key>,
     },
-    Key {
-        key: Key,
-        down: bool,
-    },
-    /// Types `text`, pressing and releasing a key for each character.
+    /// Presses `button` and leaves it down, or releases it.
+    Button { button: Button, down: bool },
+    /// Types `text`, a keystroke for each character, with `modifiers` held.
     Text {
         text: String,
+        #[serde(default)]
+        modifiers: Vec<Key>,
     },
 }
 
@@ -174,6 +165,7 @@ pub enum Refused {
     /// The US layout can't type this character; nothing was typed.
     Untypeable(char),
     TooLong,
+    TooManyKeys,
     /// Writing to the virtual device failed.
     Device(io::Error),
 }
@@ -186,8 +178,15 @@ impl fmt::Display for Refused {
                 "can't type {c:?}: Remote Input types through a US keyboard layout"
             ),
             Self::TooLong => write!(f, "can't type more than {MAX_TEXT} characters at once"),
+            Self::TooManyKeys => write!(f, "can't press more than {MAX_KEYS} keys at once"),
             Self::Device(error) => write!(f, "can't send input to the virtual devices: {error}"),
         }
+    }
+}
+
+impl From<io::Error> for Refused {
+    fn from(error: io::Error) -> Self {
+        Self::Device(error)
     }
 }
 
@@ -221,17 +220,14 @@ enum Sink {
 
 impl Device {
     fn create() -> io::Result<Self> {
+        // Every keyboard key, which saves keeping a list in step with `Key`
+        // and the layout, and the pointer's buttons.
         let mut keys = AttributeSet::<KeyCode>::new();
-        for key in Key::ALL {
-            keys.insert(key.code());
+        for code in KeyCode::KEY_ESC.0..=KeyCode::KEY_MICMUTE.0 {
+            keys.insert(KeyCode(code));
         }
-        for button in Button::ALL {
+        for button in [Button::Left, Button::Middle, Button::Right] {
             keys.insert(button.code());
-        }
-        for c in ' '..='~' {
-            if let Some((key, _)) = us_key(c) {
-                keys.insert(key);
-            }
         }
         let mut axes = AttributeSet::<RelativeAxisCode>::new();
         for axis in [
@@ -268,16 +264,16 @@ impl Device {
     }
 
     /// Sends each of `reports`, the events in one at once.
-    fn send(&self, reports: &[&[Event]]) -> io::Result<()> {
+    fn send(&self, reports: &[Vec<Event>]) -> io::Result<()> {
         let mut sink = self.0.lock().unwrap();
-        for report in reports {
+        for report in reports.iter().filter(|report| !report.is_empty()) {
             match &mut *sink {
                 Sink::Uinput(device) => {
                     let events: Vec<InputEvent> = report.iter().map(|&e| e.into()).collect();
                     device.emit(&events)?;
                 }
                 #[cfg(test)]
-                Sink::Recorded(reports) => reports.push(report.to_vec()),
+                Sink::Recorded(reports) => reports.push(report.clone()),
             }
         }
         Ok(())
@@ -363,57 +359,89 @@ fn us_key(c: char) -> Option<(KeyCode, bool)> {
     })
 }
 
-/// One page's connection to the virtual devices. It remembers the keys and
-/// buttons it holds down, and releases them when dropped, so a page that
-/// loses its connection mid-drag leaves nothing held.
+/// Pressing `keys` in order, then releasing them in reverse, one report
+/// each.
+fn chord(keys: &[KeyCode]) -> Vec<Vec<Event>> {
+    let presses = keys.iter().map(|&key| vec![Event::Press(key)]);
+    let releases = keys.iter().rev().map(|&key| vec![Event::Release(key)]);
+    presses.chain(releases).collect()
+}
+
+/// One page's connection to the virtual devices. It remembers the buttons
+/// it holds down, and releases them when dropped, so a page that loses its
+/// connection mid-drag leaves nothing held.
 pub struct Session {
     device: Arc<Device>,
     held: BTreeSet<KeyCode>,
     /// Scrolling not yet sent as a whole wheel notch, right and down.
     unsent: (i32, i32),
+    /// When the next keystroke or click may be sent.
+    next_stroke: Instant,
+    /// When a button may next be pressed.
+    next_press: Instant,
 }
 
 impl Session {
     pub fn new(device: Arc<Device>) -> Self {
+        let now = Instant::now();
         Self {
             device,
             held: BTreeSet::new(),
             unsent: (0, 0),
+            next_stroke: now,
+            next_press: now,
         }
     }
 
-    /// Carries out `message`.
-    pub fn apply(&mut self, message: Message) -> Result<(), Refused> {
-        let sent = match message {
-            Message::Text { text } => return self.type_text(&text),
+    /// Carries out `message`, pausing as keystrokes and clicks need.
+    pub async fn apply(&mut self, message: Message) -> Result<(), Refused> {
+        match message {
             Message::Move { x, y } => {
-                let report: Vec<Event> =
-                    [(RelativeAxisCode::REL_X, x), (RelativeAxisCode::REL_Y, y)]
-                        .into_iter()
-                        .filter(|&(_, value)| value != 0)
-                        .map(|(axis, value)| Event::Move(axis, value.into()))
-                        .collect();
-                if report.is_empty() {
-                    return Ok(());
-                }
-                self.device.send(&[&report])
+                let report = [(RelativeAxisCode::REL_X, x), (RelativeAxisCode::REL_Y, y)]
+                    .into_iter()
+                    .filter(|&(_, value)| value != 0)
+                    .map(|(axis, value)| Event::Move(axis, value.into()))
+                    .collect();
+                self.device.send(&[report])?;
             }
-            Message::Scroll { x, y } => self.scroll(x.into(), y.into()),
-            Message::Button { button, down } => self.press(button.code(), down),
-            Message::Key { key, down } => self.press(key.code(), down),
-        };
-        sent.map_err(Refused::Device)
+            Message::Scroll { x, y } => self.scroll(x.into(), y.into())?,
+            Message::Keys { keys } => {
+                let codes = codes(&keys)?;
+                self.stroke(chord(&codes)).await?;
+            }
+            Message::Click { button, modifiers } => {
+                let modifiers = codes(&modifiers)?;
+                tokio::time::sleep_until(self.next_press).await;
+                let mut reports = chord(&modifiers);
+                let releases = reports.split_off(modifiers.len());
+                reports.extend(chord(&[button.code()]));
+                reports.extend(releases);
+                self.stroke(reports).await?;
+                self.next_press = Instant::now() + BUTTON_GAP;
+            }
+            Message::Button { button, down } => {
+                let key = button.code();
+                if down {
+                    tokio::time::sleep_until(self.next_press).await;
+                    self.held.insert(key);
+                    self.device.send(&[vec![Event::Press(key)]])?;
+                } else {
+                    self.held.remove(&key);
+                    self.device.send(&[vec![Event::Release(key)]])?;
+                    self.next_press = Instant::now() + BUTTON_GAP;
+                }
+            }
+            Message::Text { text, modifiers } => self.type_text(&text, &modifiers).await?,
+        }
+        Ok(())
     }
 
-    fn press(&mut self, key: KeyCode, down: bool) -> io::Result<()> {
-        let event = if down {
-            self.held.insert(key);
-            Event::Press(key)
-        } else {
-            self.held.remove(&key);
-            Event::Release(key)
-        };
-        self.device.send(&[&[event]])
+    /// Sends `reports` once the last keystroke or click has had its pause.
+    async fn stroke(&mut self, reports: Vec<Vec<Event>>) -> io::Result<()> {
+        tokio::time::sleep_until(self.next_stroke).await;
+        self.device.send(&reports)?;
+        self.next_stroke = Instant::now() + STROKE_GAP;
+        Ok(())
     }
 
     /// Scrolls in high-resolution units, sending a whole notch too each time
@@ -423,7 +451,7 @@ impl Session {
         let (unsent_x, unsent_y) = (self.unsent.0 + x, self.unsent.1 + y);
         let (notches_x, notches_y) = (unsent_x / NOTCH, unsent_y / NOTCH);
         self.unsent = (unsent_x % NOTCH, unsent_y % NOTCH);
-        let report: Vec<Event> = [
+        let report = [
             (RelativeAxisCode::REL_HWHEEL_HI_RES, x),
             (RelativeAxisCode::REL_WHEEL_HI_RES, -y),
             (RelativeAxisCode::REL_HWHEEL, notches_x),
@@ -433,45 +461,58 @@ impl Session {
         .filter(|&(_, value)| value != 0)
         .map(|(axis, value)| Event::Move(axis, value))
         .collect();
-        if report.is_empty() {
-            return Ok(());
-        }
-        self.device.send(&[&report])
+        self.device.send(&[report])
     }
 
-    /// Types `text` if every character in it can be typed, and nothing
-    /// otherwise. A character that needs Shift is typed with it, unless
-    /// Shift is already held.
-    fn type_text(&mut self, text: &str) -> Result<(), Refused> {
+    /// Types `text` with `modifiers` held, if every character in it can be
+    /// typed, and nothing otherwise. A character that needs Shift is typed
+    /// with it, unless Shift is one of the modifiers.
+    async fn type_text(&mut self, text: &str, modifiers: &[Key]) -> Result<(), Refused> {
         if text.chars().count() > MAX_TEXT {
             return Err(Refused::TooLong);
         }
-        let shift = KeyCode::KEY_LEFTSHIFT;
-        let mut reports = Vec::new();
-        for c in text.chars() {
-            let (key, shifted) = us_key(c).ok_or(Refused::Untypeable(c))?;
-            let add_shift = shifted && !self.held.contains(&shift);
-            if add_shift {
-                reports.push([Event::Press(shift)]);
+        let keys = text
+            .chars()
+            .map(|c| us_key(c).ok_or(Refused::Untypeable(c)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shift_held = modifiers.contains(&Key::Shift);
+        let mut modifiers = chord(&codes(modifiers)?);
+        let releases = modifiers.split_off(modifiers.len() / 2);
+        self.stroke(modifiers).await?;
+        let typed = async {
+            for (key, shifted) in keys {
+                let stroke = if shifted && !shift_held {
+                    chord(&[KeyCode::KEY_LEFTSHIFT, key])
+                } else {
+                    chord(&[key])
+                };
+                self.stroke(stroke).await?;
             }
-            reports.push([Event::Press(key)]);
-            reports.push([Event::Release(key)]);
-            if add_shift {
-                reports.push([Event::Release(shift)]);
-            }
-        }
-        let reports: Vec<&[Event]> = reports.iter().map(|report| report.as_slice()).collect();
-        self.device.send(&reports).map_err(Refused::Device)
+            io::Result::Ok(())
+        };
+        let typed = typed.await;
+        self.device.send(&releases)?;
+        Ok(typed?)
     }
+}
+
+/// The codes of `keys`, if there aren't too many to press at once.
+fn codes(keys: &[Key]) -> Result<Vec<KeyCode>, Refused> {
+    if keys.len() > MAX_KEYS {
+        return Err(Refused::TooManyKeys);
+    }
+    Ok(keys.iter().map(|key| key.code()).collect())
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let released: Vec<[Event; 1]> =
-            self.held.iter().map(|&key| [Event::Release(key)]).collect();
-        let released: Vec<&[Event]> = released.iter().map(|report| report.as_slice()).collect();
+        let released: Vec<Vec<Event>> = self
+            .held
+            .iter()
+            .map(|&key| vec![Event::Release(key)])
+            .collect();
         if let Err(error) = self.device.send(&released) {
-            tracing::warn!(%error, "can't release the keys and buttons a Remote Input page held");
+            tracing::warn!(%error, "can't release the buttons a Remote Input page held");
         }
     }
 }

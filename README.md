@@ -109,10 +109,11 @@ services.heighliner.remoteInput.enable = true;
 Then open Input on that Node's UI. The page also has each Peripheral's
 Handoff buttons and links to the other Nodes' Remote Input. The daemon types
 text through a US keyboard layout, so set the desktop's layout to US, and it
-types only printable ASCII. It releases every key and button a page held when
-the page's connection drops. The option gives only heighliner's service
-`/dev/uinput`, which can type into any session on the machine, the login
-screen included.
+types only printable ASCII. It releases every button a page held when the
+page's connection drops. The option gives only heighliner's service
+`/dev/uinput`, but anything that can reach heighliner from one of your
+devices, a program on the media PC included, can then type into any
+session on the Node, the login screen included.
 
 A Peripheral is named by its Bluetooth address or by any Node's name for it.
 Pairing works only for a Peripheral another Node already has paired, and only

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
+use axum::extract::{Extension, State};
 use axum::http::{StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -17,8 +17,9 @@ use maud::{Markup, html};
 use tokio::time::Instant;
 
 use super::actions::{self, same_origin};
-use super::{PERIPHERALS, any_page, button, node_name, node_url};
-use crate::api::{Peripherals, Reach, Status};
+use super::{PERIPHERALS, any_page, button, node_name, other_nodes};
+use crate::api::{Peripherals, Status};
+use crate::auth::Recheck;
 use crate::daemon::api::Api;
 use crate::input::{Device, RemoteInput, Session};
 use crate::tailscale::LocalApi;
@@ -26,7 +27,7 @@ use crate::tailscale::LocalApi;
 /// The Remote Input page.
 pub(super) const PAGE: &str = "/input";
 
-/// The page's WebSocket; `ui/input.js` names it too.
+/// The page's WebSocket.
 const SOCKET: &str = "/ui/input";
 
 /// How often the daemon pings a page, so that a page that went away, such
@@ -37,9 +38,12 @@ const PING_EVERY: Duration = Duration::from_secs(2);
 /// its connection is closed, releasing what it held.
 const SILENCE: Duration = Duration::from_secs(6);
 
+/// How often a page's caller is authorized again while it is connected.
+const RECHECK_EVERY: Duration = Duration::from_secs(30);
+
 /// The largest message a page may send: text up to
-/// [`crate::input::MAX_TEXT`]
-/// characters, each up to four bytes, escaped or not.
+/// [`crate::input::MAX_TEXT`] characters, each up to four bytes, escaped or
+/// not.
 const MAX_MESSAGE: usize = 64 * 1024;
 
 pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
@@ -60,8 +64,8 @@ async fn script() -> impl IntoResponse {
     )
 }
 
-/// A button that sends `key`, one of [`input::Key`]'s names, or several
-/// separated by spaces, pressed in order and released in reverse.
+/// A button that presses `keys`, names of [`crate::input::Key`] separated
+/// by spaces, in order, then releases them in reverse.
 fn key(keys: &str, label: &str, title: &str) -> Markup {
     html! { button type="button" data-keys=(keys) title=(title) { (label) } }
 }
@@ -138,17 +142,14 @@ fn unavailable(me: &str, why: Markup) -> Markup {
 }
 
 /// Links to the other Nodes' Remote Input pages.
-fn other_nodes(status: &Status, port: u16) -> Markup {
+fn other_pages(status: &Status, port: u16) -> Markup {
+    let others = other_nodes(status, port);
     html! {
-        h2 { "Other Nodes" }
-        ul.inline-list {
-            @for node in status.nodes.iter().filter(|node| !node.departed && node.reach != Reach::Here) {
-                @let name = node_name(status, &node.node);
-                li {
-                    @match node_url(node, port) {
-                        Some(url) => a href={ (url) "input" } { (name) },
-                        None => { (name) " " span.note { "(not on the tailnet)" } },
-                    }
+        @if !others.is_empty() {
+            h2 { "Other Nodes" }
+            ul.inline-list {
+                @for (node, url) in &others {
+                    li { a href={ (url) "input" } { (node_name(status, &node.node)) } }
                 }
             }
         }
@@ -192,28 +193,31 @@ fn peripherals(view: &Peripherals) -> Markup {
 
 async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let status = api.status().await;
-    let view = api.peripherals(status.clone()).await;
     let me = node_name(&status, &status.node);
-    let fixed = match &api.remote_input {
-        RemoteInput::Ready(_) => controls(&me),
-        RemoteInput::Off => unavailable(
-            &me,
-            html! {
-                "Remote Input is off on this Node. Turn it on with "
-                code { "services.heighliner.remoteInput.enable = true" }
-                " in its NixOS configuration."
-            },
+    let (fixed, view) = match &api.remote_input {
+        RemoteInput::Ready(_) => (controls(&me), Some(api.peripherals(status.clone()).await)),
+        RemoteInput::Off => (
+            unavailable(
+                &me,
+                html! {
+                    "Remote Input is off on this Node. Turn it on with "
+                    code { "services.heighliner.remoteInput.enable = true" }
+                    " in its NixOS configuration."
+                },
+            ),
+            None,
         ),
-        RemoteInput::Failed(error) => unavailable(
-            &me,
-            html! {
-                (error) ". heighliner tries again when it restarts."
-            },
+        RemoteInput::Failed(error) => (
+            unavailable(
+                &me,
+                html! { (error) ". heighliner tries again when it restarts." },
+            ),
+            None,
         ),
     };
     let main = html! {
-        (other_nodes(&status, api.port))
-        (peripherals(&view))
+        (other_pages(&status, api.port))
+        @if let Some(view) = &view { (peripherals(view)) }
     };
     any_page(
         &status,
@@ -227,6 +231,7 @@ async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
 
 async fn socket<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
+    Extension(recheck): Extension<Recheck>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let device = match &api.remote_input {
@@ -240,14 +245,16 @@ async fn socket<T: LocalApi + Clone>(
     };
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| serve(socket, device))
+        .on_upgrade(move |socket| serve(socket, device, recheck))
 }
 
 /// Carries out each message a page sends, answering one it can't with
-/// `{"refused": "why"}`, until the page goes away.
-async fn serve(mut socket: WebSocket, device: Arc<Device>) {
+/// `{"refused": "why"}`, until the page goes away or its caller may no
+/// longer send them.
+async fn serve(mut socket: WebSocket, device: Arc<Device>, recheck: Recheck) {
     let mut session = Session::new(device);
     let mut pings = tokio::time::interval(PING_EVERY);
+    let mut rechecks = tokio::time::interval_at(Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
     let mut deadline = Instant::now() + SILENCE;
     loop {
         let message = tokio::select! {
@@ -261,16 +268,23 @@ async fn serve(mut socket: WebSocket, device: Arc<Device>) {
                 }
                 continue;
             }
+            _ = rechecks.tick() => {
+                if let Err(denied) = recheck.authorize().await {
+                    tracing::warn!(%denied, "closing a Remote Input page whose caller is no longer authorized");
+                    break;
+                }
+                continue;
+            }
             () = tokio::time::sleep_until(deadline) => {
                 tracing::info!("a Remote Input page went quiet; releasing what it held");
                 break;
             }
         };
-        deadline = Instant::now() + SILENCE;
         let refused = match message {
             ws::Message::Text(text) => match serde_json::from_str(text.as_str()) {
                 Ok(message) => session
                     .apply(message)
+                    .await
                     .err()
                     .map(|refused| refused.to_string()),
                 Err(error) => Some(format!("can't read the message: {error}")),
@@ -279,6 +293,8 @@ async fn serve(mut socket: WebSocket, device: Arc<Device>) {
             ws::Message::Close(_) => break,
             ws::Message::Ping(_) | ws::Message::Pong(_) => None,
         };
+        // Typing a long text takes a while, during which nothing is read.
+        deadline = Instant::now() + SILENCE;
         if let Some(refused) = refused {
             let answer = serde_json::json!({ "refused": refused }).to_string();
             if socket.send(ws::Message::Text(answer.into())).await.is_err() {

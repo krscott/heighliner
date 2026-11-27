@@ -209,6 +209,17 @@ fn node_url(node: &NodeStatus, port: u16) -> Option<String> {
         .map(|ip| format!("http://{}/", SocketAddr::new(ip, port)))
 }
 
+/// The Nodes other than this one that haven't left the Fleet, with the
+/// address of each one's UI.
+fn other_nodes(status: &Status, port: u16) -> Vec<(&NodeStatus, String)> {
+    status
+        .nodes
+        .iter()
+        .filter(|node| node.reach != Reach::Here && !node.departed)
+        .filter_map(|node| Some((node, node_url(node, port)?)))
+        .collect()
+}
+
 /// How long ago `then` was, as of `now`, at a glance.
 fn ago(now: Timestamp, then: Timestamp) -> String {
     let secs = now.as_millis().saturating_sub(then.as_millis()) / 1000;
@@ -756,12 +767,7 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let status = api.status().await;
     let listed = api.list_conflicts().await;
     let now = Timestamp::now();
-    let others: Vec<(&NodeStatus, String)> = status
-        .nodes
-        .iter()
-        .filter(|node| node.reach != Reach::Here && !node.departed)
-        .filter_map(|node| Some((node, node_url(node, api.port)?)))
-        .collect();
+    let others = other_nodes(&status, api.port);
     let main = html! {
         h1 { "Data conflicts on " (node_name(&status, &status.node)) }
         p.note {

@@ -291,6 +291,82 @@ form.stack button {
   justify-self: start;
 }
 
+.inline-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+
+/* The Remote Input page's controls. */
+.remote {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 0 1rem;
+}
+
+.remote-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+}
+
+.remote-bar h1 {
+  flex: 1;
+}
+
+.touchpad {
+  display: flex;
+  align-items: flex-end;
+  height: 45vh;
+  min-height: 12rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.keys {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr));
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+}
+
+.keys.mouse {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.keys button {
+  padding: 0.6rem 0.25rem;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.keys button[aria-pressed="true"] {
+  color: var(--card);
+  background: var(--link);
+}
+
+.typing {
+  display: block;
+  width: 100%;
+  resize: none;
+  font-size: 1rem;
+}
+
+.remote-note:empty {
+  display: none;
+}
+
 @media (max-width: 30rem) {
   dl {
     grid-template-columns: 1fr;

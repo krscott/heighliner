@@ -26,6 +26,7 @@ use crate::bluetooth::{Bluetooth, Bluez};
 use crate::config::{Config, ConfigDb};
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
+use crate::input::RemoteInput;
 use crate::model::{AbsPath, ItemId, NodeId, ReplicaState};
 use crate::protocol::{self, Hello};
 use crate::record::Store;
@@ -267,6 +268,7 @@ pub struct Daemon<T> {
     home: Option<AbsPath>,
     /// This Node's Bluetooth stack, if the daemon can reach one.
     bluetooth: Option<Bluetooth>,
+    remote_input: RemoteInput,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -424,6 +426,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             retention: RETENTION_WINDOW,
             home: home(std::env::var("HOME").ok()),
             bluetooth: None,
+            remote_input: RemoteInput::Off,
         })
     }
 
@@ -443,6 +446,12 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Makes the daemon manage this Node's Peripherals through `bluetooth`.
     pub fn with_bluetooth(mut self, bluetooth: Bluetooth) -> Self {
         self.bluetooth = Some(bluetooth);
+        self
+    }
+
+    /// Makes the daemon take Remote Input as `remote_input` allows.
+    pub fn with_remote_input(mut self, remote_input: RemoteInput) -> Self {
+        self.remote_input = remote_input;
         self
     }
 
@@ -491,6 +500,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             port: self.port,
             changes: self.changes.clone(),
             bluetooth: self.bluetooth.clone(),
+            remote_input: self.remote_input.clone(),
         }
     }
 
@@ -957,6 +967,8 @@ pub struct Options {
     pub retention: Duration,
     /// How to reach Syncthing, if the daemon is to drive it.
     pub syncthing: Option<SyncthingOptions>,
+    /// Whether to take Remote Input, through a virtual keyboard and pointer.
+    pub remote_input: bool,
 }
 
 /// How the daemon reaches the Syncthing instance it drives.
@@ -976,7 +988,8 @@ pub async fn run(options: Options) -> Result<(), Error> {
     let api = Client::new(options.tailscale_socket);
     let mut daemon = open_when_ready(api, &options.state_dir, options.port)
         .await?
-        .with_retention(options.retention);
+        .with_retention(options.retention)
+        .with_remote_input(RemoteInput::open(options.remote_input));
     if !daemon.tailnet.me().caches_network_maps {
         tracing::warn!(
             "this device doesn't cache Tailscale's network map, so if it restarts while Tailscale's control server is out of reach, it can't reach the other Nodes until it is back; give it the cache-network-maps node attribute"

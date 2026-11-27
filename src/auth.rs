@@ -218,7 +218,9 @@ async fn serve_with<T: LocalApi>(
                     let connection = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(header_timeout)
-                        .serve_connection(TokioIo::new(stream), service);
+                        .serve_connection(TokioIo::new(stream), service)
+                        // For the Remote Input page's WebSocket.
+                        .with_upgrades();
                     if let Err(error) = connection.await {
                         tracing::debug!(%addr, %error, "connection ended");
                     }

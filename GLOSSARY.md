@@ -2,7 +2,8 @@
 
 Heighliner is a control plane for the user's Tailscale fleet. It keeps data
 replicated between nodes, continuing to work while LANs are cut off from each
-other, and moves Bluetooth peripherals between them.
+other, moves Bluetooth peripherals between them, and lets the UI act as a
+node's keyboard and pointer.
 
 ## Fleet
 
@@ -82,6 +83,13 @@ Moving a Peripheral's connection from whichever Nodes it is connected to onto
 one other Node.
 _Avoid_: Transfer, move, switch
 
+## Input
+
+**Remote Input**:
+Keyboard and pointer input sent from the UI to a Node, as if from devices
+plugged into it.
+_Avoid_: Remote control, remote desktop (implies the screen), KVM, virtual keyboard
+
 ## Relationships
 
 - An **Item** has one or more **Replicas**; each **Replica** is on exactly one **Node** and has exactly one **Role**.
@@ -93,3 +101,4 @@ _Avoid_: Transfer, move, switch
 - A **Data Conflict** is resolved by keeping one side and making the other a **Displaced Version**, which can be reversed within the **Retention Window**.
 - A **Peripheral** can be handed off only to a **Node** it is paired with; a **Handoff** leaves it connected to that **Node** alone.
 - A **Peripheral** may have a different name on each **Node** until one name is chosen for all of them.
+- A **Node** takes **Remote Input** only once it is enabled on that **Node**.

@@ -11,7 +11,8 @@ use heighliner::tailscale::{self, DEFAULT_SOCKET};
 use heighliner::{api, cli};
 
 /// A control plane for a Tailscale fleet: keeps directories replicated with
-/// Syncthing, and moves Bluetooth Peripherals between Nodes.
+/// Syncthing, moves Bluetooth Peripherals between Nodes, and takes Remote
+/// Input from the web UI.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -52,6 +53,10 @@ enum Command {
         /// A file holding Syncthing's API key.
         #[arg(long, requires = "syncthing_socket")]
         syncthing_api_key_file: Option<PathBuf>,
+        /// Take Remote Input from the web UI, through a virtual keyboard and
+        /// pointer made with /dev/uinput, which needs write access to it.
+        #[arg(long)]
+        remote_input: bool,
     },
     /// Track a directory as a new item, adopting the files already in it.
     Track {
@@ -197,6 +202,7 @@ fn main() -> ExitCode {
             retention_days,
             syncthing_socket,
             syncthing_api_key_file,
+            remote_input,
         } => run_daemon(daemon::Options {
             state_dir,
             port,
@@ -209,6 +215,7 @@ fn main() -> ExitCode {
                     api_key_file,
                 },
             ),
+            remote_input,
         })
         .map_err(|error| error.to_string()),
         command => runtime().block_on(run_command(command, port, tailscale_socket, on)),

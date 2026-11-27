@@ -1,8 +1,9 @@
 # heighliner
 
 A control plane for your Tailscale fleet. It tracks directories across the fleet
-and keeps them replicated with Syncthing, and moves Bluetooth Peripherals, such
-as a headset, from one Node to another. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
+and keeps them replicated with Syncthing, moves Bluetooth Peripherals, such
+as a headset, from one Node to another, and turns your phone into a Node's
+touchpad and keyboard. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
 and [docs/adr](docs/adr) for the foundational decisions.
 
 Each Node runs a heighliner daemon and a Syncthing instance that heighliner
@@ -96,6 +97,22 @@ pass `--adopt`.
 The web UI does everything the CLI does. Open it from any of your devices,
 including a phone, at `http://<node>.<tailnet>.ts.net:7130/` or the Node's
 Tailscale IP. The short MagicDNS name isn't accepted.
+
+Remote Input turns the web UI into a touchpad and keyboard for a Node, such as
+a media PC across the room; you watch its screen, not the page. Turn it on for
+each Node that should take it:
+
+```nix
+services.heighliner.remoteInput.enable = true;
+```
+
+Then open Input on that Node's UI. The page also has each Peripheral's
+Handoff buttons and links to the other Nodes' Remote Input. The daemon types
+text through a US keyboard layout, so set the desktop's layout to US, and it
+types only printable ASCII. It releases every key and button a page held when
+the page's connection drops. The option gives only heighliner's service
+`/dev/uinput`, which can type into any session on the machine, the login
+screen included.
 
 A Peripheral is named by its Bluetooth address or by any Node's name for it.
 Pairing works only for a Peripheral another Node already has paired, and only

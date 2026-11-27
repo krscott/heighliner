@@ -21,6 +21,7 @@ use crate::api::{
 use crate::bluetooth::Bluetooth;
 use crate::config::{Config, ConfigDb, EditError, Problem};
 use crate::hlc::Timestamp;
+use crate::input::RemoteInput;
 use crate::model::{
     AbsPath, Direction, ExcludePattern, Item, ItemId, NodeId, Replica, ReplicaState,
 };
@@ -46,6 +47,7 @@ pub(super) struct Api<T> {
     pub(super) port: u16,
     pub(super) changes: Changes,
     pub(super) bluetooth: Option<Bluetooth>,
+    pub(super) remote_input: RemoteInput,
 }
 
 impl<T: Clone> Clone for Api<T> {
@@ -62,6 +64,7 @@ impl<T: Clone> Clone for Api<T> {
             port: self.port,
             changes: self.changes.clone(),
             bluetooth: self.bluetooth.clone(),
+            remote_input: self.remote_input.clone(),
         }
     }
 }

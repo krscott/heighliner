@@ -33,6 +33,9 @@
   let retry = null;
   // A tap's click, waiting to see whether a second touch follows.
   let waiting = null;
+  // The touch on the touchpad, from its first finger landing to its last
+  // lifting.
+  let gesture = null;
 
   function show(text, kind) {
     state.textContent = text;
@@ -154,26 +157,39 @@
     frame ??= requestAnimationFrame(flush);
   }
 
-  // The buttons the page holds down, which a click would release.
+  // The buttons the page holds down, which a click would release. Each
+  // control and the touchpad's drag press and release them alike, so
+  // whichever lets go first releases a button.
   const held = new Set();
 
+  function sendClick(button) {
+    if (!held.has(button)) {
+      flush();
+      send({ type: "click", button, modifiers: takeModifiers() });
+    }
+  }
+
   // Sends a tap's click that is waiting to see whether a second tap
-  // follows, so that it comes before whatever is sent next.
+  // follows, so that it comes before whatever is sent next. A touch that
+  // started meanwhile is then no longer a drag. Queuing the tap emptied
+  // the typing field already.
   function settle() {
     if (waiting !== null) {
       clearTimeout(waiting);
       waiting = null;
-      click("left");
+      sendClick("left");
+    } else if (gesture?.owed) {
+      gesture.owed = false;
+      sendClick("left");
+      queue("moveX", gesture.early.x);
+      queue("moveY", gesture.early.y);
     }
   }
 
   function click(button) {
     settle();
     forget();
-    if (!held.has(button)) {
-      flush();
-      send({ type: "click", button, modifiers: takeModifiers() });
-    }
+    sendClick(button);
   }
 
   function pressKeys(keys) {
@@ -221,31 +237,22 @@
     });
   }
 
-  // Mouse buttons are held for as long as a finger is on them, so one can
-  // be held while another finger moves the pointer. With a modifier
-  // latched, one clicks instead.
+  // Mouse buttons are held from a finger landing on them until one lifts,
+  // so one can be held while another finger moves the pointer. With a
+  // modifier latched, one clicks instead.
   for (const button of remote.querySelectorAll("[data-button]")) {
     const name = button.dataset.button;
-    const fingers = new Set();
-    const up = (event) => {
-      if (fingers.delete(event.pointerId) && fingers.size === 0) {
-        release(name);
-      }
-    };
     button.addEventListener("pointerdown", (event) => {
       event.preventDefault();
       button.setPointerCapture(event.pointerId);
       if (latched.size > 0) {
         click(name);
-        return;
-      }
-      fingers.add(event.pointerId);
-      if (fingers.size === 1) {
+      } else {
         press(name);
       }
     });
-    button.addEventListener("pointerup", up);
-    button.addEventListener("pointercancel", up);
+    button.addEventListener("pointerup", () => release(name));
+    button.addEventListener("pointercancel", () => release(name));
     button.addEventListener("contextmenu", (event) => event.preventDefault());
   }
 
@@ -253,7 +260,6 @@
   // view with the fingers, as on a phone. A tap clicks, once it is clear it
   // isn't the first half of a double tap; a touch that starts just after a
   // tap and moves drags.
-  let gesture = null;
   function centre(touches) {
     let x = 0;
     let y = 0;

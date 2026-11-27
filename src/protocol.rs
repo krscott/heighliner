@@ -1,7 +1,8 @@
 //! The Node protocol: the HTTP API daemons use to talk to each other.
 //!
 //! Daemons pull each other's records, and the states of each other's
-//! Replicas. `GET /node/hello` says which major
+//! Replicas, and ask each other for their Peripherals and to act on them
+//! (ADR-0006). `GET /node/hello` says which major
 //! version of the protocol a Node speaks; every version keeps its
 //! `protocol` and `heighliner` fields. Every other route sits under
 //! `/node/v<major>/`, and Nodes whose majors differ don't exchange records.
@@ -18,13 +19,17 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use http_body_util::Full;
 use hyper::StatusCode;
+use hyper::body::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::api::Refused;
+use crate::bluetooth::{Address, Paired};
 use crate::config::ConfigDb;
 use crate::hlc::Timestamp;
 use crate::http::{self, BoxError};
@@ -59,6 +64,42 @@ pub struct NodeState {
     /// The Nodes whose Replicas send to it that it was connected to.
     #[serde(default)]
     pub connected: BTreeSet<NodeId>,
+}
+
+/// GET: the answering Node's Peripherals, as [`NodePeripherals`].
+pub const PERIPHERALS_PATH: &str = "/node/v1/peripherals";
+
+/// One of the answering Node's Peripherals: POST a [`Command`] to act on
+/// it.
+pub fn peripheral_path(address: &Address) -> String {
+    format!(
+        "{PERIPHERALS_PATH}/{}",
+        http::percent_encode(address.as_str())
+    )
+}
+
+/// The answer to `GET` [`PERIPHERALS_PATH`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePeripherals {
+    /// Whether the Node has a Bluetooth adapter that BlueZ manages.
+    pub adapter: bool,
+    pub peripherals: Vec<Paired>,
+}
+
+/// What a Node is asked to do with one of its Peripherals. A body is
+/// required, so a page on another site can't send one as a plain form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "kebab-case")]
+pub enum Command {
+    Connect,
+    Disconnect,
+    /// Scan for it in pairing mode, then pair, trust and connect it.
+    Pair,
+    Forget,
+    /// Name it `alias` on the Node.
+    Name {
+        alias: String,
+    },
 }
 
 /// The answer to `GET /node/hello`.
@@ -112,6 +153,12 @@ pub enum Error {
         status: StatusCode,
         body: String,
     },
+    /// The Node refused, saying why.
+    Refused {
+        addr: SocketAddr,
+        status: StatusCode,
+        message: String,
+    },
     Decode {
         addr: SocketAddr,
         source: serde_json::Error,
@@ -132,6 +179,7 @@ impl fmt::Display for Error {
             Self::Status { addr, status, body } => {
                 write!(f, "{addr} answered {status}: {}", body.trim())
             }
+            Self::Refused { message, .. } => f.write_str(message),
             Self::Decode { addr, source } => write!(f, "can't read {addr}'s answer: {source}"),
             Self::Incompatible { addr, theirs } => {
                 let upgrade = if theirs.protocol < MAJOR {
@@ -165,9 +213,46 @@ impl std::error::Error for Error {
             Self::Connect { source, .. } => Some(source),
             Self::Http { source, .. } => Some(source.as_ref()),
             Self::Decode { source, .. } => Some(source),
-            Self::Timeout { .. } | Self::Status { .. } | Self::Incompatible { .. } => None,
+            Self::Timeout { .. }
+            | Self::Status { .. }
+            | Self::Refused { .. }
+            | Self::Incompatible { .. } => None,
         }
     }
+}
+
+/// Sends `request` to the Node at `addr` and decodes its JSON answer.
+async fn exchange<T: DeserializeOwned>(
+    addr: SocketAddr,
+    request: hyper::Request<Full<Bytes>>,
+    timeout: Duration,
+) -> Result<T, Error> {
+    let exchange = async {
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|source| Error::Connect { addr, source })?;
+        let (status, body) = http::send(stream, &addr.to_string(), request)
+            .await
+            .map_err(|source| Error::Http { addr, source })?;
+        if !status.is_success() {
+            return Err(match serde_json::from_slice::<Refused>(&body) {
+                Ok(refused) => Error::Refused {
+                    addr,
+                    status,
+                    message: refused.error,
+                },
+                Err(_) => Error::Status {
+                    addr,
+                    status,
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                },
+            });
+        }
+        serde_json::from_slice(&body).map_err(|source| Error::Decode { addr, source })
+    };
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| Error::Timeout { addr })?
 }
 
 /// Sends a GET for `path` to the Node at `addr` and decodes its JSON answer.
@@ -176,25 +261,10 @@ async fn get_json<T: DeserializeOwned>(
     path: &str,
     timeout: Duration,
 ) -> Result<T, Error> {
-    let request = async {
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|source| Error::Connect { addr, source })?;
-        let (status, body) = http::get(stream, &addr.to_string(), path)
-            .await
-            .map_err(|source| Error::Http { addr, source })?;
-        if !status.is_success() {
-            return Err(Error::Status {
-                addr,
-                status,
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
-        }
-        serde_json::from_slice(&body).map_err(|source| Error::Decode { addr, source })
-    };
-    tokio::time::timeout(timeout, request)
-        .await
-        .map_err(|_| Error::Timeout { addr })?
+    let request = hyper::Request::get(path)
+        .body(Full::default())
+        .expect("a valid request");
+    exchange(addr, request, timeout).await
 }
 
 /// Asks the Node at `addr` which protocol it speaks.
@@ -226,6 +296,36 @@ pub async fn states(addr: SocketAddr, timeout: Duration) -> Result<NodeStates, E
     get_json(addr, STATES_PATH, timeout).await
 }
 
+/// The Peripherals of the Node at `addr`. A Node whose heighliner is older
+/// than Peripherals answers [`Error::Status`] with 404.
+pub async fn peripherals(addr: SocketAddr, timeout: Duration) -> Result<NodePeripherals, Error> {
+    get_json(addr, PERIPHERALS_PATH, timeout).await
+}
+
+/// Has the Node at `addr` carry out `command` on its Peripheral at
+/// `address`.
+pub async fn command(
+    addr: SocketAddr,
+    address: &Address,
+    command: &Command,
+    timeout: Duration,
+) -> Result<(), Error> {
+    let body = serde_json::to_vec(command).expect("commands serialize");
+    let request = hyper::Request::post(peripheral_path(address))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .expect("a valid request");
+    exchange(addr, request, timeout).await
+}
+
+impl Error {
+    /// Whether the Node answered that it has no such route, as one running
+    /// an older heighliner does.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Status { status, .. } if *status == StatusCode::NOT_FOUND)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +333,7 @@ mod tests {
     #[test]
     fn versioned_paths_use_the_major_version() {
         assert_eq!(RECORDS_PATH, format!("/node/v{MAJOR}/records"));
+        assert_eq!(PERIPHERALS_PATH, format!("/node/v{MAJOR}/peripherals"));
     }
 
     #[test]

@@ -17,12 +17,18 @@ use futures_util::Stream;
 use maud::{DOCTYPE, Markup, html};
 
 use super::api::Api;
-use crate::api::{self, ItemStatus, NodeStatus, Reach, ReplicaStatus, Replication, Status};
+use crate::api::{
+    self, ItemStatus, NodeStatus, Peripheral, Peripherals, Reach, ReplicaStatus, Replication,
+    Status,
+};
 use crate::hlc::Timestamp;
 use crate::http::percent_encode;
 use crate::model::{ItemId, ReplicaState, Role};
 use crate::protocol;
 use crate::tailscale::LocalApi;
+
+/// The Peripherals page.
+const PERIPHERALS: &str = "/peripherals";
 
 /// Where pages listen for changes; `ui/live.js` names it too.
 const EVENTS: &str = "/ui/events";
@@ -47,6 +53,7 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .route("/items/{item}", get(item::<T>))
         .route("/items/{item}/replicas/{node}", get(replica::<T>))
         .route("/conflicts", get(conflicts::<T>))
+        .route(PERIPHERALS, get(peripherals::<T>))
         .route(EVENTS, get(events::<T>))
         .route("/ui/style.css", get(style))
         .route("/ui/live.js", get(script))
@@ -125,6 +132,7 @@ fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Respons
                         a.home href="/" { "heighliner" }
                         span.here { "on " (me) }
                         a href="/conflicts" { "Conflicts" }
+                        a href=(PERIPHERALS) { "Peripherals" }
                     }
                     p.lost { "Lost touch with this Node's daemon; this is what it last showed." }
                 }
@@ -750,6 +758,111 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
         }
     };
     page(&status, "Data conflicts", StatusCode::OK, main)
+}
+
+/// The form fields that act on `peripheral` with `action`, an
+/// [`api::PeripheralAction`]'s tag.
+fn peripheral_fields<'a>(peripheral: &'a Peripheral, action: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("peripheral", peripheral.address.as_str()),
+        ("action", action),
+    ]
+}
+
+/// `peripheral`'s card: each Node it is paired with, with connecting,
+/// disconnecting and forgetting it there, the Nodes it can be paired
+/// with, and a choice of name when its Nodes name it differently.
+fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
+    let aliases = peripheral.aliases();
+    html! {
+        p.title { (peripheral.alias) " " span.note { code { (peripheral.address) } } }
+        @if aliases.len() > 1 {
+            div.callout {
+                p { "Its Nodes name it differently. Pick one name for all of them:" }
+                ul.replicas {
+                    @for (alias, nodes) in &aliases {
+                        @let fields = [peripheral_fields(peripheral, "name"), vec![("alias", *alias)]].concat();
+                        @let names: Vec<&str> = nodes.iter().map(|node| view.node_name(node)).collect();
+                        li {
+                            q { (alias) } " " span.note { "on " (names.join(", ")) } " "
+                            (button(actions::PERIPHERAL, &fields, "Use this name"))
+                        }
+                    }
+                }
+            }
+        }
+        ul.paired {
+            @for on in &peripheral.paired {
+                @let name = view.node_name(&on.node);
+                @let node = [("node", on.node.as_str())];
+                li {
+                    (name) " "
+                    @if on.connected {
+                        span.badge.good { "connected" }
+                    } @else {
+                        span.badge.idle { "not connected" }
+                    }
+                    div.actions {
+                        @if on.connected {
+                            (button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "disconnect"), node.to_vec()].concat(), "Disconnect"))
+                        } @else {
+                            (button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "handoff"), node.to_vec()].concat(), "Connect"))
+                        }
+                        (confirmed(
+                            "Forget",
+                            "It is unpaired from this Node. Pairing it again needs it in pairing mode.",
+                            button(actions::PERIPHERAL, &[peripheral_fields(peripheral, "forget"), node.to_vec()].concat(), &format!("Forget it on {name}")),
+                        ))
+                    }
+                }
+            }
+            @for node in peripheral.pairable(&view.nodes) {
+                @let name = view.node_name(&node.node);
+                @let fields = [peripheral_fields(peripheral, "pair"), vec![("node", node.node.as_str())]].concat();
+                li {
+                    (name) " " span.badge.unknown { "not paired" }
+                    div.actions {
+                        (confirmed(
+                            "Pair",
+                            "Put it in pairing mode first. The Node looks for it for 30 seconds, then pairs and connects it, disconnecting it from the others.",
+                            button(actions::PERIPHERAL, &fields, &format!("Pair it with {name}")),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn peripherals<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
+    let (status, view) = tokio::join!(api.status(), api.peripherals());
+    let unknown: Vec<(&str, String)> = view
+        .nodes
+        .iter()
+        .filter_map(|node| Some((view.node_name(&node.node), node.bluetooth.problem()?)))
+        .collect();
+    let main = html! {
+        h1 { "Peripherals" }
+        p.note {
+            "Bluetooth devices paired with the Fleet's Nodes. "
+            "Connecting one on a Node disconnects it from the others."
+        }
+        @if view.peripherals.is_empty() {
+            p.note { "No Node that could be asked has a Peripheral paired." }
+        }
+        ul.cards {
+            @for peripheral in &view.peripherals {
+                li.card { (peripheral_card(&view, peripheral)) }
+            }
+        }
+        @if !unknown.is_empty() {
+            h2 { "Nodes not shown" }
+            ul {
+                @for (name, problem) in &unknown { li { (name) " " (problem) } }
+            }
+        }
+    };
+    page(&status, "Peripherals", StatusCode::OK, main)
 }
 
 mod actions;

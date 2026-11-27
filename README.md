@@ -1,7 +1,8 @@
 # heighliner
 
-A control plane that tracks directories across a Tailscale fleet and keeps them
-replicated with Syncthing. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
+A control plane for your Tailscale fleet. It tracks directories across the fleet
+and keeps them replicated with Syncthing, and moves Bluetooth Peripherals, such
+as a headset, from one machine to another. See [GLOSSARY.md](GLOSSARY.md) for the vocabulary
 and [docs/adr](docs/adr) for the foundational decisions.
 
 Each Node runs a heighliner daemon and a Syncthing instance that heighliner
@@ -81,6 +82,9 @@ heighliner conflicts keep docs <version>      # or swap, to make the other side 
 heighliner pause docs [node]                  # and resume
 heighliner remove-replica docs desktop        # Stop syncing there; files stay
 heighliner untrack docs                       # Stop syncing everywhere; files stay
+heighliner peripherals                        # Each Node's Bluetooth Peripherals
+heighliner peripherals handoff headset desk   # Connect it on desk, off the others
+heighliner peripherals pair headset tv        # Pair it with tv; in pairing mode
 heighliner ui                                 # Open the web UI
 ```
 
@@ -92,6 +96,12 @@ pass `--adopt`.
 The web UI does everything the CLI does. Open it from any of your devices,
 including a phone, at `http://<node>.<tailnet>.ts.net:7130/` or the Node's
 Tailscale IP. The short MagicDNS name isn't accepted.
+
+A Peripheral is named by its Bluetooth address or by any Node's name for it.
+Pairing works only for a Peripheral another Node already has paired, and only
+for one that needs no PIN or passkey, such as a headset. Each Node's daemon
+reaches BlueZ on the system bus as its user, which BlueZ allows by default; a
+Node without BlueZ just lists no Peripherals.
 
 An Item is **Fully Replicated** only once every Replica has been confirmed
 current within one connected window; until then, the UI and `status` show the

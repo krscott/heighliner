@@ -10,8 +10,8 @@ use heighliner::daemon::{self, DEFAULT_PORT};
 use heighliner::tailscale::{self, DEFAULT_SOCKET};
 use heighliner::{api, cli};
 
-/// Tracks directories across a Tailscale fleet and keeps them replicated
-/// with Syncthing.
+/// A control plane for a Tailscale fleet: keeps directories replicated with
+/// Syncthing, and moves Bluetooth Peripherals between Nodes.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -111,6 +111,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<ConflictAction>,
     },
+    /// List the Bluetooth Peripherals paired with the Fleet's Nodes, or act
+    /// on one, named by address or by a name one of its Nodes gives it.
+    Peripherals {
+        #[command(subcommand)]
+        action: Option<PeripheralCommand>,
+    },
     /// Open this Node's web UI, or another's with --on, in a browser.
     Ui,
     /// Leave the Fleet: no Node syncs with this one any more. Its replicas
@@ -134,6 +140,37 @@ enum ConflictAction {
     /// Make the change that lost the file's content again; the other is
     /// kept until it expires.
     Swap { item: String, version: String },
+}
+
+#[derive(Subcommand)]
+enum PeripheralCommand {
+    /// Connect a Peripheral on a Node, disconnecting it from the others.
+    Handoff {
+        peripheral: String,
+        /// The Node; this one if none.
+        node: Option<String>,
+    },
+    /// Pair a Peripheral another Node has paired with a Node, then connect
+    /// it there. Put it in pairing mode first.
+    Pair {
+        peripheral: String,
+        /// The Node; this one if none.
+        node: Option<String>,
+    },
+    /// Disconnect a Peripheral from a Node.
+    Disconnect {
+        peripheral: String,
+        /// The Node; this one if none.
+        node: Option<String>,
+    },
+    /// Unpair a Peripheral from a Node.
+    Forget {
+        peripheral: String,
+        /// The Node; this one if none.
+        node: Option<String>,
+    },
+    /// Give a Peripheral one of the names its Nodes give it, on all of them.
+    Name { peripheral: String, alias: String },
 }
 
 fn main() -> ExitCode {
@@ -284,6 +321,38 @@ async fn run_command(
         Command::Conflicts {
             action: Some(ConflictAction::Swap { item, version }),
         } => client.swap(&api::Resolve { item, version }).await,
+        Command::Peripherals { action: None } => client.peripherals().await.map(|view| {
+            print!("{}", cli::format_peripherals(&view));
+        }),
+        Command::Peripherals {
+            action: Some(command),
+        } => {
+            let (peripheral, action) = match command {
+                PeripheralCommand::Handoff { peripheral, node } => {
+                    (peripheral, api::PeripheralAction::Handoff { node })
+                }
+                PeripheralCommand::Pair { peripheral, node } => {
+                    (peripheral, api::PeripheralAction::Pair { node })
+                }
+                PeripheralCommand::Disconnect { peripheral, node } => {
+                    (peripheral, api::PeripheralAction::Disconnect { node })
+                }
+                PeripheralCommand::Forget { peripheral, node } => {
+                    (peripheral, api::PeripheralAction::Forget { node })
+                }
+                PeripheralCommand::Name { peripheral, alias } => {
+                    (peripheral, api::PeripheralAction::Name { alias })
+                }
+            };
+            client
+                .act_on_peripheral(&peripheral, &action)
+                .await
+                .map(|done| {
+                    for note in done.notes {
+                        eprintln!("heighliner: {note}");
+                    }
+                })
+        }
         Command::Ui => match client.status().await {
             Ok(_) => {
                 let url = client.url();

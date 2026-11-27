@@ -18,6 +18,7 @@ use crate::api::{
     self, AddReplica, Conflict, ItemStatus, NodeStatus, Reach, Refused, ReplicaStatus, Replication,
     Resolve, SetPaused, Status, Track, Tracked,
 };
+use crate::bluetooth::Bluetooth;
 use crate::config::{Config, ConfigDb, EditError, Problem};
 use crate::hlc::Timestamp;
 use crate::model::{
@@ -44,6 +45,7 @@ pub(super) struct Api<T> {
     /// The port the daemons serve on.
     pub(super) port: u16,
     pub(super) changes: Changes,
+    pub(super) bluetooth: Option<Bluetooth>,
 }
 
 impl<T: Clone> Clone for Api<T> {
@@ -59,6 +61,7 @@ impl<T: Clone> Clone for Api<T> {
             home: self.home.clone(),
             port: self.port,
             changes: self.changes.clone(),
+            bluetooth: self.bluetooth.clone(),
         }
     }
 }
@@ -115,14 +118,14 @@ impl From<EditError> for Refusal {
     }
 }
 
-type Answer<T> = Result<Json<T>, Refusal>;
+pub(super) type Answer<T> = Result<Json<T>, Refusal>;
 
-fn invalid(error: impl ToString) -> Refusal {
+pub(super) fn invalid(error: impl ToString) -> Refusal {
     Refusal(StatusCode::BAD_REQUEST, error.to_string())
 }
 
 /// A request body that isn't the JSON a route takes.
-fn rejected(rejection: JsonRejection) -> Refusal {
+pub(super) fn rejected(rejection: JsonRejection) -> Refusal {
     invalid(rejection.body_text())
 }
 
@@ -353,7 +356,7 @@ impl<T: LocalApi + Clone> Api<T> {
     /// Tailscale, so one on a device that has left the tailnet can still be
     /// named; one being `placing` must be on one of the owner's devices on
     /// the tailnet now.
-    async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
+    pub(super) async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
         let node = self.find_node(name, placing).await?;
         if placing && self.db.lock().unwrap().config().departed.contains(&node) {
             return Err(Refusal(

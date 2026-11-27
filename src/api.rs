@@ -12,6 +12,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bluetooth::Address;
 use crate::hlc::Timestamp;
 use crate::model::{ItemId, NodeId, ReplicaState, Role};
 
@@ -262,6 +263,162 @@ pub struct Resolve {
     /// Its Item, by ID or name.
     pub item: String,
     pub version: String,
+}
+
+/// The Fleet's Peripherals: GET lists them, as [`Peripherals`].
+pub const PERIPHERALS: &str = "/api/v1/peripherals";
+
+/// A Peripheral, by address or by a name a Node gives it: POST a
+/// [`PeripheralAction`] to act on it.
+pub fn peripheral(peripheral: &str) -> String {
+    format!("{PERIPHERALS}/{}", crate::http::percent_encode(peripheral))
+}
+
+/// The Peripherals paired with the Nodes that could be asked, and what
+/// each Node answered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peripherals {
+    /// The Fleet's Nodes, the answering one first.
+    pub nodes: Vec<BluetoothNode>,
+    pub peripherals: Vec<Peripheral>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BluetoothNode {
+    pub node: NodeId,
+    /// Its machine name, if the Node is on the tailnet.
+    pub name: Option<String>,
+    pub bluetooth: Bluetooth,
+}
+
+/// What a Node said of its Bluetooth.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum Bluetooth {
+    /// It listed its Peripherals.
+    Ready,
+    /// It has no Bluetooth adapter, or BlueZ isn't running there.
+    NoAdapter,
+    Unreachable,
+    /// Its heighliner is older than Peripherals.
+    Older,
+    /// It speaks another major version of the Node protocol.
+    Incompatible,
+    /// It couldn't list them.
+    Failed {
+        error: String,
+    },
+}
+
+impl Bluetooth {
+    /// Why the Node's Peripherals aren't known, if they aren't.
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::NoAdapter => Some("has no Bluetooth adapter, or BlueZ isn't running".into()),
+            Self::Unreachable => Some("can't be reached".into()),
+            Self::Older => {
+                Some("runs an older heighliner that can't manage Peripherals; upgrade it".into())
+            }
+            Self::Incompatible => Some("speaks another version of the Node protocol".into()),
+            Self::Failed { error } => Some(format!("can't list its Peripherals: {error}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peripheral {
+    pub address: Address,
+    /// The name shown: the alias of the first Node it is paired with, in
+    /// the order of [`Peripherals::nodes`], so the answering Node's when it
+    /// is paired there.
+    pub alias: String,
+    /// The freedesktop icon name for its kind, such as `audio-headset`.
+    pub icon: Option<String>,
+    /// The Nodes it is paired with, in the order of [`Peripherals::nodes`].
+    pub paired: Vec<PairedOn>,
+}
+
+/// A Peripheral as one Node it is paired with sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedOn {
+    pub node: NodeId,
+    /// What that Node calls it.
+    pub alias: String,
+    pub connected: bool,
+}
+
+impl Peripheral {
+    /// Each name its Nodes give it, with those Nodes, in the order they
+    /// first appear.
+    pub fn aliases(&self) -> Vec<(&str, Vec<&NodeId>)> {
+        let mut aliases: Vec<(&str, Vec<&NodeId>)> = Vec::new();
+        for paired in &self.paired {
+            match aliases.iter_mut().find(|(alias, _)| *alias == paired.alias) {
+                Some((_, nodes)) => nodes.push(&paired.node),
+                None => aliases.push((&paired.alias, vec![&paired.node])),
+            }
+        }
+        aliases
+    }
+
+    /// The Nodes of `nodes` that can pair with it: those that listed
+    /// their Peripherals without it.
+    pub fn pairable<'a>(
+        &'a self,
+        nodes: &'a [BluetoothNode],
+    ) -> impl Iterator<Item = &'a BluetoothNode> {
+        nodes.iter().filter(|node| {
+            node.bluetooth == Bluetooth::Ready
+                && !self.paired.iter().any(|paired| paired.node == node.node)
+        })
+    }
+}
+
+impl Peripherals {
+    /// `node`'s machine name, or its node ID.
+    pub fn node_name<'a>(&'a self, node: &'a NodeId) -> &'a str {
+        self.nodes
+            .iter()
+            .find(|known| known.node == *node)
+            .and_then(|known| known.name.as_deref())
+            .unwrap_or(node.as_str())
+    }
+}
+
+/// What to do with a Peripheral. Each Node is named by node ID or machine
+/// name, and is this one if none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum PeripheralAction {
+    /// Connect it on the Node, disconnecting it from every other.
+    Handoff {
+        node: Option<String>,
+    },
+    /// Pair it with the Node, where it must be in pairing mode, then
+    /// connect it there, disconnecting it from every other.
+    Pair {
+        node: Option<String>,
+    },
+    Disconnect {
+        node: Option<String>,
+    },
+    /// Unpair it from the Node.
+    Forget {
+        node: Option<String>,
+    },
+    /// Give it `alias`, a name one of its Nodes gives it, on every Node it
+    /// is paired with.
+    Name {
+        alias: String,
+    },
+}
+
+/// An action that was carried out, with what went wrong along the way
+/// without stopping it, as sentences.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Done {
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

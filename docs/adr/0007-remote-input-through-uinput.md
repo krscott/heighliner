@@ -27,5 +27,5 @@ A Node that enables Remote Input gives the daemon write access to
 by default and enabled per Node. WhoIs authorizes the owner's devices, not
 programs on them, so any program on any of them, including another
 user's on the Node itself, can send it. Input follows the keyboard layout the
-desktop has, so the page maps text through one layout, US, and refuses
-characters it can't type.
+desktop has, so the daemon types text through one layout, US, and the page
+refuses characters it can't type.

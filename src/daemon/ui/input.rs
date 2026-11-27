@@ -13,15 +13,16 @@ use axum::http::{StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures_util::future::BoxFuture;
 use maud::{Markup, html};
 use tokio::time::Instant;
 
 use super::actions::{self, same_origin};
 use super::{PERIPHERALS, any_page, button, node_name, other_nodes};
 use crate::api::{Peripherals, Status};
-use crate::auth::Recheck;
+use crate::auth::{Denied, Recheck};
 use crate::daemon::api::Api;
-use crate::input::{Device, RemoteInput, Session};
+use crate::input::{Device, MAX_TEXT, RemoteInput, Session};
 use crate::tailscale::LocalApi;
 
 /// The Remote Input page.
@@ -41,9 +42,8 @@ const SILENCE: Duration = Duration::from_secs(6);
 /// How often a page's caller is authorized again while it is connected.
 const RECHECK_EVERY: Duration = Duration::from_secs(30);
 
-/// The largest message a page may send: text up to
-/// [`crate::input::MAX_TEXT`] characters, each up to four bytes, escaped or
-/// not.
+/// The largest message a page may send: text up to [`MAX_TEXT`]
+/// characters, each at most 12 bytes once escaped.
 const MAX_MESSAGE: usize = 64 * 1024;
 
 pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
@@ -81,7 +81,7 @@ fn modifier(key: &str, label: &str) -> Markup {
 /// The touchpad, buttons and keys.
 fn controls(me: &str) -> Markup {
     html! {
-        section.remote data-socket=(SOCKET) {
+        section.remote data-socket=(SOCKET) data-max-text=(MAX_TEXT) {
             div.remote-bar {
                 h1 { "Remote Input on " (me) }
                 span.badge.unknown.remote-state { "connecting" }
@@ -99,9 +99,6 @@ fn controls(me: &str) -> Markup {
                 button type="button" data-button="middle" { "Middle" }
                 button type="button" data-button="right" { "Right" }
             }
-            textarea.typing rows="1" placeholder="Type here" aria-label="Type"
-                autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" {}
-            p.note.remote-note role="status" {}
             div.keys {
                 (key("escape", "Esc", "Escape"))
                 (key("tab", "Tab", "Tab"))
@@ -126,6 +123,10 @@ fn controls(me: &str) -> Markup {
                 (key("volume_up", "Vol +", "Volume up"))
                 (key("mute", "Mute", "Mute"))
             }
+            // Last, so the keys stay in view above the phone's keyboard.
+            textarea.typing rows="1" placeholder="Type here" aria-label="Type"
+                autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" {}
+            p.note.remote-note role="status" {}
             script src="/ui/input.js" defer {}
         }
     }
@@ -231,7 +232,7 @@ async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
 
 async fn socket<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
-    Extension(recheck): Extension<Recheck>,
+    Extension(recheck): Extension<Recheck<T>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let device = match &api.remote_input {
@@ -251,10 +252,11 @@ async fn socket<T: LocalApi + Clone>(
 /// Carries out each message a page sends, answering one it can't with
 /// `{"refused": "why"}`, until the page goes away or its caller may no
 /// longer send them.
-async fn serve(mut socket: WebSocket, device: Arc<Device>, recheck: Recheck) {
+async fn serve<T: LocalApi>(mut socket: WebSocket, device: Arc<Device>, recheck: Recheck<T>) {
     let mut session = Session::new(device);
     let mut pings = tokio::time::interval(PING_EVERY);
     let mut rechecks = tokio::time::interval_at(Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
+    let mut checking: Option<BoxFuture<'static, Result<(), Denied>>> = None;
     let mut deadline = Instant::now() + SILENCE;
     loop {
         let message = tokio::select! {
@@ -268,8 +270,16 @@ async fn serve(mut socket: WebSocket, device: Arc<Device>, recheck: Recheck) {
                 }
                 continue;
             }
-            _ = rechecks.tick() => {
-                if let Err(denied) = recheck.authorize().await {
+            // Checked alongside the page's messages, since asking tailscaled
+            // can take seconds.
+            _ = rechecks.tick(), if checking.is_none() => {
+                let recheck = recheck.clone();
+                checking = Some(Box::pin(async move { recheck.authorize().await }));
+                continue;
+            }
+            checked = async { checking.as_mut().expect("checked only while checking").await }, if checking.is_some() => {
+                checking = None;
+                if let Err(denied) = checked {
                     tracing::warn!(%denied, "closing a Remote Input page whose caller is no longer authorized");
                     break;
                 }

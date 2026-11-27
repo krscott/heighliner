@@ -27,10 +27,12 @@
   // How long a notice stays.
   const NOTICE_MS = 5000;
   // The most text one message may type, as the daemon allows.
-  const MAX_TEXT = 1024;
+  const MAX_TEXT = Number(remote.dataset.maxText);
 
   let socket = null;
   let retry = null;
+  // A tap's click, waiting to see whether a second touch follows.
+  let waiting = null;
 
   function show(text, kind) {
     state.textContent = text;
@@ -150,26 +152,58 @@
     frame ??= requestAnimationFrame(flush);
   }
 
-  function pressKeys(keys) {
-    forget();
-    send({ type: "keys", keys: [...takeModifiers(), ...keys] });
+  // How many of the page's controls hold each button down: a Left button
+  // held while the touchpad drags is released only when both let go.
+  const holds = { left: 0, middle: 0, right: 0 };
+
+  function sendClick(button) {
+    // A click would release a button a control holds.
+    if (holds[button] === 0) {
+      flush();
+      send({ type: "click", button, modifiers: takeModifiers() });
+    }
   }
 
   function click(button) {
     forget();
-    flush();
-    send({ type: "click", button, modifiers: takeModifiers() });
+    sendClick(button);
+  }
+
+  // Sends a tap's click that is waiting to see whether a second tap
+  // follows, so that it comes before what is sent next. Says whether it
+  // did.
+  function settle() {
+    if (waiting === null) {
+      return false;
+    }
+    clearTimeout(waiting);
+    waiting = null;
+    sendClick("left");
+    return true;
+  }
+
+  function pressKeys(keys) {
+    settle();
+    forget();
+    send({ type: "keys", keys: [...takeModifiers(), ...keys] });
   }
 
   function press(button) {
+    settle();
     forget();
-    flush();
-    send({ type: "button", button, down: true });
+    holds[button] += 1;
+    if (holds[button] === 1) {
+      flush();
+      send({ type: "button", button, down: true });
+    }
   }
 
   function release(button) {
-    flush();
-    send({ type: "button", button, down: false });
+    holds[button] -= 1;
+    if (holds[button] === 0) {
+      flush();
+      send({ type: "button", button, down: false });
+    }
   }
 
   // Pressing a key or modifier leaves the focus where it was, so the
@@ -220,9 +254,6 @@
   // isn't the first half of a double tap; a touch that starts just after a
   // tap and moves drags.
   let gesture = null;
-  // A tap's click, waiting to see whether a second touch follows.
-  let waiting = null;
-
   function centre(touches) {
     let x = 0;
     let y = 0;
@@ -347,9 +378,17 @@
   // replacing a word it corrected, is sent as the backspaces and characters
   // that do the same. Anything else sent can move the text cursor on the
   // Node, so it empties the field first. The US layout the daemon types
-  // with has only printable ASCII; the curly quotes phones put in are typed
-  // as straight ones.
-  const straight = { "‘": "'", "’": "'", "“": '"', "”": '"' };
+  // with has only printable ASCII; the punctuation phones put in for it is
+  // typed as what it replaced.
+  const plain = {
+    "‘": "'",
+    "’": "'",
+    "“": '"',
+    "”": '"',
+    "–": "-",
+    "—": "--",
+    "…": "...",
+  };
   const typeable = (c) => c === "\n" || c === "\t" || (c >= " " && c <= "~");
   let typed = [];
 
@@ -359,7 +398,7 @@
   }
 
   typing.addEventListener("input", () => {
-    const chars = Array.from(typing.value, (c) => straight[c] ?? c);
+    const chars = Array.from(typing.value).flatMap((c) => Array.from(plain[c] ?? c));
     const kept = chars.filter(typeable);
     if (kept.length !== chars.length) {
       const dropped = [...new Set(chars.filter((c) => !typeable(c)))].join(" ");
@@ -374,22 +413,41 @@
     }
     const erase = typed.length - same;
     const text = kept.slice(same);
+    typed = kept;
     if (text.length > MAX_TEXT) {
       notice(`Can't type more than ${MAX_TEXT} characters at once.`);
       forget();
       return;
     }
-    const modifiers = takeModifiers();
-    for (let i = 0; i < erase; i += 1) {
-      send({ type: "keys", keys: [...modifiers, "backspace"] });
+    // With a modifier latched, one character, even one that replaced a
+    // selection in the field, or one Backspace is a shortcut; anything
+    // more, such as a word the keyboard suggested, isn't sent.
+    if (latched.size > 0) {
+      forget();
+      if (text.length === 1) {
+        settle();
+        send({ type: "text", text: text[0], modifiers: takeModifiers() });
+      } else if (text.length === 0 && erase === 1) {
+        pressKeys(["backspace"]);
+      } else if (text.length > 0 || erase > 0) {
+        notice("With a modifier, type one character.");
+      }
+      return;
+    }
+    // After a click, the text cursor may be elsewhere on the Node, where
+    // what the field held isn't.
+    if (settle()) {
+      forget();
+    } else {
+      for (let i = 0; i < erase; i += 1) {
+        send({ type: "keys", keys: ["backspace"] });
+      }
     }
     if (text.length > 0) {
-      send({ type: "text", text: text.join(""), modifiers });
+      send({ type: "text", text: text.join(""), modifiers: [] });
     }
-    typed = kept;
-    // With a modifier, the characters were a shortcut, not text; and a
-    // finished line starts a new one, which keeps the field short.
-    if (modifiers.length > 0 || text.at(-1) === "\n") {
+    // A finished line starts a new one, which keeps the field short.
+    if (text.at(-1) === "\n") {
       forget();
     }
   });

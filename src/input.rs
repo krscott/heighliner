@@ -21,7 +21,7 @@ use tokio::time::Instant;
 /// The name the desktop shows for the virtual devices.
 const NAME: &str = "heighliner Remote Input";
 
-/// The longest text one message may type; `ui/input.js` knows it too.
+/// The longest text one message may type.
 pub const MAX_TEXT: usize = 1024;
 
 /// The most keys one message may press at once.
@@ -114,7 +114,7 @@ impl Key {
 }
 
 /// A pointer button.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
     Left,
@@ -372,7 +372,7 @@ fn chord(keys: &[KeyCode]) -> Vec<Vec<Event>> {
 /// connection mid-drag leaves nothing held.
 pub struct Session {
     device: Arc<Device>,
-    held: BTreeSet<KeyCode>,
+    held: BTreeSet<Button>,
     /// Scrolling not yet sent as a whole wheel notch, right and down.
     unsent: (i32, i32),
     /// When the next keystroke or click may be sent.
@@ -410,24 +410,20 @@ impl Session {
                 self.stroke(chord(&codes)).await?;
             }
             Message::Click { button, modifiers } => {
-                let modifiers = codes(&modifiers)?;
+                let mut keys = codes(&modifiers)?;
+                keys.push(button.code());
                 tokio::time::sleep_until(self.next_press).await;
-                let mut reports = chord(&modifiers);
-                let releases = reports.split_off(modifiers.len());
-                reports.extend(chord(&[button.code()]));
-                reports.extend(releases);
-                self.stroke(reports).await?;
+                self.stroke(chord(&keys)).await?;
                 self.next_press = Instant::now() + BUTTON_GAP;
             }
             Message::Button { button, down } => {
-                let key = button.code();
                 if down {
                     tokio::time::sleep_until(self.next_press).await;
-                    self.held.insert(key);
-                    self.device.send(&[vec![Event::Press(key)]])?;
+                    self.held.insert(button);
+                    self.device.send(&[vec![Event::Press(button.code())]])?;
                 } else {
-                    self.held.remove(&key);
-                    self.device.send(&[vec![Event::Release(key)]])?;
+                    self.held.remove(&button);
+                    self.device.send(&[vec![Event::Release(button.code())]])?;
                     self.next_press = Instant::now() + BUTTON_GAP;
                 }
             }
@@ -464,35 +460,30 @@ impl Session {
         self.device.send(&[report])
     }
 
-    /// Types `text` with `modifiers` held, if every character in it can be
-    /// typed, and nothing otherwise. A character that needs Shift is typed
-    /// with it, unless Shift is one of the modifiers.
+    /// Types `text`, each character a chord with `modifiers`, if every
+    /// character in it can be typed, and nothing otherwise. A character that
+    /// needs Shift is typed with it, unless Shift is one of the modifiers.
     async fn type_text(&mut self, text: &str, modifiers: &[Key]) -> Result<(), Refused> {
         if text.chars().count() > MAX_TEXT {
             return Err(Refused::TooLong);
         }
-        let keys = text
+        let modifiers = codes(modifiers)?;
+        let strokes = text
             .chars()
-            .map(|c| us_key(c).ok_or(Refused::Untypeable(c)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let shift_held = modifiers.contains(&Key::Shift);
-        let mut modifiers = chord(&codes(modifiers)?);
-        let releases = modifiers.split_off(modifiers.len() / 2);
-        self.stroke(modifiers).await?;
-        let typed = async {
-            for (key, shifted) in keys {
-                let stroke = if shifted && !shift_held {
-                    chord(&[KeyCode::KEY_LEFTSHIFT, key])
-                } else {
-                    chord(&[key])
-                };
-                self.stroke(stroke).await?;
-            }
-            io::Result::Ok(())
-        };
-        let typed = typed.await;
-        self.device.send(&releases)?;
-        Ok(typed?)
+            .map(|c| {
+                let (key, shifted) = us_key(c).ok_or(Refused::Untypeable(c))?;
+                let mut keys = modifiers.clone();
+                if shifted && !keys.contains(&KeyCode::KEY_LEFTSHIFT) {
+                    keys.push(KeyCode::KEY_LEFTSHIFT);
+                }
+                keys.push(key);
+                Ok(chord(&keys))
+            })
+            .collect::<Result<Vec<_>, Refused>>()?;
+        for stroke in strokes {
+            self.stroke(stroke).await?;
+        }
+        Ok(())
     }
 }
 
@@ -509,7 +500,7 @@ impl Drop for Session {
         let released: Vec<Vec<Event>> = self
             .held
             .iter()
-            .map(|&key| vec![Event::Release(key)])
+            .map(|button| vec![Event::Release(button.code())])
             .collect();
         if let Err(error) = self.device.send(&released) {
             tracing::warn!(%error, "can't release the buttons a Remote Input page held");

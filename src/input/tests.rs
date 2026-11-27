@@ -137,6 +137,29 @@ async fn modifiers_are_held_around_text_keys_and_clicks() {
             vec![Release(CTRL)],
         ]
     );
+    // Each character is a chord of its own, so no modifier stays down
+    // between them.
+    session
+        .apply(Message::Text {
+            text: "ab".into(),
+            modifiers: vec![Key::Alt],
+        })
+        .await
+        .unwrap();
+    let (alt, b) = (KeyCode::KEY_LEFTALT, KeyCode::KEY_B);
+    assert_eq!(
+        device.take(),
+        [
+            vec![Press(alt)],
+            vec![Press(a)],
+            vec![Release(a)],
+            vec![Release(alt)],
+            vec![Press(alt)],
+            vec![Press(b)],
+            vec![Release(b)],
+            vec![Release(alt)],
+        ]
+    );
 
     session
         .apply(Message::Keys {

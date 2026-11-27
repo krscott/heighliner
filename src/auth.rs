@@ -21,7 +21,6 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use futures_util::future::BoxFuture;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -309,12 +308,10 @@ async fn reauthorize<T: LocalApi>(
 ) -> Response {
     match authorizer.authorize(addr).await {
         Ok(identity) => {
-            let recheck = move || -> BoxFuture<'static, Result<Identity, Denied>> {
-                let authorizer = authorizer.clone();
-                Box::pin(async move { authorizer.authorize(addr).await })
-            };
             request.extensions_mut().insert(identity);
-            request.extensions_mut().insert(Recheck(Arc::new(recheck)));
+            request
+                .extensions_mut()
+                .insert(Recheck { authorizer, addr });
             next.run(request).await
         }
         Err(denied) => denied.into_response(),
@@ -323,12 +320,23 @@ async fn reauthorize<T: LocalApi>(
 
 /// Authorizes a request's caller again, for a handler that goes on serving
 /// it after answering, such as a WebSocket's.
-#[derive(Clone)]
-pub struct Recheck(Arc<dyn Fn() -> BoxFuture<'static, Result<Identity, Denied>> + Send + Sync>);
+pub struct Recheck<T> {
+    authorizer: Arc<Authorizer<T>>,
+    addr: SocketAddr,
+}
 
-impl Recheck {
-    pub async fn authorize(&self) -> Result<Identity, Denied> {
-        (self.0)().await
+impl<T> Clone for Recheck<T> {
+    fn clone(&self) -> Self {
+        Self {
+            authorizer: self.authorizer.clone(),
+            addr: self.addr,
+        }
+    }
+}
+
+impl<T: LocalApi> Recheck<T> {
+    pub async fn authorize(&self) -> Result<(), Denied> {
+        self.authorizer.authorize(self.addr).await.map(drop)
     }
 }
 

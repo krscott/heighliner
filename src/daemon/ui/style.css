@@ -128,7 +128,8 @@ p {
   font-weight: 600;
 }
 
-.replicas {
+.replicas,
+.paired {
   list-style: none;
   padding: 0;
   margin: 0.5rem 0 0;
@@ -136,6 +137,15 @@ p {
 
 .replicas li {
   padding: 0.15rem 0;
+}
+
+.paired li {
+  padding: 0.25rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.paired .actions {
+  margin: 0.25rem 0;
 }
 
 .note,

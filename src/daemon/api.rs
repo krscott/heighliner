@@ -18,6 +18,7 @@ use crate::api::{
     self, AddReplica, Conflict, ItemStatus, NodeStatus, Reach, Refused, ReplicaStatus, Replication,
     Resolve, SetPaused, Status, Track, Tracked,
 };
+use crate::bluetooth::Bluetooth;
 use crate::config::{Config, ConfigDb, EditError, Problem};
 use crate::hlc::Timestamp;
 use crate::model::{
@@ -44,6 +45,7 @@ pub(super) struct Api<T> {
     /// The port the daemons serve on.
     pub(super) port: u16,
     pub(super) changes: Changes,
+    pub(super) bluetooth: Option<Bluetooth>,
 }
 
 impl<T: Clone> Clone for Api<T> {
@@ -59,6 +61,7 @@ impl<T: Clone> Clone for Api<T> {
             home: self.home.clone(),
             port: self.port,
             changes: self.changes.clone(),
+            bluetooth: self.bluetooth.clone(),
         }
     }
 }
@@ -115,14 +118,14 @@ impl From<EditError> for Refusal {
     }
 }
 
-type Answer<T> = Result<Json<T>, Refusal>;
+pub(super) type Answer<T> = Result<Json<T>, Refusal>;
 
-fn invalid(error: impl ToString) -> Refusal {
+pub(super) fn invalid(error: impl ToString) -> Refusal {
     Refusal(StatusCode::BAD_REQUEST, error.to_string())
 }
 
 /// A request body that isn't the JSON a route takes.
-fn rejected(rejection: JsonRejection) -> Refusal {
+pub(super) fn rejected(rejection: JsonRejection) -> Refusal {
     invalid(rejection.body_text())
 }
 
@@ -134,9 +137,10 @@ impl<T: LocalApi + Clone> Api<T> {
     /// This Node's view of the Fleet.
     pub(super) async fn status(&self) -> Status {
         // Names are a convenience; without Tailscale, IDs do.
-        let devices: BTreeMap<NodeId, (String, Option<IpAddr>)> =
-            match self.tailscale.status().await {
-                Ok(tailnet) => std::iter::once(tailnet.me())
+        // None if Tailscale can't be asked.
+        let devices: Option<BTreeMap<NodeId, (String, Option<IpAddr>)>> =
+            self.tailscale.status().await.ok().map(|tailnet| {
+                std::iter::once(tailnet.me())
                     .chain(tailnet.owned_devices())
                     .map(|device| {
                         let ip = device
@@ -147,10 +151,10 @@ impl<T: LocalApi + Clone> Api<T> {
                             .copied();
                         (device.id.clone(), (device.name.clone(), ip))
                     })
-                    .collect(),
-                Err(_) => BTreeMap::new(),
-            };
-        let name_of = |node: &NodeId| devices.get(node).map(|(name, _)| name.clone());
+                    .collect()
+            });
+        let device = |node: &NodeId| devices.as_ref().and_then(|devices| devices.get(node));
+        let name_of = |node: &NodeId| device(node).map(|(name, _)| name.clone());
         let (config, me) = {
             let db = self.db.lock().unwrap();
             (db.config(), db.node().clone())
@@ -265,6 +269,14 @@ impl<T: LocalApi + Clone> Api<T> {
             )
             .chain(&config.departed)
             .chain(remote.incompatible.keys())
+            // A Node that answered, even one that hasn't published its
+            // record yet or holds no Replica, unless Tailscale says it has
+            // left the tailnet.
+            .chain(remote.states.keys().filter(|node| {
+                devices
+                    .as_ref()
+                    .is_none_or(|devices| devices.contains_key(*node))
+            }))
             .chain([&me])
             .collect();
         let mut nodes: Vec<NodeStatus> = named
@@ -285,7 +297,7 @@ impl<T: LocalApi + Clone> Api<T> {
                 NodeStatus {
                     node: node.clone(),
                     name: name_of(node),
-                    ip: devices.get(node).and_then(|(_, ip)| *ip),
+                    ip: device(node).and_then(|(_, ip)| *ip),
                     departed: config.departed.contains(node),
                     reach,
                 }
@@ -353,7 +365,7 @@ impl<T: LocalApi + Clone> Api<T> {
     /// Tailscale, so one on a device that has left the tailnet can still be
     /// named; one being `placing` must be on one of the owner's devices on
     /// the tailnet now.
-    async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
+    pub(super) async fn node(&self, name: Option<&str>, placing: bool) -> Result<NodeId, Refusal> {
         let node = self.find_node(name, placing).await?;
         if placing && self.db.lock().unwrap().config().departed.contains(&node) {
             return Err(Refusal(

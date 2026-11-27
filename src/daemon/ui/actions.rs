@@ -17,8 +17,8 @@ use axum::routing::post;
 use maud::html;
 use serde::Deserialize;
 
-use super::{item_href, page};
-use crate::api::{self, AddReplica, Resolve, Track};
+use super::{PERIPHERALS, item_href, outcome_page};
+use crate::api::{self, AddReplica, Done, PeripheralAction, Resolve, Track};
 use crate::daemon::api::{Api, Refusal};
 use crate::http::percent_encode;
 use crate::model::ItemId;
@@ -28,6 +28,7 @@ pub(super) const TRACK: &str = "/ui/track";
 pub(super) const KEEP: &str = "/ui/conflicts/keep";
 pub(super) const SWAP: &str = "/ui/conflicts/swap";
 pub(super) const LEAVE: &str = "/ui/leave";
+pub(super) const PERIPHERAL: &str = "/ui/peripherals";
 
 pub(super) fn item_paused(item: ItemId) -> String {
     format!("/ui/items/{item}/paused")
@@ -66,6 +67,7 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .route(KEEP, post(keep::<T>))
         .route(SWAP, post(swap::<T>))
         .route(LEAVE, post(leave::<T>))
+        .route(PERIPHERAL, post(peripheral::<T>))
         .layer(middleware::from_fn(same_origin))
         .with_state(api)
 }
@@ -128,7 +130,7 @@ async fn done<T: LocalApi + Clone>(
                 p.callout { (message) }
                 p { a href=(back) { "Back" } }
             };
-            page(&status, &format!("Couldn't {what}"), code, main)
+            outcome_page(&status, &format!("Couldn't {what}"), code, main)
         }
     }
 }
@@ -344,4 +346,47 @@ async fn leave<T: LocalApi + Clone>(
         })
     });
     done(&api, "leave the Fleet", result, "/".to_owned()).await
+}
+
+#[derive(Deserialize)]
+struct PeripheralForm {
+    /// Its address.
+    peripheral: String,
+    #[serde(flatten)]
+    action: PeripheralAction,
+}
+
+/// What `action` does, to say it couldn't.
+fn what(action: &PeripheralAction) -> &'static str {
+    match action {
+        PeripheralAction::Handoff { .. } => "connect it",
+        PeripheralAction::Pair { .. } => "pair it",
+        PeripheralAction::Disconnect { .. } => "disconnect it",
+        PeripheralAction::Forget { .. } => "forget it",
+        PeripheralAction::Name { .. } => "rename it",
+    }
+}
+
+async fn peripheral<T: LocalApi + Clone>(
+    State(api): State<Api<T>>,
+    form: Result<Form<PeripheralForm>, FormRejection>,
+) -> Response {
+    let back_to = PERIPHERALS.to_owned();
+    let PeripheralForm { peripheral, action } = match fields(form) {
+        Ok(form) => form,
+        Err(refused) => return done(&api, "do that", Err(refused), back_to).await,
+    };
+    let what = what(&action);
+    match api.act_on_peripheral(&peripheral, action).await {
+        Ok(Done { notes }) if !notes.is_empty() => {
+            let status = api.status().await;
+            let main = html! {
+                h1 { "Done, with problems" }
+                ul { @for note in &notes { li { (note) } } }
+                p { a href=(back_to) { "Back" } }
+            };
+            outcome_page(&status, "Done, with problems", StatusCode::OK, main)
+        }
+        result => done(&api, what, result.map(drop), back_to).await,
+    }
 }

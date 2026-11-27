@@ -1,8 +1,10 @@
-//! Heighliner tracks directories across a Tailscale fleet and keeps them
-//! replicated with Syncthing.
+//! Heighliner is a control plane for a Tailscale fleet: it keeps
+//! directories replicated with Syncthing and moves Bluetooth Peripherals
+//! between Nodes.
 
 pub mod api;
 pub mod auth;
+pub mod bluetooth;
 pub mod cli;
 pub mod config;
 pub mod daemon;

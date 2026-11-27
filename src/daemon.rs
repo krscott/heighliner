@@ -22,6 +22,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
 use crate::auth::{self, Authorizer};
+use crate::bluetooth::{Bluetooth, Bluez};
 use crate::config::{Config, ConfigDb};
 use crate::discovery;
 use crate::hlc::{Hlc, Timestamp};
@@ -264,6 +265,8 @@ pub struct Daemon<T> {
     /// The daemon's user's home, which `~` in a path on this Node stands
     /// for, if `HOME` names a normalized absolute path.
     home: Option<AbsPath>,
+    /// This Node's Bluetooth stack, if the daemon can reach one.
+    bluetooth: Option<Bluetooth>,
 }
 
 /// The state file, which the daemon and its API's edits save to.
@@ -420,6 +423,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             conflict_gates: Arc::default(),
             retention: RETENTION_WINDOW,
             home: home(std::env::var("HOME").ok()),
+            bluetooth: None,
         })
     }
 
@@ -433,6 +437,12 @@ impl<T: LocalApi + Clone> Daemon<T> {
     /// Makes the daemon configure Syncthing through `driver` each round.
     pub fn with_driver(mut self, driver: Driver) -> Self {
         self.driver = Some(driver);
+        self
+    }
+
+    /// Makes the daemon manage this Node's Peripherals through `bluetooth`.
+    pub fn with_bluetooth(mut self, bluetooth: Bluetooth) -> Self {
+        self.bluetooth = Some(bluetooth);
         self
     }
 
@@ -480,6 +490,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             home: self.home.clone(),
             port: self.port,
             changes: self.changes.clone(),
+            bluetooth: self.bluetooth.clone(),
         }
     }
 
@@ -503,6 +514,7 @@ impl<T: LocalApi + Clone> Daemon<T> {
             let api = self.api();
             let router = protocol::router(self.db.clone())
                 .merge(api::router(api.clone()))
+                .merge(peripherals::router(api.clone()))
                 .merge(ui::router(api));
             let router = auth::only_for_hosts(router, hosts(self.tailnet.me(), self.port));
             servers.spawn(auth::serve(listener, router, authorizer.clone()));
@@ -981,6 +993,10 @@ pub async fn run(options: Options) -> Result<(), Error> {
             .map_err(|error| api_key_error(error.to_string()))?;
         daemon = daemon.with_driver(Driver::new(client, options.retention));
     }
+    match Bluez::open().await {
+        Ok(bluez) => daemon = daemon.with_bluetooth(Bluetooth::Bluez(bluez)),
+        Err(error) => tracing::warn!(%error, "can't manage this Node's Peripherals"),
+    }
     let stopped = serve(&mut daemon, options.pull_every).await;
     // Whatever stopped the daemon, keep what it merged since the last save.
     if let Err(error) = daemon.save_on_stop() {
@@ -1011,6 +1027,17 @@ async fn serve(daemon: &mut Daemon<Client>, pull_every: Duration) -> Result<(), 
     if let Some(driver) = daemon.driver.clone() {
         let (changed, queue) = (changed.clone(), queue.clone());
         tasks.spawn(async move { driver.watch(&changed, |seen| queue.add(seen)).await });
+    }
+    if let Some(Bluetooth::Bluez(bluez)) = daemon.bluetooth.clone() {
+        let changes = daemon.changes.clone();
+        tasks.spawn(async move {
+            match bluez.watch(|| self::signal(&changes)).await {
+                Ok(()) => tracing::warn!(
+                    "lost the system bus, so Peripherals can't be managed until heighliner restarts"
+                ),
+                Err(error) => tracing::warn!(%error, "can't follow BlueZ's changes; pages show them on their next refresh"),
+            }
+        });
     }
     let mut last_sweep: Option<Instant> = None;
     let edited = daemon.edited.clone();
@@ -1103,6 +1130,7 @@ async fn open_when_ready(
 
 mod api;
 mod conflicts;
+mod peripherals;
 mod ui;
 
 pub use conflicts::ActionError;

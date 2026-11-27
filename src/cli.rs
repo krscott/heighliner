@@ -27,6 +27,10 @@ use crate::tailscale::{self, LocalApi};
 /// How long a request may take.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the daemon may take to act on a Peripheral, which can involve
+/// another Node scanning for it, then pairing and connecting it.
+const PERIPHERAL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How long connecting to one of the daemon's addresses may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -172,11 +176,38 @@ impl Client {
         self.call(Method::POST, api::LEAVE, Some(&leave)).await
     }
 
+    pub async fn peripherals(&self) -> Result<api::Peripherals, Error> {
+        self.call(Method::GET, api::PERIPHERALS, None::<&()>).await
+    }
+
+    /// Carries out `action` on `peripheral`, which can take a while, as
+    /// when pairing scans for it.
+    pub async fn act_on_peripheral(
+        &self,
+        peripheral: &str,
+        action: &api::PeripheralAction,
+    ) -> Result<api::Done, Error> {
+        let path = api::peripheral(peripheral);
+        self.call_for(Method::POST, &path, Some(action), PERIPHERAL_TIMEOUT)
+            .await
+    }
+
     async fn call<R: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
         body: Option<&impl Serialize>,
+    ) -> Result<R, Error> {
+        self.call_for(method, path, body, TIMEOUT).await
+    }
+
+    /// Sends a request, and waits up to `timeout` for its answer.
+    async fn call_for<R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&impl Serialize>,
+        timeout: Duration,
     ) -> Result<R, Error> {
         let body = body.map_or_else(Bytes::new, |body| {
             Bytes::from(serde_json::to_vec(body).expect("requests serialize"))
@@ -209,7 +240,7 @@ impl Client {
         };
         let host = addr.to_string();
         let exchange = http::send(stream, &host, request);
-        let (status, body) = tokio::time::timeout(TIMEOUT, exchange)
+        let (status, body) = tokio::time::timeout(timeout, exchange)
             .await
             .map_err(|_| Error::Timeout { addr })?
             .map_err(|source| Error::Http { addr, source })?;
@@ -409,6 +440,50 @@ pub fn format_status(status: &Status) -> String {
         for problem in &status.problems {
             out.push_str(&format!("  {problem}\n"));
         }
+    }
+    out
+}
+
+/// The Fleet's Peripherals as text: each one's Nodes and its state there,
+/// then the Nodes that couldn't say.
+pub fn format_peripherals(view: &api::Peripherals) -> String {
+    let mut out = String::new();
+    if view.peripherals.is_empty() {
+        out.push_str("No Node that could be asked has a Peripheral paired.\n");
+    }
+    for peripheral in &view.peripherals {
+        out.push_str(&format!("{} ({})\n", peripheral.alias, peripheral.address));
+        for on in &peripheral.paired {
+            let state = if on.connected {
+                "connected"
+            } else {
+                "not connected"
+            };
+            let named = if on.alias == peripheral.alias {
+                String::new()
+            } else {
+                format!(", named {:?}", on.alias)
+            };
+            out.push_str(&format!("  {}: {state}{named}\n", view.node_name(&on.node)));
+        }
+        for node in peripheral.pairable(&view.nodes) {
+            out.push_str(&format!("  {}: not paired\n", view.node_name(&node.node)));
+        }
+    }
+    let without: Vec<&str> = view
+        .without_bluetooth()
+        .map(|node| view.node_name(&node.node))
+        .collect();
+    if !without.is_empty() {
+        out.push_str(&format!("Without Bluetooth: {}\n", without.join(", ")));
+    }
+    let unknown: Vec<String> = view
+        .not_shown()
+        .map(|(node, problem)| format!("  {} {problem}\n", view.node_name(&node.node)))
+        .collect();
+    if !unknown.is_empty() {
+        out.push_str("Nodes not shown:\n");
+        out.extend(unknown);
     }
     out
 }

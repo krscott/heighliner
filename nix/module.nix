@@ -112,7 +112,7 @@ let
 in
 {
   options.services.heighliner = {
-    enable = lib.mkEnableOption "heighliner, which keeps directories replicated across the owner's Tailscale devices with Syncthing";
+    enable = lib.mkEnableOption "heighliner, a control plane for the owner's Tailscale devices that keeps directories replicated with Syncthing and moves Bluetooth Peripherals between them";
 
     package = lib.mkOption {
       type = lib.types.package;

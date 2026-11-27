@@ -11,7 +11,7 @@ unsafe_code = "forbid"
 [dependencies]
 axum = "0.8.9"
 clap = { version = "4.6.9", features = ["derive"] }
-futures-util = { version = "0.3.34", default-features = false }
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
@@ -23,6 +23,7 @@ tokio = { version = "1.54.1", features = ["rt", "net", "time", "macros", "io-uti
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
 uuid = { version = "1.29.3", features = ["v4", "serde"] }
+zbus = { version = "6.5.0", default-features = false, features = ["proxy", "service", "tokio"] }
 
 [dev-dependencies]
 proptest = "1.12.0"

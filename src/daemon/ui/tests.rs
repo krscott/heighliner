@@ -344,3 +344,68 @@ async fn pages_offer_their_actions() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_peripherals_page_moves_and_names_them() {
+    use crate::bluetooth::fake::{Fake as FakeBluetooth, paired};
+    const HOME: &str = "98:47:44:A6:21:19";
+    const WORK: &str = "98:47:44:A5:A9:3B";
+    let dir = tempfile::tempdir().unwrap();
+    let bluetooth = FakeBluetooth::with([
+        paired(HOME, "<i>Q20 Home</i>", true),
+        paired(WORK, "Q20 Work", false),
+    ]);
+    let daemon = daemon(dir.path())
+        .await
+        .with_bluetooth(bluetooth.bluetooth());
+    let (code, _, body) = get_page(&daemon, PERIPHERALS).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("href=\"/peripherals\""), "{body}");
+    // Names are escaped.
+    assert!(body.contains("&lt;i&gt;Q20 Home&lt;/i&gt;"), "{body}");
+    assert!(body.contains(&format!("action=\"{}\"", actions::PERIPHERAL)));
+    for label in [">Disconnect<", ">Connect<", "Forget it on laptop"] {
+        assert!(body.contains(label), "{label}: {body}");
+    }
+
+    let form = format!(
+        "peripheral={}&action=handoff&node=n-laptop",
+        percent_encode(WORK)
+    );
+    let (code, location, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(location.as_deref(), Some(PERIPHERALS));
+    assert!(bluetooth.get(WORK).unwrap().connected);
+
+    let form = format!("peripheral={}&action=fly", percent_encode(WORK));
+    let (code, _, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(
+        body.contains("Couldn&#39;t do that") || body.contains("Couldn't do that"),
+        "{body}"
+    );
+
+    let form = format!(
+        "peripheral={}&action=name&alias={}",
+        percent_encode(WORK),
+        percent_encode("Q20 Work")
+    );
+    let (code, location, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(location.as_deref(), Some(PERIPHERALS));
+
+    // A refusal says why.
+    let form = format!(
+        "peripheral={}&action=pair&node=n-laptop",
+        percent_encode(WORK)
+    );
+    let (code, _, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(
+        body.contains("Couldn&#39;t pair it") || body.contains("Couldn't pair it"),
+        "{body}"
+    );
+    assert!(body.contains("already paired with laptop"), "{body}");
+    // It stays as it is, rather than fetching the form's address again.
+    assert!(!body.contains("live.js"), "{body}");
+}

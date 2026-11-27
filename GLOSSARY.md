@@ -1,7 +1,8 @@
 # Heighliner
 
-Heighliner tracks data across a Tailscale fleet and keeps it replicated between
-nodes, continuing to work while LANs are cut off from each other.
+Heighliner is a control plane for the user's Tailscale fleet. It keeps data
+replicated between nodes, continuing to work while LANs are cut off from each
+other, and moves Bluetooth peripherals between them.
 
 ## Fleet
 
@@ -69,6 +70,18 @@ How long Displaced Versions and the losing side of a Data Conflict are kept and
 can be restored.
 _Avoid_: TTL, grace period
 
+## Peripherals
+
+**Peripheral**:
+A Bluetooth device paired with one or more Nodes, identified by its Bluetooth
+address.
+_Avoid_: Device, Bluetooth device, accessory
+
+**Handoff**:
+Moving a Peripheral's connection from whichever Nodes it is connected to onto
+one other Node.
+_Avoid_: Transfer, move, switch
+
 ## Relationships
 
 - An **Item** has one or more **Replicas**; each **Replica** is on exactly one **Node** and has exactly one **Role**.
@@ -78,3 +91,5 @@ _Avoid_: TTL, grace period
 - Removing a **Replica** or untracking an **Item** never deletes files.
 - Every data movement is ongoing replication between **Replicas**; there is no one-shot copy or move.
 - A **Data Conflict** is resolved by keeping one side and making the other a **Displaced Version**, which can be reversed within the **Retention Window**.
+- A **Peripheral** can be handed off only to a **Node** it is paired with; a **Handoff** leaves it connected to that **Node** alone.
+- A **Peripheral** may have a different name on each **Node** until one name is chosen for all of them.

@@ -17,12 +17,19 @@ use futures_util::Stream;
 use maud::{DOCTYPE, Markup, html};
 
 use super::api::Api;
-use crate::api::{self, ItemStatus, NodeStatus, Reach, ReplicaStatus, Replication, Status};
+use crate::api::{
+    self, ItemStatus, NodeStatus, Peripheral, Peripherals, Reach, ReplicaStatus, Replication,
+    Status,
+};
+use crate::bluetooth;
 use crate::hlc::Timestamp;
 use crate::http::percent_encode;
 use crate::model::{ItemId, ReplicaState, Role};
 use crate::protocol;
 use crate::tailscale::LocalApi;
+
+/// The Peripherals page.
+const PERIPHERALS: &str = "/peripherals";
 
 /// Where pages listen for changes; `ui/live.js` names it too.
 const EVENTS: &str = "/ui/events";
@@ -47,6 +54,7 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .route("/items/{item}", get(item::<T>))
         .route("/items/{item}/replicas/{node}", get(replica::<T>))
         .route("/conflicts", get(conflicts::<T>))
+        .route(PERIPHERALS, get(peripherals::<T>))
         .route(EVENTS, get(events::<T>))
         .route("/ui/style.css", get(style))
         .route("/ui/live.js", get(script))
@@ -105,8 +113,19 @@ async fn events<T: LocalApi + Clone>(
     Sse::new(stream)
 }
 
-/// A page titled `title`, served by `status.node`.
+/// A page titled `title`, served by `status.node`, which keeps itself
+/// current.
 fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
+    any_page(status, title, code, main, true)
+}
+
+/// The page a form's post answers with, which stays as it is: fetching
+/// its address again would ask for a form's action.
+fn outcome_page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
+    any_page(status, title, code, main, false)
+}
+
+fn any_page(status: &Status, title: &str, code: StatusCode, main: Markup, live: bool) -> Response {
     let me = node_name(status, &status.node);
     let markup = html! {
         (DOCTYPE)
@@ -116,8 +135,10 @@ fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Respons
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · heighliner on " (me) }
                 link rel="stylesheet" href="/ui/style.css";
-                script src="/ui/live.js" defer {}
-                noscript { meta http-equiv="refresh" content=(TICK.as_secs()); }
+                @if live {
+                    script src="/ui/live.js" defer {}
+                    noscript { meta http-equiv="refresh" content=(TICK.as_secs()); }
+                }
             }
             body {
                 header {
@@ -125,6 +146,7 @@ fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Respons
                         a.home href="/" { "heighliner" }
                         span.here { "on " (me) }
                         a href="/conflicts" { "Conflicts" }
+                        a href=(PERIPHERALS) { "Peripherals" }
                     }
                     p.lost { "Lost touch with this Node's daemon; this is what it last showed." }
                 }
@@ -750,6 +772,117 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
         }
     };
     page(&status, "Data conflicts", StatusCode::OK, main)
+}
+
+/// `peripheral`'s card: each Node it is paired with, with connecting,
+/// disconnecting and forgetting it there, the Nodes it can be paired
+/// with, and a choice of name when its Nodes name it differently.
+fn peripheral_card(view: &Peripherals, peripheral: &Peripheral) -> Markup {
+    let aliases = peripheral.aliases();
+    let address = peripheral.address.as_str();
+    html! {
+        p.title { (peripheral.alias) " " span.note { code { (peripheral.address) } } }
+        @if aliases.len() > 1 {
+            div.callout {
+                p { "Its Nodes name it differently. Pick one name for all of them:" }
+                ul.replicas {
+                    @for (alias, nodes) in &aliases {
+                        @let fields = [("peripheral", address), ("action", "name"), ("alias", *alias)];
+                        @let names: Vec<&str> = nodes.iter().map(|node| view.node_name(node)).collect();
+                        li {
+                            q { (alias) } " " span.note { "on " (names.join(", ")) } " "
+                            (button(actions::PERIPHERAL, &fields, "Use this name"))
+                        }
+                    }
+                }
+            }
+        }
+        ul.paired {
+            @for on in &peripheral.paired {
+                @let name = view.node_name(&on.node);
+                @let node = ("node", on.node.as_str());
+                li {
+                    (name) " "
+                    @if on.connected {
+                        span.badge.good { "connected" }
+                    } @else {
+                        span.badge.idle { "not connected" }
+                    }
+                    div.actions {
+                        @if on.connected {
+                            (button(actions::PERIPHERAL, &[("peripheral", address), ("action", "disconnect"), node], "Disconnect"))
+                        } @else {
+                            (button(actions::PERIPHERAL, &[("peripheral", address), ("action", "handoff"), node], "Connect"))
+                        }
+                        (confirmed(
+                            "Forget",
+                            &match (peripheral.paired.len(), view.not_shown().next()) {
+                                (2.., _) => format!("It is unpaired from {name}. Pairing it again there needs it in pairing mode."),
+                                (_, None) => format!("It is unpaired from {name}, the only Node it is paired with, so heighliner can't pair it again."),
+                                (_, Some(_)) => format!("It is unpaired from {name}. No other Node that could be asked has it paired, so heighliner may not be able to pair it again."),
+                            },
+                            button(actions::PERIPHERAL, &[("peripheral", address), ("action", "forget"), node], &format!("Forget it on {name}")),
+                        ))
+                    }
+                }
+            }
+            @for node in peripheral.pairable(&view.nodes) {
+                @let name = view.node_name(&node.node);
+                @let fields = [("peripheral", address), ("action", "pair"), ("node", node.node.as_str())];
+                li {
+                    (name) " " span.badge.unknown { "not paired" }
+                    div.actions {
+                        (confirmed(
+                            "Pair",
+                            &format!(
+                                "Put it in pairing mode first. It is disconnected from the other Nodes, then {name} looks for it for {} seconds, pairs it and connects it.",
+                                bluetooth::SCAN.as_secs()
+                            ),
+                            button(actions::PERIPHERAL, &fields, &format!("Pair it with {name}")),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn peripherals<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
+    let status = api.status().await;
+    let view = api.peripherals(status.clone()).await;
+    let without: Vec<&str> = view
+        .without_bluetooth()
+        .map(|node| view.node_name(&node.node))
+        .collect();
+    let unknown: Vec<(&str, String)> = view
+        .not_shown()
+        .map(|(node, problem)| (view.node_name(&node.node), problem))
+        .collect();
+    let main = html! {
+        h1 { "Peripherals" }
+        p.note {
+            "Bluetooth devices paired with the Fleet's Nodes. "
+            "Connecting one on a Node disconnects it from the others."
+        }
+        @if view.peripherals.is_empty() {
+            p.note { "No Node that could be asked has a Peripheral paired." }
+        }
+        ul.cards {
+            @for peripheral in &view.peripherals {
+                li.card { (peripheral_card(&view, peripheral)) }
+            }
+        }
+        @if !without.is_empty() {
+            p.note { "Without Bluetooth: " (without.join(", ")) }
+        }
+        @if !unknown.is_empty() {
+            h2 { "Nodes not shown" }
+            ul {
+                @for (name, problem) in &unknown { li { (name) " " (problem) } }
+            }
+        }
+    };
+    page(&status, "Peripherals", StatusCode::OK, main)
 }
 
 mod actions;

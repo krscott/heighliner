@@ -106,7 +106,8 @@ each Node that should take it:
 services.heighliner.remoteInput.enable = true;
 ```
 
-Then open Input on that Node's UI. The page also has each Peripheral's
+Then open Input on that Node's UI and open the touchpad and keys, which fill
+the screen and nothing else. The Input page also has each Peripheral's
 Handoff buttons and links to the other Nodes' Remote Input. The daemon types
 text through a US keyboard layout, so set the desktop's layout to US, and it
 types only printable ASCII. It releases every button a page held when the

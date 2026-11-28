@@ -1,7 +1,8 @@
-//! The Remote Input page: a touchpad, buttons and keys that `ui/input.js`
-//! sends to this Node's virtual keyboard and pointer over a WebSocket, with
-//! the Fleet's Peripherals beside them. Each Node serves its own; the page
-//! links to the others'.
+//! Remote Input's two pages. The controls, a touchpad, buttons and keys
+//! that `ui/input.js` sends to this Node's virtual keyboard and pointer
+//! over a WebSocket, fill the screen and nothing else. The Input page opens
+//! them or says why there are none, with the Fleet's Peripherals and links
+//! to the other Nodes' Input pages. Each Node serves its own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,21 +12,24 @@ use axum::extract::ws::{self, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::http::{StatusCode, header};
 use axum::middleware;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use maud::{Markup, html};
+use maud::{DOCTYPE, Markup, html};
 use tokio::time::Instant;
 
 use super::actions::{self, same_origin};
-use super::{PERIPHERALS, any_page, button, node_name, other_nodes};
+use super::{PERIPHERALS, button, node_name, other_nodes, respond};
 use crate::api::{Peripherals, Status};
 use crate::auth::Recheck;
 use crate::daemon::api::Api;
 use crate::input::{MAX_TEXT, RemoteInput, Session, VirtualInput};
 use crate::tailscale::LocalApi;
 
-/// The Remote Input page.
+/// The Input page.
 pub(super) const PAGE: &str = "/input";
+
+/// The page of controls.
+const CONTROLS: &str = "/input/controls";
 
 /// The page's WebSocket.
 const SOCKET: &str = "/ui/input";
@@ -48,6 +52,7 @@ const MAX_MESSAGE: usize = 64 * 1024;
 pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
     Router::new()
         .route(PAGE, get(page::<T>))
+        .route(CONTROLS, get(controls::<T>))
         .route("/ui/input.js", get(script))
         .route(
             SOCKET,
@@ -77,68 +82,104 @@ fn modifier(key: &str, label: &str) -> Markup {
     }
 }
 
-/// The touchpad, buttons and keys.
-fn controls(me: &str) -> Markup {
+/// The page of controls: the touchpad, buttons and keys, sized to fill the
+/// screen, or what of it the phone's keyboard leaves, without scrolling.
+fn controls_page(me: &str) -> Markup {
     html! {
-        section.remote data-socket=(SOCKET) data-max-text=(MAX_TEXT) {
-            div.remote-bar {
-                h1 { "Remote Input on " (me) }
-                span.badge.unknown.remote-state { "connecting" }
-                button.fullscreen type="button" hidden { "Fullscreen" }
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                // The phone's keyboard shrinks the page rather than covering
+                // it, so the touchpad shrinks and the keys stay in view.
+                meta name="viewport"
+                    content="width=device-width, initial-scale=1, interactive-widget=resizes-content";
+                title { "Remote Input · heighliner on " (me) }
+                link rel="stylesheet" href="/ui/style.css";
+                script src="/ui/input.js" defer {}
             }
-            noscript { p.callout { "Remote Input needs JavaScript." } }
-            div.touchpad role="application" aria-label="Touchpad" {
-                span.note {
-                    "Drag to move · tap to click · two-finger tap to right-click · "
-                    "two fingers to scroll · double-tap and drag to drag"
+            body.remote-page {
+                section.remote data-socket=(SOCKET) data-max-text=(MAX_TEXT) {
+                    div.remote-bar {
+                        h1 { (me) }
+                        span.badge.unknown.remote-state { "connecting" }
+                        button.fullscreen type="button" hidden { "Fullscreen" }
+                        p.note.remote-note role="status" {}
+                    }
+                    noscript { p.callout { "Remote Input needs JavaScript." } }
+                    // Two views take turns: the touchpad with the keys used
+                    // most alongside it, and every key with room to spare.
+                    div.view {
+                        div.touchpad role="application" aria-label="Touchpad" {
+                            span.note {
+                                "Drag to move · tap to click · two-finger tap to right-click · "
+                                "two fingers to scroll · double-tap and drag to drag"
+                            }
+                        }
+                        div.keys.mouse {
+                            button type="button" data-button="left" { "Left" }
+                            button type="button" data-button="middle" { "Middle" }
+                            button type="button" data-button="right" { "Right" }
+                        }
+                        div.keys {
+                            (key("escape", "Esc", "Escape"))
+                            (key("super", "Super", "Super"))
+                            (key("alt tab", "Alt+Tab", "Alt+Tab"))
+                            (modifier("super", "Super"))
+                            button.swap type="button" title="Every key, without the touchpad" { "Keys" }
+                        }
+                    }
+                    div.view.all-keys hidden {
+                        // The arrows in an inverted T.
+                        div.keys {
+                            (key("escape", "Esc", "Escape"))
+                            (key("tab", "Tab", "Tab"))
+                            (key("up", "↑", "Up"))
+                            (key("backspace", "⌫", "Backspace"))
+                        }
+                        div.keys {
+                            (key("enter", "Enter", "Enter"))
+                            (key("left", "←", "Left"))
+                            (key("down", "↓", "Down"))
+                            (key("right", "→", "Right"))
+                        }
+                        div.keys {
+                            (key("super", "Super", "Super"))
+                            (key("alt tab", "Alt+Tab", "Alt+Tab"))
+                            (key("f11", "F11", "F11"))
+                        }
+                        div.keys {
+                            (key("mute", "Mute", "Mute"))
+                            (key("volume_down", "Vol −", "Volume down"))
+                            (key("volume_up", "Vol +", "Volume up"))
+                        }
+                        div.keys {
+                            (modifier("ctrl", "Ctrl"))
+                            (modifier("alt", "Alt"))
+                            (modifier("shift", "Shift"))
+                            (modifier("super", "Super"))
+                            button.swap type="button" title="The touchpad" { "Mouse" }
+                        }
+                    }
+                    textarea.typing rows="1" placeholder="Type here" aria-label="Type"
+                        autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" {}
                 }
             }
-            div.keys.mouse {
-                button type="button" data-button="left" { "Left" }
-                button type="button" data-button="middle" { "Middle" }
-                button type="button" data-button="right" { "Right" }
-            }
-            div.keys {
-                (key("escape", "Esc", "Escape"))
-                (key("tab", "Tab", "Tab"))
-                (key("enter", "Enter", "Enter"))
-                (key("backspace", "⌫", "Backspace"))
-                (key("left", "←", "Left"))
-                (key("up", "↑", "Up"))
-                (key("down", "↓", "Down"))
-                (key("right", "→", "Right"))
-            }
-            div.keys {
-                (key("super", "Super", "Super"))
-                (key("alt tab", "Alt+Tab", "Alt+Tab"))
-                (key("f11", "F11", "F11"))
-                (modifier("ctrl", "Ctrl"))
-                (modifier("alt", "Alt"))
-                (modifier("shift", "Shift"))
-                (modifier("super", "Super"))
-            }
-            div.keys {
-                (key("volume_down", "Vol −", "Volume down"))
-                (key("volume_up", "Vol +", "Volume up"))
-                (key("mute", "Mute", "Mute"))
-            }
-            p.note.remote-note role="status" {}
-            // Last, so the keys and notices stay in view above the phone's
-            // keyboard.
-            textarea.typing rows="1" placeholder="Type here" aria-label="Type"
-                autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" {}
-            script src="/ui/input.js" defer {}
         }
     }
 }
 
-/// Why this Node takes no Remote Input.
-fn unavailable(me: &str, why: Markup) -> Markup {
-    html! {
-        section.remote {
-            h1 { "Remote Input on " (me) }
-            p.callout { (why) }
+async fn controls<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
+    match &api.remote_input {
+        RemoteInput::Ready(_) => {
+            let status = api.status().await;
+            respond(
+                StatusCode::OK,
+                controls_page(&node_name(&status, &status.node)),
+            )
         }
+        // The Input page says why.
+        RemoteInput::Off | RemoteInput::Failed(_) => Redirect::to(PAGE).into_response(),
     }
 }
 
@@ -195,36 +236,33 @@ fn peripherals(view: &Peripherals) -> Markup {
 async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let status = api.status().await;
     let me = node_name(&status, &status.node);
-    let (fixed, view) = match &api.remote_input {
-        RemoteInput::Ready(_) => (controls(&me), Some(api.peripherals(status.clone()).await)),
+    let (here, view) = match &api.remote_input {
+        RemoteInput::Ready(_) => (
+            html! { a.big-button href=(CONTROLS) { "Open the touchpad and keys" } },
+            Some(api.peripherals(status.clone()).await),
+        ),
         RemoteInput::Off => (
-            unavailable(
-                &me,
-                html! {
+            html! {
+                p.callout {
                     "Remote Input is off on this Node. Turn it on with "
                     code { "services.heighliner.remoteInput.enable = true" }
                     " in its NixOS configuration."
-                },
-            ),
+                }
+            },
             None,
         ),
         RemoteInput::Failed(error) => (
-            unavailable(&me, html! { (error) ". Restart heighliner to try again." }),
+            html! { p.callout { (error) ". Restart heighliner to try again." } },
             None,
         ),
     };
     let main = html! {
+        h1 { "Remote Input on " (me) }
+        (here)
         (other_pages(&status, api.port))
         @if let Some(view) = &view { (peripherals(view)) }
     };
-    any_page(
-        &status,
-        "Remote Input",
-        StatusCode::OK,
-        main,
-        true,
-        Some(fixed),
-    )
+    super::page(&status, "Remote Input", StatusCode::OK, main)
 }
 
 async fn socket<T: LocalApi + Clone>(

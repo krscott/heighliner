@@ -117,25 +117,17 @@ async fn events<T: LocalApi + Clone>(
 /// A page titled `title`, served by `status.node`, which keeps itself
 /// current.
 fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
-    any_page(status, title, code, main, true, None)
+    any_page(status, title, code, main, true)
 }
 
 /// The page a form's post answers with, which stays as it is: fetching
 /// its address again would ask for a form's action.
 fn outcome_page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
-    any_page(status, title, code, main, false, None)
+    any_page(status, title, code, main, false)
 }
 
-/// A page showing `main`, which, if it is `live`, is kept current. Content
-/// in `fixed` goes before it and is left alone.
-fn any_page(
-    status: &Status,
-    title: &str,
-    code: StatusCode,
-    main: Markup,
-    live: bool,
-    fixed: Option<Markup>,
-) -> Response {
+/// A page showing `main`, which, if it is `live`, is kept current.
+fn any_page(status: &Status, title: &str, code: StatusCode, main: Markup, live: bool) -> Response {
     let me = node_name(status, &status.node);
     let markup = html! {
         (DOCTYPE)
@@ -161,11 +153,15 @@ fn any_page(
                     }
                     p.lost { "Lost touch with this Node's daemon; this is what it last showed." }
                 }
-                @if let Some(fixed) = fixed { (fixed) }
                 main { (main) }
             }
         }
     };
+    respond(code, markup)
+}
+
+/// A rendered page, held to [`POLICY`] and never cached.
+fn respond(code: StatusCode, markup: Markup) -> Response {
     (
         code,
         [

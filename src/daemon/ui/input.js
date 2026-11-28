@@ -1,4 +1,4 @@
-// The Remote Input page: turns touches on the touchpad, the buttons and
+// Remote Input's controls: turns touches on the touchpad, the buttons and
 // typing into messages for this Node's virtual keyboard and pointer, sent
 // over a WebSocket. Keys are pressed and released within one message; the
 // daemon releases any button a page held when its connection closes.
@@ -117,8 +117,9 @@
     } else {
       latched.delete(key);
     }
-    const button = remote.querySelector(`[data-modifier="${key}"]`);
-    button?.setAttribute("aria-pressed", String(on));
+    for (const button of remote.querySelectorAll(`[data-modifier="${key}"]`)) {
+      button.setAttribute("aria-pressed", String(on));
+    }
   }
 
   // The latched modifiers, which are then no longer latched.
@@ -215,9 +216,9 @@
     }
   }
 
-  // Pressing a key or modifier leaves the focus where it was, so the
-  // phone's keyboard stays open while typing.
-  for (const button of remote.querySelectorAll("[data-keys], [data-modifier]")) {
+  // Pressing a key, modifier or swap button leaves the focus where it was,
+  // so the phone's keyboard stays open while typing.
+  for (const button of remote.querySelectorAll("[data-keys], [data-modifier], .swap")) {
     button.addEventListener("pointerdown", (event) => event.preventDefault());
     button.addEventListener("mousedown", (event) => event.preventDefault());
   }
@@ -234,6 +235,28 @@
       settle();
       forget();
       setLatched(key, !latched.has(key));
+    });
+  }
+
+  // The two views take turns. What the hidden one held is let go, as it
+  // would miss the finger lifting, and latched modifiers too, as the other
+  // view may not show them.
+  const swaps = [...remote.querySelectorAll(".swap")];
+  for (const swap of swaps) {
+    swap.addEventListener("click", () => {
+      settle();
+      gesture = null;
+      for (const button of [...held]) {
+        release(button);
+      }
+      takeModifiers();
+      for (const view of remote.querySelectorAll(".view")) {
+        view.hidden = !view.hidden;
+      }
+      // A keyboard user stays on the button, now the other view's.
+      if (document.activeElement === swap) {
+        swaps.find((other) => other !== swap).focus();
+      }
     });
   }
 

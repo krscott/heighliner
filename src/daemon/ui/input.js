@@ -1,4 +1,4 @@
-// The Remote Input page: turns touches on the touchpad, the buttons and
+// Remote Input's page of controls: turns touches on the touchpad, the buttons and
 // typing into messages for this Node's virtual keyboard and pointer, sent
 // over a WebSocket. Keys are pressed and released within one message; the
 // daemon releases any button a page held when its connection closes.
@@ -117,8 +117,9 @@
     } else {
       latched.delete(key);
     }
-    const button = remote.querySelector(`[data-modifier="${key}"]`);
-    button?.setAttribute("aria-pressed", String(on));
+    for (const button of remote.querySelectorAll(`[data-modifier="${key}"]`)) {
+      button.setAttribute("aria-pressed", String(on));
+    }
   }
 
   // The latched modifiers, which are then no longer latched.
@@ -217,7 +218,7 @@
 
   // Pressing a key or modifier leaves the focus where it was, so the
   // phone's keyboard stays open while typing.
-  for (const button of remote.querySelectorAll("[data-keys], [data-modifier]")) {
+  for (const button of remote.querySelectorAll("[data-keys], [data-modifier], .swap")) {
     button.addEventListener("pointerdown", (event) => event.preventDefault());
     button.addEventListener("mousedown", (event) => event.preventDefault());
   }
@@ -234,6 +235,24 @@
       settle();
       forget();
       setLatched(key, !latched.has(key));
+    });
+  }
+
+  // The two views take turns. What the hidden one held is let go, as it
+  // would miss the finger lifting.
+  for (const swap of remote.querySelectorAll(".swap")) {
+    swap.addEventListener("click", () => {
+      settle();
+      if (gesture?.dragging) {
+        release("left");
+      }
+      gesture = null;
+      for (const button of [...held]) {
+        release(button);
+      }
+      for (const view of remote.querySelectorAll(".view")) {
+        view.hidden = !view.hidden;
+      }
     });
   }
 

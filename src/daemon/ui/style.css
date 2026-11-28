@@ -300,33 +300,88 @@ form.stack button {
   gap: 0.25rem 1rem;
 }
 
-/* The Remote Input page's controls. */
+/* Remote Input's page of controls, which fills the screen, or what of it
+   the phone's keyboard leaves, and never scrolls: the touchpad takes what
+   the rest doesn't. */
+.remote-page {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 .remote {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  height: 100%;
   max-width: 60rem;
   margin: 0 auto;
-  padding: 0 1rem;
+  padding: 0.5rem;
 }
 
 .remote-bar {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem 1rem;
+  gap: 0.5rem;
   align-items: center;
 }
 
 .remote-bar h1 {
   flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-bar button {
+  padding: 0.15rem 0.6rem;
+}
+
+/* Notices float under the bar, so one appearing moves nothing. */
+.remote-note {
+  position: absolute;
+  top: 2.75rem;
+  left: 1rem;
+  right: 1rem;
+  z-index: 1;
+  padding: 0.25rem 0.5rem;
+  color: var(--warn);
+  background: var(--card);
+  border: 1px solid var(--warn);
+  border-radius: 0.375rem;
+  pointer-events: none;
+}
+
+.remote-note:empty {
+  display: none;
+}
+
+.view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.view[hidden] {
+  display: none;
 }
 
 .touchpad {
+  flex: 1;
+  min-height: 0;
   display: flex;
   align-items: flex-end;
-  height: 45vh;
-  min-height: 12rem;
   padding: 0.5rem 0.75rem;
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 0.75rem;
+  overflow: hidden;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
@@ -338,15 +393,17 @@ form.stack button {
   pointer-events: none;
 }
 
+/* A row of keys, each as wide as the others. */
 .keys {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   gap: 0.4rem;
-  margin: 0.5rem 0;
 }
 
-.keys.mouse {
-  grid-template-columns: repeat(3, 1fr);
+/* Without the touchpad, the keys share its room. */
+.all-keys .keys {
+  flex: 1;
 }
 
 /* A held button stays held while its finger drifts, rather than the page
@@ -356,7 +413,8 @@ form.stack button {
 }
 
 .keys button {
-  padding: 0.6rem 0.25rem;
+  padding: 0.5rem 0.25rem;
+  min-width: 0;
   touch-action: manipulation;
   user-select: none;
   -webkit-user-select: none;
@@ -372,11 +430,6 @@ form.stack button {
   width: 100%;
   resize: none;
   font-size: 1rem;
-}
-
-/* One line kept for notices, so one appearing doesn't move the field. */
-.remote-note {
-  min-height: 1.5em;
 }
 
 @media (max-width: 30rem) {

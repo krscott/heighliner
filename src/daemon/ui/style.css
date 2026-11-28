@@ -300,6 +300,20 @@ form.stack button {
   gap: 0.25rem 1rem;
 }
 
+/* A link that is the page's main action. */
+.big-button {
+  display: block;
+  margin: 1rem 0;
+  padding: 1rem;
+  text-align: center;
+  font-size: 1.25rem;
+  font-weight: 600;
+  text-decoration: none;
+  color: var(--card);
+  background: var(--link);
+  border-radius: 0.5rem;
+}
+
 /* Remote Input's page of controls, which fills the screen, or what of it
    the phone's keyboard leaves, and never scrolls: the touchpad takes what
    the rest doesn't. */

@@ -238,7 +238,7 @@ async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let me = node_name(&status, &status.node);
     let (here, view) = match &api.remote_input {
         RemoteInput::Ready(_) => (
-            html! { p { a href=(CONTROLS) { "Open the touchpad and keys" } } },
+            html! { a.big-button href=(CONTROLS) { "Open the touchpad and keys" } },
             Some(api.peripherals(status.clone()).await),
         ),
         RemoteInput::Off => (

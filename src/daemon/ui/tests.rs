@@ -428,10 +428,10 @@ async fn the_remote_input_page_says_why_a_node_takes_none() {
     let (_, _, body) = get_page(&daemon, input::PAGE).await;
     assert!(body.contains("can't open /dev/uinput"), "{body}");
     assert!(!body.contains("input.js"), "{body}");
-    assert!(!body.contains("/input/remote"), "{body}");
+    assert!(!body.contains("/input/controls"), "{body}");
 
     // The controls send there instead.
-    let (code, headers, _) = get_page(&daemon, "/input/remote").await;
+    let (code, headers, _) = get_page(&daemon, "/input/controls").await;
     assert_eq!(code, StatusCode::SEE_OTHER);
     assert_eq!(headers[header::LOCATION], input::PAGE);
 }
@@ -448,13 +448,13 @@ async fn the_remote_input_page_offers_its_controls_and_peripherals() {
         .with_remote_input(RemoteInput::Ready(Arc::new(VirtualInput::recorded())));
     let (code, _, body) = get_page(&daemon, input::PAGE).await;
     assert_eq!(code, StatusCode::OK);
-    assert!(body.contains("href=\"/input/remote\""), "{body}");
+    assert!(body.contains("href=\"/input/controls\""), "{body}");
     assert!(body.contains("<script src=\"/ui/live.js\" defer>"));
     assert!(!body.contains("input.js"), "{body}");
     assert!(body.contains("Connect on laptop"), "{body}");
 
     // The controls have a page to themselves, with nothing else on it.
-    let (code, headers, controls) = get_page(&daemon, "/input/remote").await;
+    let (code, headers, controls) = get_page(&daemon, "/input/controls").await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_SECURITY_POLICY], POLICY);
     assert!(controls.contains("data-socket=\"/ui/input\""), "{controls}");

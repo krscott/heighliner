@@ -1,4 +1,4 @@
-// Remote Input's page of controls: turns touches on the touchpad, the buttons and
+// Remote Input's controls: turns touches on the touchpad, the buttons and
 // typing into messages for this Node's virtual keyboard and pointer, sent
 // over a WebSocket. Keys are pressed and released within one message; the
 // daemon releases any button a page held when its connection closes.
@@ -239,19 +239,23 @@
   }
 
   // The two views take turns. What the hidden one held is let go, as it
-  // would miss the finger lifting.
-  for (const swap of remote.querySelectorAll(".swap")) {
+  // would miss the finger lifting, and its latched modifiers too, as the
+  // other may not show them.
+  const swaps = [...remote.querySelectorAll(".swap")];
+  for (const swap of swaps) {
     swap.addEventListener("click", () => {
       settle();
-      if (gesture?.dragging) {
-        release("left");
-      }
       gesture = null;
       for (const button of [...held]) {
         release(button);
       }
+      takeModifiers();
       for (const view of remote.querySelectorAll(".view")) {
         view.hidden = !view.hidden;
+      }
+      // A keyboard user stays on the button, now the other view's.
+      if (document.activeElement === swap) {
+        swaps.find((other) => other !== swap).focus();
       }
     });
   }

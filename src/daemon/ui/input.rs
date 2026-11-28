@@ -1,8 +1,8 @@
-//! Remote Input: a page of controls, a touchpad, buttons and keys that
-//! `ui/input.js` sends to this Node's virtual keyboard and pointer over a
-//! WebSocket, filling the screen and nothing else; and the Input page,
-//! which opens it, says why there is none, and has the Fleet's Peripherals
-//! and links to the other Nodes' Input pages. Each Node serves its own.
+//! Remote Input's two pages. The controls, a touchpad, buttons and keys
+//! that `ui/input.js` sends to this Node's virtual keyboard and pointer
+//! over a WebSocket, fill the screen and nothing else. The Input page opens
+//! them or says why there are none, with the Fleet's Peripherals and links
+//! to the other Nodes' Input pages. Each Node serves its own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use crate::tailscale::LocalApi;
 pub(super) const PAGE: &str = "/input";
 
 /// The page of controls.
-const CONTROLS: &str = "/input/remote";
+const CONTROLS: &str = "/input/controls";
 
 /// The page's WebSocket.
 const SOCKET: &str = "/ui/input";
@@ -104,9 +104,9 @@ fn controls_page(me: &str) -> Markup {
                         h1 { (me) }
                         span.badge.unknown.remote-state { "connecting" }
                         button.fullscreen type="button" hidden { "Fullscreen" }
+                        p.note.remote-note role="status" {}
                     }
                     noscript { p.callout { "Remote Input needs JavaScript." } }
-                    p.note.remote-note role="status" {}
                     // Two views take turns: the touchpad with the keys used
                     // most alongside it, and every key with room to spare.
                     div.view {
@@ -238,7 +238,7 @@ async fn page<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let me = node_name(&status, &status.node);
     let (here, view) = match &api.remote_input {
         RemoteInput::Ready(_) => (
-            html! { p { a.open href=(CONTROLS) { "Open the touchpad and keys" } } },
+            html! { p { a href=(CONTROLS) { "Open the touchpad and keys" } } },
             Some(api.peripherals(status.clone()).await),
         ),
         RemoteInput::Off => (

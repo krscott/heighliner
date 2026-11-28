@@ -216,8 +216,8 @@
     }
   }
 
-  // Pressing a key or modifier leaves the focus where it was, so the
-  // phone's keyboard stays open while typing.
+  // Pressing a key, modifier or swap button leaves the focus where it was,
+  // so the phone's keyboard stays open while typing.
   for (const button of remote.querySelectorAll("[data-keys], [data-modifier], .swap")) {
     button.addEventListener("pointerdown", (event) => event.preventDefault());
     button.addEventListener("mousedown", (event) => event.preventDefault());
@@ -239,8 +239,8 @@
   }
 
   // The two views take turns. What the hidden one held is let go, as it
-  // would miss the finger lifting, and its latched modifiers too, as the
-  // other may not show them.
+  // would miss the finger lifting, and latched modifiers too, as the other
+  // view may not show them.
   const swaps = [...remote.querySelectorAll(".swap")];
   for (const swap of swaps) {
     swap.addEventListener("click", () => {

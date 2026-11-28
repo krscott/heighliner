@@ -347,6 +347,7 @@ form.stack button {
   top: calc(100% + 0.25rem);
   left: 0.5rem;
   right: 0.5rem;
+  margin: 0;
   z-index: 1;
   padding: 0.25rem 0.5rem;
   color: var(--warn);
@@ -436,6 +437,14 @@ form.stack button {
   width: 100%;
   resize: none;
   font-size: 1rem;
+}
+
+/* Five keys to a row fit their labels on the narrowest phones. */
+@media (max-width: 22.5rem) {
+  .keys button {
+    padding: 0;
+    font-size: 0.8rem;
+  }
 }
 
 @media (max-width: 30rem) {

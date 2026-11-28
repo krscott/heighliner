@@ -184,7 +184,7 @@ pkgs.testers.runNixOSTest {
 
         page = beta.succeed("curl -sf http://beta.tailnet:7130/input")
         assert "Remote Input is off on this Node" in page, page
-        page = beta.succeed("curl -sf http://alpha.tailnet:7130/input")
+        page = beta.succeed("curl -sf http://alpha.tailnet:7130/input/controls")
         assert 'data-socket="/ui/input"' in page, page
 
     with subtest("A Node that stops is shown unreachable, as last read"):

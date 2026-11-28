@@ -59,6 +59,7 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .route("/ui/style.css", get(style))
         .route("/ui/live.js", get(script))
         .with_state(api.clone())
+        .merge(input::router(api.clone()))
         .merge(actions::router(api))
 }
 
@@ -116,16 +117,25 @@ async fn events<T: LocalApi + Clone>(
 /// A page titled `title`, served by `status.node`, which keeps itself
 /// current.
 fn page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
-    any_page(status, title, code, main, true)
+    any_page(status, title, code, main, true, None)
 }
 
 /// The page a form's post answers with, which stays as it is: fetching
 /// its address again would ask for a form's action.
 fn outcome_page(status: &Status, title: &str, code: StatusCode, main: Markup) -> Response {
-    any_page(status, title, code, main, false)
+    any_page(status, title, code, main, false, None)
 }
 
-fn any_page(status: &Status, title: &str, code: StatusCode, main: Markup, live: bool) -> Response {
+/// A page showing `main`, which, if it is `live`, is kept current. Content
+/// in `fixed` goes before it and is left alone.
+fn any_page(
+    status: &Status,
+    title: &str,
+    code: StatusCode,
+    main: Markup,
+    live: bool,
+    fixed: Option<Markup>,
+) -> Response {
     let me = node_name(status, &status.node);
     let markup = html! {
         (DOCTYPE)
@@ -147,9 +157,11 @@ fn any_page(status: &Status, title: &str, code: StatusCode, main: Markup, live: 
                         span.here { "on " (me) }
                         a href="/conflicts" { "Conflicts" }
                         a href=(PERIPHERALS) { "Peripherals" }
+                        a href=(input::PAGE) { "Input" }
                     }
                     p.lost { "Lost touch with this Node's daemon; this is what it last showed." }
                 }
+                @if let Some(fixed) = fixed { (fixed) }
                 main { (main) }
             }
         }
@@ -195,6 +207,17 @@ fn node_name(status: &Status, node: &crate::model::NodeId) -> String {
 fn node_url(node: &NodeStatus, port: u16) -> Option<String> {
     node.ip
         .map(|ip| format!("http://{}/", SocketAddr::new(ip, port)))
+}
+
+/// The Nodes other than this one that haven't left the Fleet, with the
+/// address of each one's UI.
+fn other_nodes(status: &Status, port: u16) -> Vec<(&NodeStatus, String)> {
+    status
+        .nodes
+        .iter()
+        .filter(|node| node.reach != Reach::Here && !node.departed)
+        .filter_map(|node| Some((node, node_url(node, port)?)))
+        .collect()
 }
 
 /// How long ago `then` was, as of `now`, at a glance.
@@ -744,12 +767,7 @@ async fn conflicts<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response {
     let status = api.status().await;
     let listed = api.list_conflicts().await;
     let now = Timestamp::now();
-    let others: Vec<(&NodeStatus, String)> = status
-        .nodes
-        .iter()
-        .filter(|node| node.reach != Reach::Here && !node.departed)
-        .filter_map(|node| Some((node, node_url(node, api.port)?)))
-        .collect();
+    let others = other_nodes(&status, api.port);
     let main = html! {
         h1 { "Data conflicts on " (node_name(&status, &status.node)) }
         p.note {
@@ -886,6 +904,7 @@ async fn peripherals<T: LocalApi + Clone>(State(api): State<Api<T>>) -> Response
 }
 
 mod actions;
+mod input;
 
 #[cfg(test)]
 mod tests;

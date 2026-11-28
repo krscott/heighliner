@@ -72,9 +72,9 @@ pub(super) fn router<T: LocalApi + Clone>(api: Api<T>) -> Router {
         .with_state(api)
 }
 
-/// Refuses a post whose `Origin` isn't the daemon at the `Host` it was
+/// Refuses a request whose `Origin` isn't the daemon at the `Host` it was
 /// sent to, which the Host check has already limited to this device's.
-async fn same_origin(request: Request, next: Next) -> Response {
+pub(super) async fn same_origin(request: Request, next: Next) -> Response {
     let headers = request.headers();
     let origin = headers
         .get(header::ORIGIN)
@@ -91,7 +91,7 @@ async fn same_origin(request: Request, next: Next) -> Response {
     } else {
         (
             StatusCode::FORBIDDEN,
-            "only this daemon's own pages can post its forms",
+            "only this daemon's own pages can send this",
         )
             .into_response()
     }
@@ -354,6 +354,8 @@ struct PeripheralForm {
     peripheral: String,
     #[serde(flatten)]
     action: PeripheralAction,
+    /// The page to go back to; the Peripherals page if none.
+    back: Option<String>,
 }
 
 /// What `action` does, to say it couldn't.
@@ -371,11 +373,17 @@ async fn peripheral<T: LocalApi + Clone>(
     State(api): State<Api<T>>,
     form: Result<Form<PeripheralForm>, FormRejection>,
 ) -> Response {
-    let back_to = PERIPHERALS.to_owned();
-    let PeripheralForm { peripheral, action } = match fields(form) {
+    let PeripheralForm {
+        peripheral,
+        action,
+        back: back_field,
+    } = match fields(form) {
         Ok(form) => form,
-        Err(refused) => return done(&api, "do that", Err(refused), back_to).await,
+        Err(refused) => {
+            return done(&api, "do that", Err(refused), PERIPHERALS.to_owned()).await;
+        }
     };
+    let back_to = back(back_field, PERIPHERALS.to_owned());
     let what = what(&action);
     match api.act_on_peripheral(&peripheral, action).await {
         Ok(Done { notes }) if !notes.is_empty() => {

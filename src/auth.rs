@@ -140,12 +140,15 @@ impl<T: LocalApi> Authorizer<T> {
 }
 
 /// Serves `router` on `listener` to the callers `authorizer` accepts.
-/// Handlers get the caller's [`Identity`] as a request extension.
+/// Handlers get the caller's [`Identity`] and a [`Recheck`] as request
+/// extensions.
 ///
 /// Each connection is authorized as it is accepted, before anything is
 /// read from it; a refused caller gets a single error response and the
 /// connection is closed. Each request on an accepted connection is
 /// authorized again, since either device can change while it is open. A
+/// connection upgraded to a WebSocket is no longer this server's, so its
+/// handler authorizes its caller again itself, with the [`Recheck`]. A
 /// caller that doesn't send a request's headers within [`HEADER_TIMEOUT`]
 /// is disconnected.
 pub async fn serve<T: LocalApi>(
@@ -180,7 +183,8 @@ async fn serve_with<T: LocalApi>(
 ) -> Infallible {
     let unauthorized = Arc::new(Unauthorized::default());
     let mut last_warned = None;
-    // Owned here, so that when the server stops, its connections close.
+    // Owned here, so that when the server stops, its connections close,
+    // apart from those upgraded to WebSockets.
     let mut connections = JoinSet::new();
     loop {
         let accepted = tokio::select! {
@@ -218,7 +222,9 @@ async fn serve_with<T: LocalApi>(
                     let connection = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(header_timeout)
-                        .serve_connection(TokioIo::new(stream), service);
+                        .serve_connection(TokioIo::new(stream), service)
+                        // For the Remote Input page's WebSocket.
+                        .with_upgrades();
                     if let Err(error) = connection.await {
                         tracing::debug!(%addr, %error, "connection ended");
                     }
@@ -303,9 +309,34 @@ async fn reauthorize<T: LocalApi>(
     match authorizer.authorize(addr).await {
         Ok(identity) => {
             request.extensions_mut().insert(identity);
+            request
+                .extensions_mut()
+                .insert(Recheck { authorizer, addr });
             next.run(request).await
         }
         Err(denied) => denied.into_response(),
+    }
+}
+
+/// Authorizes a request's caller again, for a handler that goes on serving
+/// it after answering, such as a WebSocket's.
+pub struct Recheck<T> {
+    authorizer: Arc<Authorizer<T>>,
+    addr: SocketAddr,
+}
+
+impl<T> Clone for Recheck<T> {
+    fn clone(&self) -> Self {
+        Self {
+            authorizer: self.authorizer.clone(),
+            addr: self.addr,
+        }
+    }
+}
+
+impl<T: LocalApi> Recheck<T> {
+    pub async fn authorize(&self) -> Result<(), Denied> {
+        self.authorizer.authorize(self.addr).await.map(drop)
     }
 }
 

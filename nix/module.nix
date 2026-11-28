@@ -112,7 +112,7 @@ let
 in
 {
   options.services.heighliner = {
-    enable = lib.mkEnableOption "heighliner, a control plane for the owner's Tailscale devices that keeps directories replicated with Syncthing and moves Bluetooth Peripherals between them";
+    enable = lib.mkEnableOption "heighliner, a control plane for the owner's Tailscale devices that keeps directories replicated with Syncthing, moves Bluetooth Peripherals between them, and takes Remote Input from its web UI";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -157,6 +157,13 @@ in
       default = 60;
       description = "Seconds between pulls of the other Nodes' configuration.";
     };
+
+    remoteInput.enable = lib.mkEnableOption ''
+      Remote Input: the web UI's touchpad and keyboard for this Node. The
+      daemon gets write access to /dev/uinput, to create a virtual keyboard
+      and pointer, which can type into any session on the machine, the
+      login screen included
+    '';
   };
 
   config = lib.mkIf cfg.enable {
@@ -172,6 +179,8 @@ in
     ];
 
     environment.systemPackages = [ cfg.package ];
+
+    hardware.uinput.enable = lib.mkIf cfg.remoteInput.enable true;
 
     # Reachable only over Tailscale.
     networking.firewall.interfaces.${interfaceName}.allowedTCPPorts = [
@@ -204,23 +213,29 @@ in
       ];
       serviceConfig = service // {
         ExecStart = lib.escapeShellArgs (
-          map toString [
-            (lib.getExe cfg.package)
-            "--port"
-            cfg.port
-            "daemon"
-            "--state-dir"
-            stateDir
-            "--pull-every"
-            cfg.pullEvery
-            "--retention-days"
-            cfg.retentionDays
-            "--syncthing-socket"
-            socket
-            "--syncthing-api-key-file"
-            apiKeyFile
-          ]
+          map toString (
+            [
+              (lib.getExe cfg.package)
+              "--port"
+              cfg.port
+              "daemon"
+              "--state-dir"
+              stateDir
+              "--pull-every"
+              cfg.pullEvery
+              "--retention-days"
+              cfg.retentionDays
+              "--syncthing-socket"
+              socket
+              "--syncthing-api-key-file"
+              apiKeyFile
+            ]
+            ++ lib.optional cfg.remoteInput.enable "--remote-input"
+          )
         );
+        # /dev/uinput is the daemon's alone; the user's own sessions don't
+        # get it.
+        SupplementaryGroups = lib.optional cfg.remoteInput.enable "uinput";
       };
     };
   };

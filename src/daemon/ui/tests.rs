@@ -3,8 +3,11 @@ use axum::http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use std::sync::Arc;
+
 use super::*;
 use crate::daemon::Daemon;
+use crate::input::{RemoteInput, VirtualInput};
 use crate::model::{AbsPath, Direction, Item, Replica};
 use crate::tailscale::UserId;
 use crate::tailscale::fake::{Fake, device};
@@ -408,4 +411,128 @@ async fn the_peripherals_page_moves_and_names_them() {
     assert!(body.contains("already paired with laptop"), "{body}");
     // It stays as it is, rather than fetching the form's address again.
     assert!(!body.contains("live.js"), "{body}");
+}
+
+#[tokio::test]
+async fn the_remote_input_page_says_why_a_node_takes_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = daemon(dir.path()).await;
+    let (code, _, body) = get_page(&daemon, input::PAGE).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("href=\"/input\""), "{body}");
+    assert!(body.contains("Remote Input is off on this Node"), "{body}");
+    assert!(body.contains("services.heighliner.remoteInput.enable"));
+    assert!(!body.contains("input.js"), "{body}");
+
+    let daemon = daemon.with_remote_input(RemoteInput::Failed("can't open /dev/uinput".into()));
+    let (_, _, body) = get_page(&daemon, input::PAGE).await;
+    assert!(body.contains("can't open /dev/uinput"), "{body}");
+    assert!(!body.contains("input.js"), "{body}");
+}
+
+#[tokio::test]
+async fn the_remote_input_page_offers_its_controls_and_peripherals() {
+    use crate::bluetooth::fake::{Fake as FakeBluetooth, paired};
+    const WORK: &str = "98:47:44:A5:A9:3B";
+    let dir = tempfile::tempdir().unwrap();
+    let bluetooth = FakeBluetooth::with([paired(WORK, "Q20 Work", false)]);
+    let daemon = daemon(dir.path())
+        .await
+        .with_bluetooth(bluetooth.bluetooth())
+        .with_remote_input(RemoteInput::Ready(Arc::new(VirtualInput::recorded())));
+    let (code, _, body) = get_page(&daemon, input::PAGE).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body.contains("data-socket=\"/ui/input\""), "{body}");
+    assert!(body.contains("<script src=\"/ui/input.js\" defer>"));
+    assert!(body.contains("<script src=\"/ui/live.js\" defer>"));
+    // The controls stay put while the live script swaps `main`.
+    let (controls, main) = (
+        body.find("class=\"touchpad\"").unwrap(),
+        body.find("<main>").unwrap(),
+    );
+    assert!(controls < main, "{body}");
+    assert!(body.contains("Connect on laptop"), "{body}");
+    assert!(body.contains("name=\"back\" value=\"/input\""), "{body}");
+
+    let form = format!(
+        "peripheral={}&action=handoff&node=n-laptop&back=%2Finput",
+        percent_encode(WORK)
+    );
+    let (code, location, body) = post_form(&daemon, actions::PERIPHERAL, &form, OURS).await;
+    assert_eq!(code, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(location.as_deref(), Some(input::PAGE));
+    assert!(bluetooth.get(WORK).unwrap().connected);
+}
+
+#[tokio::test]
+async fn remote_input_goes_from_the_page_to_the_virtual_keyboard_and_pointer() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+
+    use crate::auth::{self, Authorizer};
+    use crate::input::Event;
+
+    let dir = tempfile::tempdir().unwrap();
+    let virtual_input = Arc::new(VirtualInput::recorded());
+    let daemon = daemon(dir.path())
+        .await
+        .with_remote_input(RemoteInput::Ready(virtual_input.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let authorizer = Arc::new(Authorizer::new(daemon.api.clone()).await.unwrap());
+    tokio::spawn(auth::serve(listener, router(daemon.api()), authorizer));
+    let url = format!("ws://{addr}/ui/input");
+
+    // From another site, which a browser says in `Origin`.
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+    match tokio_tungstenite::connect_async(request).await {
+        Err(tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN)
+        }
+        other => panic!("connected from another site: {other:?}"),
+    }
+
+    let mut request = url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, format!("http://{addr}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    for message in [
+        r#"{"type":"button","button":"left","down":true}"#,
+        r#"{"type":"text","text":"é"}"#,
+    ] {
+        socket
+            .send(tungstenite::Message::text(message))
+            .await
+            .unwrap();
+    }
+    let answer = loop {
+        match socket.next().await.unwrap().unwrap() {
+            tungstenite::Message::Text(text) => break text,
+            _ => continue,
+        }
+    };
+    assert!(answer.contains("US keyboard layout"), "{answer}");
+    assert_eq!(
+        virtual_input.take(),
+        [vec![Event::Press(evdev::KeyCode::BTN_LEFT)]]
+    );
+
+    // Going away releases what the page held.
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let released = virtual_input.take();
+            if !released.is_empty() {
+                assert_eq!(released, [vec![Event::Release(evdev::KeyCode::BTN_LEFT)]]);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the button is released");
 }

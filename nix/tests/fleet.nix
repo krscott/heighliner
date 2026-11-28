@@ -1,6 +1,6 @@
 # Two Nodes on a tailnet that headscale runs: an item tracked on one is
-# replicated to the other in both directions, and each Node's daemon and
-# web UI see the Fleet.
+# replicated to the other in both directions, each Node's daemon and web UI
+# see the Fleet, and Remote Input sent from one reaches the other's kernel.
 { pkgs, module }:
 
 let
@@ -25,14 +25,20 @@ let
       pullEvery = 2;
     };
     users.users.alice.isNormalUser = true;
-    environment.systemPackages = [ pkgs.curl ];
+    environment.systemPackages = [
+      pkgs.curl
+      pkgs.websocat
+    ];
   };
 in
 pkgs.testers.runNixOSTest {
   name = "heighliner-fleet";
 
   nodes = {
-    alpha = node;
+    alpha = {
+      imports = [ node ];
+      services.heighliner.remoteInput.enable = true;
+    };
     beta = node;
 
     headscale = {
@@ -134,6 +140,52 @@ pkgs.testers.runNixOSTest {
         )
         page = beta.succeed("curl -sf http://alpha.tailnet:7130/")
         assert ">docs</a>" in page, page
+
+    with subtest("Remote Input sent from another Node reaches the kernel"):
+        name = "heighliner Remote Input"
+        event = alpha.wait_until_succeeds(
+            "for d in /sys/class/input/event*; do"
+            f" grep -qx '{name}' $d/device/name && basename $d; done | grep ."
+        ).strip()
+        # By path, since systemd-run's PATH lacks the system's packages, and
+        # line-buffered, so each event is in the file as it happens.
+        alpha.succeed(
+            "systemd-run --unit=evtest sh -c"
+            f" '${pkgs.coreutils}/bin/stdbuf -oL ${pkgs.evtest}/bin/evtest /dev/input/{event} >/tmp/events'"
+        )
+        alpha.wait_until_succeeds("grep -q 'Testing ...' /tmp/events", timeout=30)
+        messages = [
+            '{"type":"text","text":"Hi"}',
+            '{"type":"keys","keys":["ctrl","escape"]}',
+            '{"type":"move","x":5,"y":-3}',
+            '{"type":"button","button":"left","down":true}',
+        ]
+        url = "ws://alpha.tailnet:7130/ui/input"
+        beta.succeed(
+            f"printf '%s\\n' {' '.join(shlex.quote(m) for m in messages)}"
+            # The URL first: -H takes every argument after it.
+            f" | websocat -E {url} -H 'Origin: http://alpha.tailnet:7130'"
+        )
+        for seen in [
+            "(KEY_LEFTSHIFT), value 1",
+            "(KEY_H), value 1",
+            "(KEY_I), value 0",
+            "(KEY_ESC), value 1",
+            "(REL_X), value 5",
+            "(REL_Y), value -3",
+            "(BTN_LEFT), value 1",
+            # Released when the connection closed.
+            "(BTN_LEFT), value 0",
+        ]:
+            alpha.wait_until_succeeds(f"grep -qF '{seen}' /tmp/events", timeout=30)
+
+        # Another site's page can't open the connection.
+        beta.fail(f"echo '{messages[0]}' | websocat -E {url} -H 'Origin: http://evil.example'")
+
+        page = beta.succeed("curl -sf http://beta.tailnet:7130/input")
+        assert "Remote Input is off on this Node" in page, page
+        page = beta.succeed("curl -sf http://alpha.tailnet:7130/input")
+        assert 'data-socket="/ui/input"' in page, page
 
     with subtest("A Node that stops is shown unreachable, as last read"):
         beta.succeed("systemctl stop heighliner.service heighliner-syncthing.service")
